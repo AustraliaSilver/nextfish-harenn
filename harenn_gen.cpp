@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <array>
 #include <thread>
+#include <sys/wait.h>
+#include <signal.h>
 #include "harenn_data.h"
 
 /**
@@ -29,25 +31,13 @@
 
 namespace Nextfish {
 
-    // --- HÀM HELPER ĐỂ CHẠY LỆNH VÀ LẤY OUTPUT ---
-    std::string exec_and_get_output(const std::string& cmd) {
-        std::array<char, 256> buffer;
-        std::string result;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (!pipe) {
-            throw std::runtime_error("popen() failed!");
-        }
-        while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-            result += buffer.data();
-        }
-        return result;
-    }
-
     // --- LỚP GIAO TIẾP VỚI STOCKFISH ---
-    // Giao tiếp bằng cách chạy tiến trình mới cho mỗi lần search
+    // Giao tiếp qua Pipe liên tục (Persistent Process) để tối ưu hiệu suất
     class Stockfish {
     private:
-        std::string engine_path;
+        int pid = -1;
+        int pipe_in[2];  // Parent -> Child (Write to Stockfish)
+        int pipe_out[2]; // Child -> Parent (Read from Stockfish)
 
     public:
         struct SearchResult {
@@ -56,50 +46,108 @@ namespace Nextfish {
             std::vector<std::string> pv;
         };
 
-        Stockfish(const std::string& path) : engine_path(path) {}
-        ~Stockfish() {}
+        Stockfish(const std::string& path) {
+            if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+                throw std::runtime_error("Failed to create pipes");
+            }
+
+            pid = fork();
+            if (pid < 0) {
+                throw std::runtime_error("Failed to fork process");
+            }
+
+            if (pid == 0) { // Child process
+                // Redirect stdin/stdout
+                dup2(pipe_in[0], STDIN_FILENO);
+                dup2(pipe_out[1], STDOUT_FILENO);
+
+                // Close unused ends
+                close(pipe_in[0]);
+                close(pipe_in[1]);
+                close(pipe_out[0]);
+                close(pipe_out[1]);
+
+                // Execute Stockfish
+                execl(path.c_str(), path.c_str(), nullptr);
+                exit(1); // Should not reach here
+            } else { // Parent process
+                // Close unused ends
+                close(pipe_in[0]);
+                close(pipe_out[1]);
+
+                // Initialize Engine
+                write_cmd("uci");
+                wait_for("uciok");
+                write_cmd("isready");
+                wait_for("readyok");
+                write_cmd("ucinewgame");
+            }
+        }
+
+        ~Stockfish() {
+            if (pid > 0) {
+                write_cmd("quit");
+                close(pipe_in[1]);
+                close(pipe_out[0]);
+                waitpid(pid, nullptr, 0);
+            }
+        }
+
+        void write_cmd(const std::string& cmd) {
+            std::string full_cmd = cmd + "\n";
+            write(pipe_in[1], full_cmd.c_str(), full_cmd.length());
+        }
+
+        // Đọc một dòng từ pipe
+        std::string read_line() {
+            std::string line = "";
+            char c;
+            while (read(pipe_out[0], &c, 1) > 0) {
+                if (c == '\n') break;
+                line += c;
+            }
+            return line;
+        }
+
+        // Đọc và bỏ qua cho đến khi gặp token
+        void wait_for(const std::string& token) {
+            while (true) {
+                std::string line = read_line();
+                if (line.find(token) != std::string::npos) break;
+            }
+        }
 
         // Search và trả về kết quả
         SearchResult search(const std::string& fen, int depth) {
             SearchResult result;
-            // Xây dựng chuỗi lệnh UCI và thực thi qua pipe
-            std::string uci_commands = "position fen " + fen + "\\n" + "go depth " + std::to_string(depth);
-            std::string full_command = "echo -e \"" + uci_commands + "\" | " + engine_path;
+            
+            write_cmd("position fen " + fen);
+            write_cmd("go depth " + std::to_string(depth));
 
-            std::string output = exec_and_get_output(full_command);
-
-            // Phân tích output từ Stockfish
-            std::stringstream ss(output);
-            std::string line;
-            while (std::getline(ss, line)) {
+            while (true) {
+                std::string line = read_line();
                 std::stringstream line_ss(line);
                 std::string token;
                 line_ss >> token;
 
                 if (token == "info") {
                     std::string key;
+                    // Parse info line
                     while (line_ss >> key) {
                         if (key == "score") {
                             std::string type;
                             int value;
                             line_ss >> type >> value;
-                            if (type == "cp") {
-                                result.score_cp = value;
-                            } else if (type == "mate") {
-                                result.score_cp = (value > 0) ? 30000 - value : -30000 - value;
-                            }
-                        } else if (key == "pv") {
-                            std::string move;
-                            result.pv.clear();
-                            while (line_ss >> move) {
-                                result.pv.push_back(move);
-                            }
+                            if (type == "cp") result.score_cp = value;
+                            else if (type == "mate") result.score_cp = (value > 0) ? 30000 - value : -30000 - value;
                         }
                     }
                 } else if (token == "bestmove") {
                     line_ss >> result.best_move_uci;
+                    break; // Search finished
                 }
             }
+            
             return result;
         }
     };
@@ -266,7 +314,7 @@ std::vector<std::string> load_opening_book(const std::string& filename) {
     return book;
 }
 
-void play_one_game(int nodes, std::ofstream& file, const std::string& opening_line, Nextfish::Stockfish& sf) {
+int play_one_game(int nodes, std::ofstream& file, const std::string& opening_line, Nextfish::Stockfish& sf) {
     Nextfish::Board board;
     std::vector<HARENNEntry> game_positions;
 
@@ -302,6 +350,7 @@ void play_one_game(int nodes, std::ofstream& file, const std::string& opening_li
         file.write(reinterpret_cast<const char*>(&entry), sizeof(HARENNEntry));
     }
     file.flush(); // Đảm bảo dữ liệu được ghi xuống đĩa ngay
+    return game_result;
 }
 
 void run_generation(int games, int nodes, std::string filename, Nextfish::Stockfish& sf) {
@@ -321,9 +370,10 @@ void run_generation(int games, int nodes, std::string filename, Nextfish::Stockf
         // Chọn ngẫu nhiên một dòng khai cuộc
         std::string opening = opening_book[rand() % opening_book.size()];
         
-        play_one_game(nodes, file, opening, sf);
+        int result = play_one_game(nodes, file, opening, sf);
+        std::string res_str = (result == 1) ? "1-0" : (result == -1 ? "0-1" : "1/2-1/2");
         
-        std::cout << "Đã hoàn thành ván " << i + 1 << "/" << games << ". Ghi dữ liệu thành công." << std::endl;
+        std::cout << "Ván " << i + 1 << "/" << games << " | Kết quả: " << res_str << " | Ghi dữ liệu thành công." << std::endl;
     }
     file.close();
 }
