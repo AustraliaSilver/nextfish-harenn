@@ -64,7 +64,8 @@ namespace Nextfish {
         multi_depth_scores.push_back(main_score);
         
         float tau = calculate_std_dev(multi_depth_scores);
-        entry.tactical_complexity_fixed = (int16_t)(tau * 100);
+        // Sửa lỗi: tactical_complexity_fixed -> complexity_fixed (theo harenn_data.h)
+        entry.complexity_fixed = (int16_t)(tau * 100);
 
         // 3. Head 3: Move Criticality Scores (MCS)
         // Đây là trái tim của HARENN: Xác định nước đi nào "nhạy cảm" nhất
@@ -86,19 +87,23 @@ namespace Nextfish {
         // Độ lệch giữa Static Eval và Search Score (dấu hiệu của bẫy hoặc phối hợp)
         int static_eval = get_static_eval();
         float rho = std::abs(main_score - static_eval) / 100.0f;
-        entry.horizon_risk_fixed = (int16_t)(rho * 100);
+        // Sửa lỗi: horizon_risk_fixed -> risk_fixed (theo định nghĩa mới trong harenn_data.h)
+        entry.risk_fixed = (int16_t)(rho * 100);
 
         // 5. Head 5: Resolution Score (rs)
         // Khả năng "hội tụ" của search (ví dụ: tỷ lệ các nước đi bị loại bỏ sớm)
         float resolution = 0.85f; // Tạm thời để hằng số hoặc tính từ Branching Factor
-        entry.resolution_score_fixed = (int16_t)(resolution * 100);
+        // Sửa lỗi: resolution_score_fixed -> resolution_fixed (theo harenn_data.h)
+        entry.resolution_fixed = (int16_t)(resolution * 100);
 
         // Metadata & Board State
         entry.score = (int16_t)main_score;
         entry.result = 0; // Cập nhật sau khi kết thúc ván
         entry.stm = 1;    // White to move
         entry.occupancy = 0x0000FFFFFFFF0000ULL; // Cần lấy từ Board::get_occ()
-        // entry.pieces cần được copy từ Board::get_pieces()
+        
+        // Khởi tạo pieces để tránh dữ liệu rác
+        for(int i = 0; i < 32; ++i) entry.pieces[i] = 0;
         
         return entry;
     }
