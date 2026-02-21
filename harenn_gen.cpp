@@ -6,9 +6,6 @@
 #include <numeric>
 #include <algorithm>
 #include <sstream>
-#include <chrono>
-#include <unistd.h> // For getpid()
-#include <iterator> 
 #include "harenn_data.h"
 
 /**
