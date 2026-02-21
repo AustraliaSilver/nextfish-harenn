@@ -6,6 +6,9 @@
 #include <numeric>
 #include <algorithm>
 #include <sstream>
+#include <chrono>
+#include <unistd.h> // For getpid()
+#include <iterator> // Đảm bảo std::begin/std::end hoạt động
 #include "harenn_data.h"
 
 /**
@@ -19,49 +22,150 @@
 namespace Nextfish {
 
     // --- MÔ PHỎNG ĐỐI TƯỢNG BÀN CỜ (Thay bằng class Board của bạn) ---
+    // Nâng cấp: Board bây giờ theo dõi vị trí quân cờ thật để tạo dữ liệu hợp lệ
     class Board {
     public:
+        int squares[64]; // 0: Empty, 1-6: White (P,N,B,R,Q,K), 7-12: Black
         int stm = 1; // 1: White, -1: Black
         
+        Board() {
+            // Khởi tạo bàn cờ chuẩn
+            int init[64] = {
+                4, 2, 3, 5, 6, 3, 2, 4, // White Pieces (Rank 1)
+                1, 1, 1, 1, 1, 1, 1, 1, // White Pawns
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                7, 7, 7, 7, 7, 7, 7, 7, // Black Pawns
+                10, 8, 9, 11, 12, 9, 8, 10 // Black Pieces (Rank 8)
+            };
+            std::copy(std::begin(init), std::end(init), std::begin(squares));
+        }
+
         void make_move(const std::string& move) {
+            if (move.length() < 4) return;
+            // Parse UCI đơn giản (ví dụ: "e2e4")
+            int from = (move[0] - 'a') + (move[1] - '1') * 8;
+            int to   = (move[2] - 'a') + (move[3] - '1') * 8;
+            
+            // Di chuyển quân cờ trong mảng
+            if (from >= 0 && from < 64 && to >= 0 && to < 64) {
+                squares[to] = squares[from];
+                squares[from] = 0;
+            }
             stm = -stm; // Đổi lượt đi
         }
         
         bool is_game_over() {
-            return (rand() % 100) < 5; // Giả lập 5% tỷ lệ kết thúc ván đấu mỗi nước
+            // Giả lập: Hết ván nếu mất Vua (để logic hợp lý hơn chút)
+            bool wK = false, bK = false;
+            for(int i=0; i<64; ++i) {
+                if (squares[i] == 6) wK = true;
+                if (squares[i] == 12) bK = true;
+            }
+            if (!wK || !bK) return true;
+            
+            return (rand() % 1000) < 2; // Tỷ lệ hòa/hết giờ ngẫu nhiên thấp
         }
         
         int get_result() {
-            // Trả về 1 (Trắng thắng), -1 (Đen thắng), 0 (Hòa)
-            int r = rand() % 3;
-            return (r == 2) ? -1 : r;
+            // Đếm vật chất để quyết định thắng thua sơ bộ
+            int score = 0;
+            for(int i=0; i<64; ++i) {
+                if (squares[i] >= 1 && squares[i] <= 6) score++;
+                if (squares[i] >= 7 && squares[i] <= 12) score--;
+            }
+            if (score > 2) return 1;
+            if (score < -2) return -1;
+            return 0;
         }
 
-        uint64_t get_occupancy() { return 0x0000FFFFFFFF0000ULL; }
+        uint64_t get_occupancy() { 
+            uint64_t occ = 0;
+            for(int i=0; i<64; ++i) {
+                if (squares[i] != 0) occ |= (1ULL << i);
+            }
+            return occ;
+        }
     };
 
     struct Move { 
         int from, to; 
-        std::string uci() const { return "e2e4"; } // Giả lập in ra UCI
+        std::string uci() const { 
+            if (from < 0 || from > 63 || to < 0 || to > 63) return "0000";
+            std::string s = "";
+            s += (char)('a' + (from % 8));
+            s += (char)('1' + (from / 8));
+            s += (char)('a' + (to % 8));
+            s += (char)('1' + (to / 8));
+            return s;
+        } 
     };
 
     // --- CÁC HÀM GIAO TIẾP VỚI ENGINE (TRUYỀN THÊM BOARD) ---
     
-    int get_static_eval(Board& board) { return (rand() % 100) - 50; }
+    int get_static_eval(Board& board) { 
+        // Đánh giá dựa trên vật chất đơn giản để label không bị random hoàn toàn
+        int score = 0;
+        for(int i=0; i<64; ++i) {
+            if (board.squares[i] != 0) score += (board.squares[i] <= 6 ? 100 : -100);
+        }
+        return score + (rand() % 20 - 10); // Thêm chút nhiễu
+    }
     
-    int run_search(Board& board, int nodes, int depth) { return 45 + (rand() % 20); }
+    // Search trả về static eval + nhiễu (giả lập search depth)
+    int run_search(Board& board, int nodes, int depth) { 
+        // Giả lập search sâu hơn sẽ có đánh giá "chính xác" hơn
+        // bằng cách giảm nhiễu. Điều này tạo ra label có ý nghĩa hơn.
+        int static_eval = get_static_eval(board);
+        int noise_range = std::max(1, 40 - depth * 2); // Nhiễu giảm khi depth tăng
+        int noise = (noise_range > 0) ? (rand() % noise_range) - (noise_range / 2) : 0;
+        return static_eval + noise;
+    }
 
     std::vector<Move> get_legal_moves(Board& board) {
         std::vector<Move> moves;
-        moves.push_back({12, 28}); 
-        moves.push_back({11, 27}); 
+        for (int from = 0; from < 64; ++from) {
+            int p = board.squares[from];
+            if (p == 0) continue;
+
+            // Kiểm tra quân của bên đang đi
+            if (board.stm == 1 && (p < 1 || p > 6)) continue;
+            if (board.stm == -1 && (p < 7 || p > 12)) continue;
+
+            // Nâng cấp: Thêm logic di chuyển cơ bản cho Tốt để dữ liệu thực tế hơn
+            if (p == 1 && board.stm == 1) { // White Pawn
+                if (from / 8 < 7 && board.squares[from + 8] == 0) moves.push_back({from, from + 8});
+                if (from / 8 == 1 && board.squares[from + 8] == 0 && board.squares[from + 16] == 0) moves.push_back({from, from + 16});
+            } else if (p == 7 && board.stm == -1) { // Black Pawn
+                if (from / 8 > 0 && board.squares[from - 8] == 0) moves.push_back({from, from - 8});
+                if (from / 8 == 6 && board.squares[from - 8] == 0 && board.squares[from - 16] == 0) moves.push_back({from, from - 16});
+            } else { // Các quân khác: vẫn dùng logic ngẫu nhiên
+                for (int k = 0; k < 8; ++k) { // Tăng số lần thử để có nhiều nước hơn
+                    int to = rand() % 64;
+                    if (from == to) continue;
+                    
+                    int target = board.squares[to];
+                    // Không được ăn quân mình
+                    if (target != 0) {
+                        bool is_white_piece = (target >= 1 && target <= 6);
+                        bool is_black_piece = (target >= 7 && target <= 12);
+                        if (board.stm == 1 && is_white_piece) continue;
+                        if (board.stm == -1 && is_black_piece) continue;
+                    }
+                    moves.push_back({from, to});
+                }
+            }
+        }
         return moves;
     }
 
     Move get_best_move(Board& board, int nodes) {
         // Hàm này dùng để engine thực sự tự chơi ván cờ
         auto moves = get_legal_moves(board);
-        return moves.empty() ? Move{0,0} : moves[0];
+        if (moves.empty()) return Move{0,0};
+        return moves[rand() % moves.size()];
     }
 
     // --- THUẬT TOÁN HARENN CHUYÊN SÂU ---
@@ -96,7 +200,7 @@ namespace Nextfish {
         for (auto& m : moves) {
             int reduced_score = run_search(board, nodes / 10, main_depth - 6);
             int criticality = std::abs(main_score - reduced_score);
-            entry.mcs_map[m.to % 64] = (uint8_t)std::min(255, criticality);
+            entry.mcs_map[m.to] = (uint8_t)std::min(255, criticality);
         }
 
         // Head 4 & 5: Risk & Resolution
@@ -109,7 +213,18 @@ namespace Nextfish {
         entry.score = (int16_t)main_score;
         entry.stm = board.stm;    
         entry.occupancy = board.get_occupancy(); 
-        for(int i = 0; i < 32; ++i) entry.pieces[i] = 0; 
+        
+        // Serialize pieces: Duyệt qua các bit 1 trong occupancy để lưu loại quân
+        int p_idx = 0;
+        for(int i = 0; i < 64; ++i) {
+            if ((entry.occupancy >> i) & 1) {
+                if (p_idx < 32) {
+                    entry.pieces[p_idx++] = (uint8_t)board.squares[i];
+                }
+            }
+        }
+        // Fill phần còn lại bằng 0
+        while(p_idx < 32) entry.pieces[p_idx++] = 0;
         
         return entry;
     }
@@ -146,6 +261,10 @@ void play_one_game(int nodes, std::ofstream& file, const std::string& opening_li
 
         // Engine tự chọn nước đi tốt nhất để tiếp tục ván cờ
         Nextfish::Move best_move = Nextfish::get_best_move(board, nodes);
+        
+        // An toàn: Nếu không còn nước đi hợp lệ (best_move là {0,0}), dừng ván cờ ngay
+        if (best_move.from == best_move.to) break;
+        
         board.make_move(best_move.uci());
         move_count++;
     }
@@ -188,8 +307,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    // Khởi tạo random seed
-    srand(time(NULL));
+    // Sửa lỗi: Khởi tạo random seed an toàn cho việc chạy song song
+    unsigned int seed = std::chrono::high_resolution_clock::now().time_since_epoch().count() + getpid();
+    srand(seed);
 
     int nodes = std::stoi(argv[1]);
     int games = std::stoi(argv[2]);
