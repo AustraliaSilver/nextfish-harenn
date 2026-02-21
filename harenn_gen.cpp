@@ -88,7 +88,7 @@ namespace Nextfish {
         depth_scores.push_back(main_score);
         
         float tau = calculate_std_dev(depth_scores);
-        entry.tactical_complexity_fixed = (int16_t)(tau * 100);
+té        entry.complexity_fixed = (int16_t)(tau * 100);
 
         // Head 3: MCS (Probe Search)
         std::fill(entry.mcs_map, entry.mcs_map + 64, 0);
@@ -102,8 +102,8 @@ namespace Nextfish {
         // Head 4 & 5: Risk & Resolution
         int static_eval = get_static_eval(board);
         float rho = std::abs(main_score - static_eval) / 100.0f;
-        entry.horizon_risk_fixed = (int16_t)(rho * 100);
-        entry.resolution_score_fixed = (int16_t)(0.85f * 100);
+        entry.risk_fixed = (int16_t)(rho * 100);
+        entry.resolution_fixed = (int16_t)(0.85f * 100);
 
         // Metadata & Board State
         entry.score = (int16_t)main_score;
