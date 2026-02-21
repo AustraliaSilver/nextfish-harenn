@@ -88,7 +88,7 @@ namespace Nextfish {
         depth_scores.push_back(main_score);
         
         float tau = calculate_std_dev(depth_scores);
-té        entry.complexity_fixed = (int16_t)(tau * 100);
+        entry.complexity_fixed = (int16_t)(tau * 100);
 
         // Head 3: MCS (Probe Search)
         std::fill(entry.mcs_map, entry.mcs_map + 64, 0);
