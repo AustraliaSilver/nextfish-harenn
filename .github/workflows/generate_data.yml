@@ -1,0 +1,43 @@
+name: HARENN Continuous Datagen
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build
+      run: g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
+
+    - name: Generate
+      run: |
+        # Chạy song song 2 luồng
+        ./harenn_gen 15000 200 data1.binpack &
+        ./harenn_gen 15000 200 data2.binpack &
+        wait
+        cat data1.binpack data2.binpack >> harenn_master.binpack
+
+    - name: Capacity Control & Push
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git config --global user.name 'HARENN Bot'
+        git config --global user.email 'bot@harenn.ai'
+        
+        # Kiểm tra dung lượng (90MB = 94371840 bytes)
+        MAX_SIZE=94371840
+        if [ -f harenn_master.binpack ] && [ $(stat -c%s harenn_master.binpack) -gt $MAX_SIZE ]; then
+          mv harenn_master.binpack "harenn_$(date +%Y%m%d_%H%M%S).binpack"
+        fi
+        
+        git add *.binpack
+        git commit -m "Add HARENN data batch" || exit 0
+        git push origin HEAD:master
+        
+        # Kích hoạt chu kỳ tiếp theo sau 30 giây
+        sleep 30
+        gh workflow run "HARENN Continuous Datagen"
