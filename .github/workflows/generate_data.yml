@@ -1,43 +1,89 @@
-name: HARENN Continuous Datagen
+name: HARENN Continuous Data Generation
+
 on:
   push:
     branches: [ master, main ]
   workflow_dispatch:
 
+# QUAN TRỌNG: Cấp quyền ghi để sửa lỗi 403
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   generate:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Build
-      run: g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Generate
+    - name: Build HARENN Generator
       run: |
-        # Chạy song song 2 luồng
-        ./harenn_gen 15000 200 data1.binpack &
-        ./harenn_gen 15000 200 data2.binpack &
-        wait
-        cat data1.binpack data2.binpack >> harenn_master.binpack
+        # Biên dịch engine với tối ưu hóa cao nhất
+        g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
 
-    - name: Capacity Control & Push
+    - name: Run Parallel Datagen
+      run: |
+        chmod +x harenn_gen
+        # Tạo file mồi khai cuộc từ script python
+        python3 preprocess_pgn.py
+        
+        # Chạy 2 luồng song song (tận dụng 2 CPU cores của GitHub Runner)
+        # Cú pháp: ./harenn_gen <nodes> <games> <output_file>
+        ./harenn_gen 15000 200 batch1.binpack &
+        PID1=$!
+        ./harenn_gen 15000 200 batch2.binpack &
+        PID2=$!
+        
+        wait $PID1 $PID2
+        
+        # Gộp dữ liệu mới vào file chính
+        cat batch1.binpack batch2.binpack >> harenn_master.binpack
+        rm batch1.binpack batch2.binpack
+
+    - name: Capacity Management & Push
+      id: push_step
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config --global user.name 'HARENN Bot'
         git config --global user.email 'bot@harenn.ai'
         
-        # Kiểm tra dung lượng (90MB = 94371840 bytes)
+        # GIỚI HẠN DUNG LƯỢNG: 90MB (GitHub chặn file > 100MB)
         MAX_SIZE=94371840
-        if [ -f harenn_master.binpack ] && [ $(stat -c%s harenn_master.binpack) -gt $MAX_SIZE ]; then
-          mv harenn_master.binpack "harenn_$(date +%Y%m%d_%H%M%S).binpack"
+        
+        if [ -f harenn_master.binpack ]; then
+          CURRENT_SIZE=$(stat -c%s harenn_master.binpack)
+          if [ "$CURRENT_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "Dung lượng đạt 90MB, đang tiến hành xoay file..."
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            mv harenn_master.binpack "harenn_${TIMESTAMP}.binpack"
+            touch harenn_master.binpack
+          fi
         fi
         
         git add *.binpack
-        git commit -m "Add HARENN data batch" || exit 0
-        git push origin HEAD:master
         
-        # Kích hoạt chu kỳ tiếp theo sau 30 giây
+        # Kiểm tra nếu không có gì thay đổi thì thoát để tránh lỗi commit trống
+        if git diff --staged --quiet; then
+          echo "Không có dữ liệu mới."
+          exit 0
+        fi
+
+        # Dùng [skip ci] để tránh GitHub tự kích hoạt lại workflow từ chính commit này
+        git commit -m "Add HARENN data batch [skip ci]"
+        
+        # Push lên nhánh hiện tại
+        git push origin HEAD:${{ github.ref_name }}
+
+    - name: Trigger Next Cycle
+      if: always() && steps.push_step.outcome == 'success'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Nghỉ 30 giây trước khi bắt đầu chu kỳ mới..."
         sleep 30
-        gh workflow run "HARENN Continuous Datagen"
+        # Tự động kích hoạt chu kỳ tiếp theo thông qua GitHub CLI
+        gh workflow run "HARENN Continuous Data Generation" --ref ${{ github.ref_name }}
