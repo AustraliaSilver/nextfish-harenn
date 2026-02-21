@@ -29,7 +29,9 @@ jobs:
         tar -xvf stockfish.tar
         echo "Setting up Stockfish executable..."
         # Correct the path to the executable inside the archive.
-        mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish
+        mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish_tmp
+        rm -rf stockfish
+        mv ./stockfish_tmp ./stockfish
         chmod +x ./stockfish
 
     - name: Build HARENN Generator
