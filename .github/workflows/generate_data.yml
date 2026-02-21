@@ -19,6 +19,17 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Download and Setup Stockfish
+      run: |
+        echo "Downloading Stockfish..."
+        # Tải bản build Stockfish 16 mới nhất cho Linux
+        wget -q https://stockfishchess.org/files/stockfish-16-linux-x86-64-avx2.tar.gz
+        echo "Extracting Stockfish..."
+        tar -xvf stockfish-16-linux-x86-64-avx2.tar.gz
+        echo "Setting up Stockfish executable..."
+        mv stockfish-16-linux-x86-64-avx2/stockfish ./stockfish
+        chmod +x ./stockfish
+
     - name: Build HARENN Generator
       run: |
         # Biên dịch engine với tối ưu hóa cao nhất
