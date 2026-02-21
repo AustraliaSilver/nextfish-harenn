@@ -344,7 +344,12 @@ int play_one_game(int nodes, std::ofstream& file, const std::string& opening_lin
 
     // 3. Gán kết quả hồi tố (Retroactive Result)
     int final_eval = sf.search(board.get_fen(), 10).score_cp;
-    int game_result = (final_eval > 100) ? 1 : (final_eval < -100 ? -1 : 0);
+lpha    
+    // SỬA LỖI: Chuyển điểm số tương đối (Stockfish) sang tuyệt đối (White perspective)
+    // Nếu đến lượt Đen (stm = -1), đảo dấu điểm số
+    int absolute_score = (board.stm == 1) ? final_eval : -final_eval;
+    int game_result = (absolute_score > 100) ? 1 : (absolute_score < -100 ? -1 : 0);
+    
     for (auto& entry : game_positions) {
         entry.result = game_result; // Cập nhật nhãn thắng/thua/hòa thực tế
         file.write(reinterpret_cast<const char*>(&entry), sizeof(HARENNEntry));
