@@ -22,12 +22,14 @@ jobs:
     - name: Download and Setup Stockfish
       run: |
         echo "Downloading Stockfish..."
-        # Tải bản build Stockfish 16 mới nhất cho Linux
-        wget -q https://stockfishchess.org/files/stockfish-16-linux-x86-64-avx2.tar.gz
+        # Use curl -L to follow redirects and -o to specify the output file for a more robust download.
+        curl -L -o stockfish.tar https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-avx2.tar
         echo "Extracting Stockfish..."
-        tar -xvf stockfish-16-linux-x86-64-avx2.tar.gz
+        # Explicitly use -xvf for tar (no z for uncompressed tar)
+        tar -xvf stockfish.tar
         echo "Setting up Stockfish executable..."
-        mv stockfish-16-linux-x86-64-avx2/stockfish ./stockfish
+        # Correct the path to the executable inside the archive.
+        mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish
         chmod +x ./stockfish
 
     - name: Build HARENN Generator
