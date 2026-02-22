@@ -53,9 +53,9 @@ jobs:
         
         # Chạy 2 luồng song song (tận dụng 2 CPU cores của GitHub Runner)
         # Cú pháp: ./harenn_gen <nodes> <games> <output_file>
-        ./harenn_gen 15000 2000 batch1.binpack &
+        ./harenn_gen 15000 100 batch1.binpack &
         PID1=$!
-        ./harenn_gen 15000 2000 batch2.binpack &
+        ./harenn_gen 15000 100 batch2.binpack &
         PID2=$!
         
         wait $PID1 $PID2
@@ -94,11 +94,11 @@ jobs:
           exit 0
         fi
         
-        # Pull lần cuối để tránh conflict nếu có thay đổi khác
-        git pull --rebase origin ${{ github.ref_name }}
-
         # Dùng [skip ci] để tránh GitHub tự kích hoạt lại workflow từ chính commit này
         git commit -m "Add HARENN data batch [skip ci]"
+        
+        # Pull lần cuối để tránh conflict nếu có thay đổi khác
+        git pull --rebase origin ${{ github.ref_name }}
         
         # Push lên nhánh hiện tại
         git push origin HEAD:${{ github.ref_name }}
