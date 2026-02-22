@@ -18,6 +18,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0 # Lấy toàn bộ lịch sử để tránh lỗi push và đảm bảo file lfs (nếu có)
 
     - name: Download and Setup Stockfish
       run: |
@@ -42,14 +43,20 @@ jobs:
     - name: Run Parallel Datagen
       run: |
         chmod +x harenn_gen
+        
+        # Đảm bảo đồng bộ dữ liệu mới nhất trước khi chạy
+        git config --global user.name 'HARENN Bot'
+        git config --global user.email 'bot@harenn.ai'
+        git pull --rebase origin ${{ github.ref_name }}
+        
         # Tạo file mồi khai cuộc từ script python
         python3 preprocess_pgn.py
         
         # Chạy 2 luồng song song (tận dụng 2 CPU cores của GitHub Runner)
         # Cú pháp: ./harenn_gen <nodes> <games> <output_file>
-        ./harenn_gen 15000 200 batch1.binpack &
+        ./harenn_gen 15000 2000 batch1.binpack &
         PID1=$!
-        ./harenn_gen 15000 200 batch2.binpack &
+        ./harenn_gen 15000 2000 batch2.binpack &
         PID2=$!
         
         wait $PID1 $PID2
@@ -57,14 +64,15 @@ jobs:
         # Gộp dữ liệu mới vào file chính
         cat batch1.binpack batch2.binpack >> harenn_master.binpack
         rm batch1.binpack batch2.binpack
+        
+        # Debug: Kiểm tra dung lượng file sau khi gộp
+        ls -lh harenn_master.binpack
 
     - name: Capacity Management & Push
       id: push_step
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        git config --global user.name 'HARENN Bot'
-        git config --global user.email 'bot@harenn.ai'
         
         # GIỚI HẠN DUNG LƯỢNG: 90MB (GitHub chặn file > 100MB)
         MAX_SIZE=94371840
@@ -86,6 +94,9 @@ jobs:
           echo "Không có dữ liệu mới."
           exit 0
         fi
+        
+        # Pull lần cuối để tránh conflict nếu có thay đổi khác
+        git pull --rebase origin ${{ github.ref_name }}
 
         # Dùng [skip ci] để tránh GitHub tự kích hoạt lại workflow từ chính commit này
         git commit -m "Add HARENN data batch [skip ci]"

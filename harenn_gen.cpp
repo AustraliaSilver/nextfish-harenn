@@ -254,7 +254,7 @@ namespace Nextfish {
         // Head 2: Tactical Complexity
         // Phân tích sự biến động của điểm số ở các độ sâu khác nhau
         std::vector<int> depth_scores;
-        for (int d = main_depth - 6; d <= main_depth; d += 2) {
+        for (int d = main_depth - 6; d < main_depth; d += 2) {
             if (d > 0) {
                 depth_scores.push_back(sf.search(fen, d).score_cp);
             }

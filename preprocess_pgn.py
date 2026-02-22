@@ -42,7 +42,7 @@ def prepare_book():
     print("--- HARENN Opening Book Generator ---")
     
     # Bạn có thể điều chỉnh số lượng chuỗi khai cuộc ở đây
-    num_lines = 2000 
+    num_lines = 5000 
     
     book_lines = generate_random_openings(num_lines)
     
