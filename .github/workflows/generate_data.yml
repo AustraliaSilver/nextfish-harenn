@@ -47,7 +47,6 @@ jobs:
         # Đảm bảo đồng bộ dữ liệu mới nhất trước khi chạy
         git config --global user.name 'HARENN Bot'
         git config --global user.email 'bot@harenn.ai'
-        git pull --rebase origin ${{ github.ref_name }}
         
         # Tạo file mồi khai cuộc từ script python
         python3 preprocess_pgn.py
