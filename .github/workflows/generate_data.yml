@@ -52,10 +52,10 @@ jobs:
         python3 preprocess_pgn.py
         
         # Chạy 2 luồng song song (tận dụng 2 CPU cores của GitHub Runner)
-        # Cú pháp: ./harenn_gen <nodes> <games> <output_file>
-        ./harenn_gen 15000 100 batch1.binpack &
+        # Cú pháp: ./harenn_gen <games> <output_file>
+        ./harenn_gen 1000 batch1.binpack &
         PID1=$!
-        ./harenn_gen 15000 100 batch2.binpack &
+        ./harenn_gen 1000 batch2.binpack &
         PID2=$!
         
         wait $PID1 $PID2

@@ -22,8 +22,9 @@ struct HARENNEntry {
     int16_t complexity_fixed; 
 
     // Head 3: Move Criticality Scores (64 bytes)
-    // Bản đồ 8x8 mô tả tầm quan trọng của từng ô cờ cho việc cắt tỉa (reduction)
-    uint8_t mcs_map[64];
+    // Bản đồ 64x64 mô tả tầm quan trọng của từng cặp (from, to)
+    // Cập nhật theo tài liệu HARENN Architecture 2.3
+    uint8_t mcs_map[64 * 64]; // 4096 bytes
 
     // Head 4 & 5: Horizon Risk & Resolution (4 bytes)
     // Lưu giá trị thực * 100
