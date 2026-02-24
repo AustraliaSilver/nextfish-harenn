@@ -1,114 +1,98 @@
-name: HARENN Continuous Data Generation
+name: HARENN Dataset Generation
 
 on:
-  push:
-    branches: [ master, main ]
   workflow_dispatch:
+    inputs:
+      games:
+        description: "Total self-play games"
+        required: false
+        default: "120"
+      workers:
+        description: "Parallel generator workers"
+        required: false
+        default: "2"
+      book_plies:
+        description: "Opening plies to keep"
+        required: false
+        default: "8"
+      stockfish_release:
+        description: "Stockfish release tag"
+        required: false
+        default: "sf_18"
+  schedule:
+    - cron: "30 2 * * *"
 
-# QUAN TRỌNG: Cấp quyền ghi để sửa lỗi 403
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 jobs:
   generate:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GAMES: ${{ github.event.inputs.games || '120' }}
+      WORKERS: ${{ github.event.inputs.workers || '2' }}
+      BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
+      SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0 # Lấy toàn bộ lịch sử để tránh lỗi push và đảm bảo file lfs (nếu có)
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Download and Setup Stockfish
-      run: |
-        echo "Downloading Stockfish..."
-        # Use curl -L to follow redirects and -o to specify the output file for a more robust download.
-        curl -L -o stockfish.tar https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-avx2.tar
-        echo "Extracting Stockfish..."
-        # Explicitly use -xvf for tar (no z for uncompressed tar)
-        tar -xvf stockfish.tar
-        echo "Setting up Stockfish executable..."
-        # Correct the path to the executable inside the archive.
-        mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish_tmp
-        rm -rf stockfish
-        mv ./stockfish_tmp ./stockfish
-        chmod +x ./stockfish
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - name: Build HARENN Generator
-      run: |
-        # Biên dịch engine với tối ưu hóa cao nhất
-        g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-chess zstandard
 
-    - name: Run Parallel Datagen
-      run: |
-        chmod +x harenn_gen
-        
-        # Đảm bảo đồng bộ dữ liệu mới nhất trước khi chạy
-        git config --global user.name 'HARENN Bot'
-        git config --global user.email 'bot@harenn.ai'
-        
-        # Tạo file mồi khai cuộc từ script python
-        python3 preprocess_pgn.py
-        
-        # Chạy 2 luồng song song (tận dụng 2 CPU cores của GitHub Runner)
-        # Cú pháp: ./harenn_gen <games> <output_file>
-        ./harenn_gen 1000 batch1.binpack &
-        PID1=$!
-        ./harenn_gen 1000 batch2.binpack &
-        PID2=$!
-        
-        wait $PID1 $PID2
-        
-        # Gộp dữ liệu mới vào file chính
-        cat batch1.binpack batch2.binpack >> harenn_master.binpack
-        rm batch1.binpack batch2.binpack
-        
-        # Debug: Kiểm tra dung lượng file sau khi gộp
-        ls -lh harenn_master.binpack
+      - name: Download Stockfish release
+        run: |
+          set -euxo pipefail
+          curl -L -o stockfish.tar "https://github.com/official-stockfish/Stockfish/releases/download/${SF_TAG}/stockfish-ubuntu-x86-64-avx2.tar"
+          tar -xvf stockfish.tar
+          mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish
+          chmod +x ./stockfish
 
-    - name: Capacity Management & Push
-      id: push_step
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        
-        # GIỚI HẠN DUNG LƯỢNG: 90MB (GitHub chặn file > 100MB)
-        MAX_SIZE=94371840
-        
-        if [ -f harenn_master.binpack ]; then
-          CURRENT_SIZE=$(stat -c%s harenn_master.binpack)
-          if [ "$CURRENT_SIZE" -gt "$MAX_SIZE" ]; then
-            echo "Dung lượng đạt 90MB, đang tiến hành xoay file..."
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            mv harenn_master.binpack "harenn_${TIMESTAMP}.binpack"
-            touch harenn_master.binpack
-          fi
-        fi
-        
-        git add *.binpack
-        
-        # Kiểm tra nếu không có gì thay đổi thì thoát để tránh lỗi commit trống
-        if git diff --staged --quiet; then
-          echo "Không có dữ liệu mới."
-          exit 0
-        fi
-        
-        # Dùng [skip ci] để tránh GitHub tự kích hoạt lại workflow từ chính commit này
-        git commit -m "Add HARENN data batch [skip ci]"
-        
-        # Pull lần cuối để tránh conflict nếu có thay đổi khác
-        git pull --rebase origin ${{ github.ref_name }}
-        
-        # Push lên nhánh hiện tại
-        git push origin HEAD:${{ github.ref_name }}
+      - name: Build HARENN generator
+        run: |
+          set -euxo pipefail
+          g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
 
-    - name: Trigger Next Cycle
-      if: always() && steps.push_step.outcome == 'success'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        echo "Nghỉ 30 giây trước khi bắt đầu chu kỳ mới..."
-        sleep 30
-        # Tự động kích hoạt chu kỳ tiếp theo thông qua GitHub CLI
-        gh workflow run "HARENN Continuous Data Generation" --ref ${{ github.ref_name }}
+      - name: Generate opening seeds
+        run: |
+          python preprocess_pgn.py \
+            --input UHO_2022_8mvs_+110_+119.pgn \
+            --output book_moves.txt \
+            --lines 8000 \
+            --plies "${BOOK_PLIES}" \
+            --seed 20260224
+
+      - name: Run dataset orchestrator
+        run: |
+          python scripts/generate_dataset.py \
+            --repo-root . \
+            --generator ./harenn_gen \
+            --stockfish ./stockfish \
+            --games "${GAMES}" \
+            --workers "${WORKERS}" \
+            --book-input UHO_2022_8mvs_+110_+119.pgn \
+            --book-lines 8000 \
+            --book-plies "${BOOK_PLIES}" \
+            --out-dir data/generated \
+            --prefix harenn
+
+      - name: List generated files
+        run: |
+          ls -lah data/generated
+
+      - name: Upload dataset artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: harenn-dataset-${{ github.run_id }}
+          path: data/generated/*
+          if-no-files-found: error
+          retention-days: 14

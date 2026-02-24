@@ -31,8 +31,8 @@
 
 namespace Nextfish {
 
-    // --- LỚP GIAO TIẾP VỚI STOCKFISH ---
-    // Giao tiếp qua Pipe liên tục (Persistent Process) để tối ưu hiệu suất
+    // --- Lá»šP GIAO TIáº¾P Vá»šI STOCKFISH ---
+    // Giao tiáº¿p qua Pipe liÃªn tá»¥c (Persistent Process) Ä‘á»ƒ tá»‘i Æ°u hiá»‡u suáº¥t
     class Stockfish {
     private:
         int pid = -1;
@@ -85,6 +85,10 @@ namespace Nextfish {
                 // Initialize Engine
                 write_cmd("uci");
                 wait_for("uciok");
+                // Stable, reproducible settings for dataset generation.
+                write_cmd("setoption name Threads value 1");
+                write_cmd("setoption name Hash value 256");
+                write_cmd("setoption name MultiPV value 1");
                 write_cmd("isready");
                 wait_for("readyok");
                 write_cmd("ucinewgame");
@@ -105,7 +109,7 @@ namespace Nextfish {
             write(pipe_in[1], full_cmd.c_str(), full_cmd.length());
         }
 
-        // Đọc một dòng từ pipe
+        // Äá»c má»™t dÃ²ng tá»« pipe
         std::string read_line() {
             std::string line = "";
             char c;
@@ -116,7 +120,7 @@ namespace Nextfish {
             return line;
         }
 
-        // Đọc và bỏ qua cho đến khi gặp token
+        // Äá»c vÃ  bá» qua cho Ä‘áº¿n khi gáº·p token
         void wait_for(const std::string& token) {
             while (true) {
                 std::string line = read_line();
@@ -124,7 +128,7 @@ namespace Nextfish {
             }
         }
 
-        // Search và trả về kết quả
+        // Search vÃ  tráº£ vá» káº¿t quáº£
         SearchResult search(const std::string& fen, int depth) {
             SearchResult result;
             
@@ -202,8 +206,8 @@ namespace Nextfish {
         }
     };
 
-    // --- LỚP BÀN CỜ TỐI GIẢN ---
-    // Chỉ dùng để theo dõi trạng thái và tạo FEN cho Stockfish
+    // --- Lá»šP BÃ€N Cá»œ Tá»I GIáº¢N ---
+    // Chá»‰ dÃ¹ng Ä‘á»ƒ theo dÃµi tráº¡ng thÃ¡i vÃ  táº¡o FEN cho Stockfish
     class Board {
     public:
         int squares[64]; // 0: Empty, 1-6: White (P,N,B,R,Q,K), 7-12: Black
@@ -244,7 +248,7 @@ namespace Nextfish {
             }
         }
 
-        // Tạo FEN string từ trạng thái bàn cờ hiện tại
+        // Táº¡o FEN string tá»« tráº¡ng thÃ¡i bÃ n cá» hiá»‡n táº¡i
         std::string get_fen() const {
             return current_fen;
         }
@@ -256,7 +260,7 @@ namespace Nextfish {
         }
     };
 
-    // --- THUẬT TOÁN HARENN CHUYÊN SÂU ---
+    // --- THUáº¬T TOÃN HARENN CHUYÃŠN SÃ‚U ---
 
     float calculate_std_dev(const std::vector<int>& values) {
         if (values.size() < 2) return 0.0f;
@@ -277,33 +281,33 @@ namespace Nextfish {
         return v;
     }
 
-    // --- SINH NHÃN HARENN SỬ DỤNG STOCKFISH ---
-    // Đây là nơi triển khai logic từ tài liệu HARENN của bạn
+    // --- SINH NHÃƒN HARENN Sá»¬ Dá»¤NG STOCKFISH ---
+    // ÄÃ¢y lÃ  nÆ¡i triá»ƒn khai logic tá»« tÃ i liá»‡u HARENN cá»§a báº¡n
     HARENNEntry compute_full_harenn_labels(Board& board, Stockfish& sf) {
         HARENNEntry entry;
         std::string fen = board.get_fen();
 
         // --- Head 1: Evaluation (Score) ---
-        // Search ở độ sâu tiêu chuẩn (ví dụ: 10)
+        // Search á»Ÿ Ä‘á»™ sÃ¢u tiÃªu chuáº©n (vÃ­ dá»¥: 10)
         int main_depth = 10; 
         auto main_result = sf.search(fen, main_depth);
         int main_score = main_result.score_cp;
 
         // --- Head 2: Tactical Complexity (tau) ---
-        // Phân tích sự biến động của điểm số ở các độ sâu khác nhau
+        // PhÃ¢n tÃ­ch sá»± biáº¿n Ä‘á»™ng cá»§a Ä‘iá»ƒm sá»‘ á»Ÿ cÃ¡c Ä‘á»™ sÃ¢u khÃ¡c nhau
         std::vector<int> depth_scores;
         std::vector<std::string> depth_moves;
         
         // Sample depths: 6, 8, 10
-        // Tối ưu hóa: Chạy search cho các độ sâu phụ trước
+        // Tá»‘i Æ°u hÃ³a: Cháº¡y search cho cÃ¡c Ä‘á»™ sÃ¢u phá»¥ trÆ°á»›c
         for (int d = 6; d < main_depth; d += 2) {
             auto res = sf.search(fen, d);
             depth_scores.push_back(res.score_cp);
             depth_moves.push_back(res.best_move_uci);
         }
-        // Thêm kết quả của lần search chính (đã có sẵn) để tránh search lại
+        // ThÃªm káº¿t quáº£ cá»§a láº§n search chÃ­nh (Ä‘Ã£ cÃ³ sáºµn) Ä‘á»ƒ trÃ¡nh search láº¡i
         // main_depth = 10.
-        // Việc này giúp tiết kiệm 1 lần gọi search tốn kém.
+        // Viá»‡c nÃ y giÃºp tiáº¿t kiá»‡m 1 láº§n gá»i search tá»‘n kÃ©m.
         depth_scores.push_back(main_score);
         depth_moves.push_back(main_result.best_move_uci);
 
@@ -379,6 +383,7 @@ namespace Nextfish {
         int deep_score = deep_result.score_cp;
         float rho = std::abs(main_score - deep_score) / 100.0f;
         if (main_result.best_move_uci != deep_result.best_move_uci) rho += 0.3f;
+        rho = clamp(rho, 0.0f, 1.0f);
         entry.risk_fixed = (int16_t)(rho * 100);
 
         // --- Head 5: Resolution Score (rs) ---
@@ -386,6 +391,7 @@ namespace Nextfish {
         auto static_res = sf.search(fen, 1);
         auto qs_res = sf.search(fen, 4);
         float rs = 1.0f - std::min(1.0f, std::abs(qs_res.score_cp - static_res.score_cp) / 150.0f);
+        rs = clamp(rs, 0.0f, 1.0f);
         entry.resolution_fixed = (int16_t)(rs * 100);
 
         // Metadata & Board State
@@ -407,7 +413,7 @@ namespace Nextfish {
     }
 }
 
-// Hàm tải Opening Book từ file python sinh ra
+// HÃ m táº£i Opening Book tá»« file python sinh ra
 std::vector<std::string> load_opening_book(const std::string& filename) {
     std::vector<std::string> book;
     std::ifstream file(filename);
@@ -421,6 +427,7 @@ std::vector<std::string> load_opening_book(const std::string& filename) {
 int play_one_game(std::ofstream& file, const std::string& opening_line, Nextfish::Stockfish& sf) {
     Nextfish::Board board;
     std::vector<HARENNEntry> game_positions;
+    std::set<std::string> seen_fens;
 
     // Maintain UCI moves string to ensure correct game state (castling, en passant)
     std::string current_moves_uci = "";
@@ -433,9 +440,9 @@ int play_one_game(std::ofstream& file, const std::string& opening_line, Nextfish
         current_moves_uci += move;
     }
 
-    // 2. Vòng lặp Self-Play (Tự chơi đến hết ván)
+    // 2. VÃ²ng láº·p Self-Play (Tá»± chÆ¡i Ä‘áº¿n háº¿t vÃ¡n)
     int move_count = 0;
-    while (move_count < 200) { // Giới hạn 200 nước đi mỗi ván
+    while (move_count < 200) { // Giá»›i háº¡n 200 nÆ°á»›c Ä‘i má»—i vÃ¡n
         // Sync Board state with Stockfish
         if (current_moves_uci.empty()) sf.write_cmd("position startpos");
         else sf.write_cmd("position startpos moves " + current_moves_uci);
@@ -444,11 +451,13 @@ int play_one_game(std::ofstream& file, const std::string& opening_line, Nextfish
         std::string fen = sf.get_fen();
         board.set_fen(fen);
 
-        // Sinh dữ liệu cho vị trí hiện tại
-        HARENNEntry entry = Nextfish::compute_full_harenn_labels(board, sf);
-        game_positions.push_back(entry);
+        // Sinh dá»¯ liá»‡u cho vá»‹ trÃ­ hiá»‡n táº¡i
+        if (seen_fens.insert(fen).second) {
+            HARENNEntry entry = Nextfish::compute_full_harenn_labels(board, sf);
+            game_positions.push_back(entry);
+        }
 
-        // Engine tự chọn nước đi tốt nhất để tiếp tục ván cờ
+        // Engine tá»± chá»n nÆ°á»›c Ä‘i tá»‘t nháº¥t Ä‘á»ƒ tiáº¿p tá»¥c vÃ¡n cá»
         auto best_move_result = sf.search(board.get_fen(), 8); // Search depth 8 cho self-play
         std::string best_move_uci = best_move_result.best_move_uci;
 
@@ -459,70 +468,70 @@ int play_one_game(std::ofstream& file, const std::string& opening_line, Nextfish
         move_count++;
     }
 
-    // 3. Gán kết quả hồi tố (Retroactive Result)
+    // 3. GÃ¡n káº¿t quáº£ há»“i tá»‘ (Retroactive Result)
     int final_eval = sf.search(board.get_fen(), 10).score_cp;
     
-    // SỬA LỖI: Chuyển điểm số tương đối (Stockfish) sang tuyệt đối (White perspective)
-    // Nếu đến lượt Đen (stm = -1), đảo dấu điểm số
+    // Sá»¬A Lá»–I: Chuyá»ƒn Ä‘iá»ƒm sá»‘ tÆ°Æ¡ng Ä‘á»‘i (Stockfish) sang tuyá»‡t Ä‘á»‘i (White perspective)
+    // Náº¿u Ä‘áº¿n lÆ°á»£t Äen (stm = -1), Ä‘áº£o dáº¥u Ä‘iá»ƒm sá»‘
     int absolute_score = (board.stm == 1) ? final_eval : -final_eval;
     int game_result = (absolute_score > 100) ? 1 : (absolute_score < -100 ? -1 : 0);
     
     for (auto& entry : game_positions) {
-        entry.result = game_result; // Cập nhật nhãn thắng/thua/hòa thực tế
+        entry.result = game_result; // Cáº­p nháº­t nhÃ£n tháº¯ng/thua/hÃ²a thá»±c táº¿
         file.write(reinterpret_cast<const char*>(&entry), sizeof(HARENNEntry));
     }
-    file.flush(); // Đảm bảo dữ liệu được ghi xuống đĩa ngay
+    file.flush(); // Äáº£m báº£o dá»¯ liá»‡u Ä‘Æ°á»£c ghi xuá»‘ng Ä‘Ä©a ngay
     return game_result;
 }
 
 void run_generation(int games, std::string filename, Nextfish::Stockfish& sf) {
     std::ofstream file(filename, std::ios::binary | std::ios::app);
     if (!file.is_open()) {
-        std::cerr << "Lỗi: Không thể mở file " << filename << std::endl;
+        std::cerr << "Lá»—i: KhÃ´ng thá»ƒ má»Ÿ file " << filename << std::endl;
         return;
     }
 
-    // Tải Opening Book đã được sinh ra bởi preprocess_pgn.py
+    // Táº£i Opening Book Ä‘Ã£ Ä‘Æ°á»£c sinh ra bá»Ÿi preprocess_pgn.py
     auto opening_book = load_opening_book("book_moves.txt");
     if (opening_book.empty()) {
-        opening_book.push_back(""); // Fallback nếu không có book
+        opening_book.push_back(""); // Fallback náº¿u khÃ´ng cÃ³ book
     }
 
     for (int i = 0; i < games; ++i) {
-        // Chọn ngẫu nhiên một dòng khai cuộc
+        // Chá»n ngáº«u nhiÃªn má»™t dÃ²ng khai cuá»™c
         std::string opening = opening_book[rand() % opening_book.size()];
         
         int result = play_one_game(file, opening, sf);
         std::string res_str = (result == 1) ? "1-0" : (result == -1 ? "0-1" : "1/2-1/2");
         
-        std::cout << "Ván " << i + 1 << "/" << games << " | Kết quả: " << res_str << " | Ghi dữ liệu thành công." << std::endl;
+        std::cout << "VÃ¡n " << i + 1 << "/" << games << " | Káº¿t quáº£: " << res_str << " | Ghi dá»¯ liá»‡u thÃ nh cÃ´ng." << std::endl;
     }
     file.close();
 }
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cout << "Sử dụng: ./harenn_gen <games> <output_file>" << std::endl;
+        std::cout << "Usage: ./harenn_gen <games> <output_file> [stockfish_path]" << std::endl;
         return 1;
     }
-    
+
     unsigned int seed = (unsigned int)std::chrono::high_resolution_clock::now().time_since_epoch().count() + (unsigned int)getpid();
     srand(seed);
-    
+
     std::cout << "Process ID: " << getpid() << " - Random Seed: " << seed << std::endl;
     std::cout << "--- HARENN Data Generation (Stockfish Backend) ---" << std::endl;
 
     int games = std::stoi(argv[1]);
     std::string output_file = argv[2];
+    std::string stockfish_path = (argc >= 4) ? argv[3] : "./stockfish";
 
     try {
-        // THAY ĐỔI ĐƯỜNG DẪN NÀY tới file thực thi Stockfish của bạn
-        Nextfish::Stockfish sf("./stockfish"); 
+        Nextfish::Stockfish sf(stockfish_path);
 
-        std::cout << "Bắt đầu Self-Play và sinh dữ liệu HARENN Multi-Head..." << std::endl;
+        std::cout << "Starting self-play and multi-head HARENN label generation..." << std::endl;
         run_generation(games, output_file, sf);
     } catch (const std::exception& e) {
-        std::cerr << "Lỗi nghiêm trọng: " << e.what() << std::endl;
+        std::cerr << "Fatal error: " << e.what() << std::endl;
         return 1;
     }
 
