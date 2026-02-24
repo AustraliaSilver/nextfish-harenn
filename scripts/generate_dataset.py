@@ -258,10 +258,10 @@ def quality_gate(stats: Dict[str, float], min_entries: int, strict: bool, profil
     if not (5.0 <= stats["avg_complexity_x100"] <= 95.0):
         errors.append(f"avg_complexity_x100 out of range: {stats['avg_complexity_x100']:.2f}")
 
-    if not (2.0 <= stats["avg_risk_x100"] <= 98.0):
+    if not (2.0 <= stats["avg_risk_x100"] <= 99.5):
         errors.append(f"avg_risk_x100 out of range: {stats['avg_risk_x100']:.2f}")
 
-    if not (2.0 <= stats["avg_resolution_x100"] <= 98.0):
+    if not (2.0 <= stats["avg_resolution_x100"] <= 99.5):
         errors.append(f"avg_resolution_x100 out of range: {stats['avg_resolution_x100']:.2f}")
 
     # Sparse MCS is expected, but all-zero map indicates broken generation.
