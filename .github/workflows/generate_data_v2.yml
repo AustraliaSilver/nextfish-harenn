@@ -48,7 +48,7 @@ jobs:
       WORKERS: ${{ github.event.inputs.workers || '2' }}
       BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
       SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
-      DATA_OUT: .harenn_artifacts
+      DATA_OUT: ${{ github.workspace }}/.harenn_artifacts
 
     steps:
       - name: Checkout
@@ -122,8 +122,8 @@ jobs:
       - name: Quality summary
         run: |
           python - << 'PY'
-          import json, pathlib, sys
-          out = pathlib.Path(".harenn_artifacts")
+          import json, pathlib, sys, os
+          out = pathlib.Path(os.environ["DATA_OUT"])
           manifests = sorted(out.glob("*.manifest.json"))
           if not manifests:
               print("No manifest found in", out)
@@ -149,10 +149,18 @@ jobs:
           print("hard subset entries:", int(h["entries"]))
           PY
 
+      - name: Verify artifact files exist
+        run: |
+          set -euxo pipefail
+          test -d "${DATA_OUT}"
+          count=$(find "${DATA_OUT}" -maxdepth 1 -type f | wc -l)
+          echo "artifact file count: ${count}"
+          test "${count}" -gt 0
+
       - name: Upload dataset artifacts
         uses: actions/upload-artifact@v4
         with:
           name: harenn-dataset-${{ github.run_id }}
-          path: ${{ env.DATA_OUT }}/*
+          path: ${{ env.DATA_OUT }}/**
           if-no-files-found: error
           retention-days: 14
