@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <array>
 #include <thread>
+#include <functional>
 #include <sys/wait.h>
 #include <signal.h>
 #include <map>
@@ -335,21 +336,32 @@ namespace Nextfish {
         entry.complexity_fixed = (int16_t)(tau * 100);
 
         // --- Head 3: Move Criticality Scores (MCS) ---
-        // Logic: Compare full-depth score vs reduced-depth score for moves
+        // Logic: Compare deeper score vs shallower score per move.
+        // Set a non-zero baseline for all legal moves to avoid all-zero bias.
         std::fill(std::begin(entry.mcs_map), std::end(entry.mcs_map), 0);
         
         auto legal_moves = sf.get_legal_moves(fen);
         
-        // Optimization: Sample moves to save time (Top 5 + 40% of others)
-        // int moves_processed = 0; // Uncomment to limit moves if too slow
+        // Deterministic and bounded sampling for runtime stability.
+        // Always evaluate first few moves and a hash-sampled subset of others.
         int mcs_depth_high = 7;
         int mcs_depth_low = 3;
+        const uint8_t baseline_crit = static_cast<uint8_t>(0.15f * 255.0f);
 
         for (size_t i = 0; i < legal_moves.size(); ++i) {
-            // Always process first 5 moves, then sample randomly
-            if (i >= 5 && (rand() % 100 > 40)) continue;
-
             const auto& m = legal_moves[i];
+
+            if (m.from >= 0 && m.from < 64 && m.to >= 0 && m.to < 64) {
+                entry.mcs_map[m.from * 64 + m.to] = baseline_crit;
+            }
+
+            bool eval_move = (i < 8);
+            if (!eval_move) {
+                std::string key = fen + "|" + m.uci;
+                uint8_t bucket = static_cast<uint8_t>(std::hash<std::string>{}(key) & 0xFF);
+                eval_move = (bucket < 77); // ~30% deterministic sample
+            }
+            if (!eval_move) continue;
             
             // Trick: Use UCI 'position ... moves ...' to search the resulting position
             // Note: Scores will be from opponent's perspective, but diff is absolute
@@ -487,7 +499,7 @@ int play_one_game(std::ofstream& file, const std::string& opening_line, Nextfish
 void run_generation(int games, std::string filename, Nextfish::Stockfish& sf) {
     std::ofstream file(filename, std::ios::binary | std::ios::app);
     if (!file.is_open()) {
-        std::cerr << "Lá»—i: KhÃ´ng thá»ƒ má»Ÿ file " << filename << std::endl;
+        std::cerr << "Error: cannot open output file " << filename << std::endl;
         return;
     }
 
@@ -504,7 +516,9 @@ void run_generation(int games, std::string filename, Nextfish::Stockfish& sf) {
         int result = play_one_game(file, opening, sf);
         std::string res_str = (result == 1) ? "1-0" : (result == -1 ? "0-1" : "1/2-1/2");
         
-        std::cout << "VÃ¡n " << i + 1 << "/" << games << " | Káº¿t quáº£: " << res_str << " | Ghi dá»¯ liá»‡u thÃ nh cÃ´ng." << std::endl;
+        std::cout << "Game " << i + 1 << "/" << games
+                  << " | Result: " << res_str
+                  << " | Data recorded." << std::endl;
     }
     file.close();
 }

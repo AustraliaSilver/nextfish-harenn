@@ -31,6 +31,10 @@ on:
   schedule:
     - cron: "30 2 * * *"
 
+concurrency:
+  group: harenn-datagen-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -99,7 +103,8 @@ jobs:
             --book-lines 8000 \
             --book-plies "${BOOK_PLIES}" \
             --out-dir "${DATA_OUT}" \
-            --prefix harenn
+            --prefix harenn \
+            --strict-quality
 
       - name: Safety guard (no dataset in git index)
         run: |

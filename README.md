@@ -33,11 +33,13 @@ python scripts/generate_dataset.py \
   --games 120 \
   --workers 2 \
   --out-dir data/generated \
-  --prefix harenn
+  --prefix harenn \
+  --strict-quality
 ```
 
 Outputs:
 - `*.binpack` merged dataset
+- `*.train.binpack`, `*.val.binpack`, `*.test.binpack` deterministic splits
 - `*.binpack.zst` (or `.gz`) compressed dataset
 - `*.manifest.json` with quality stats and checksums
 
@@ -45,4 +47,5 @@ Outputs:
 
 - Generator now uses fixed Stockfish options for reproducibility: `Threads=1`, `Hash=256`.
 - Repeated positions in a game are deduplicated before writing labels.
+- Datagen enforces quality gates (entry count, label ranges, MCS density, phase diversity).
 - Workflow uploads artifacts instead of committing large binary files into git history.
