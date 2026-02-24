@@ -240,14 +240,20 @@ def maybe_compress(src: Path, prefer_zstd: bool = True) -> Tuple[Path, str]:
     return dst, "gzip"
 
 
-def quality_gate(stats: Dict[str, float], min_entries: int, strict: bool) -> None:
+def quality_gate(stats: Dict[str, float], min_entries: int, strict: bool, profile: str = "default") -> None:
     errors: List[str] = []
 
     if stats["entries"] < min_entries:
         errors.append(f"entries too low: {stats['entries']} < {min_entries}")
 
-    if not (5.0 <= stats["avg_abs_score_cp"] <= 2500.0):
-        errors.append(f"avg_abs_score_cp out of range: {stats['avg_abs_score_cp']:.2f}")
+    if profile == "hard":
+        # Hard subset intentionally contains tactical/horizon-heavy positions.
+        # Absolute scores are expected to be much larger than merged/split sets.
+        if not (100.0 <= stats["avg_abs_score_cp"] <= 12000.0):
+            errors.append(f"avg_abs_score_cp out of range: {stats['avg_abs_score_cp']:.2f}")
+    else:
+        if not (5.0 <= stats["avg_abs_score_cp"] <= 2500.0):
+            errors.append(f"avg_abs_score_cp out of range: {stats['avg_abs_score_cp']:.2f}")
 
     if not (5.0 <= stats["avg_complexity_x100"] <= 95.0):
         errors.append(f"avg_complexity_x100 out of range: {stats['avg_complexity_x100']:.2f}")
@@ -359,7 +365,12 @@ def main() -> None:
     hard_path = out_dir / f"{args.prefix}_{stamp}.hard.binpack"
     hard_build = build_hard_subset(merged, hard_path, max_entries=250000)
     hard_stats = inspect_binpack(hard_path)
-    quality_gate(hard_stats, min_entries=max(100, args.min_entries // 20), strict=args.strict_quality)
+    quality_gate(
+        hard_stats,
+        min_entries=max(100, args.min_entries // 20),
+        strict=args.strict_quality,
+        profile="hard",
+    )
 
     compressed, codec = maybe_compress(merged, prefer_zstd=True)
     split_compressed = {}
