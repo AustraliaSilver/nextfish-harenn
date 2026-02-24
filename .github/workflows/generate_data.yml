@@ -88,7 +88,8 @@ jobs:
             --output book_moves.txt \
             --lines 8000 \
             --plies "${BOOK_PLIES}" \
-            --seed 20260224
+            --seed 20260224 \
+            --strict-source
 
       - name: Run dataset orchestrator
         run: |

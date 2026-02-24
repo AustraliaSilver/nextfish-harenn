@@ -6,7 +6,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 ENTRY_STRUCT = struct.Struct("<Q32sbhb4096shh")
 ENTRY_SIZE = ENTRY_STRUCT.size  # 4146 bytes
@@ -149,6 +149,69 @@ def split_dataset(src: Path, out_dir: Path, prefix: str, stamp: str) -> Dict[str
     return split_paths
 
 
+def merge_shards_dedup(shards: List[Path], merged: Path) -> Dict[str, int]:
+    seen_keys: Set[bytes] = set()
+    kept = 0
+    dropped = 0
+
+    with merged.open("wb") as fo:
+        for shard in shards:
+            with shard.open("rb") as fi:
+                while True:
+                    raw = fi.read(ENTRY_SIZE)
+                    if not raw:
+                        break
+                    if len(raw) != ENTRY_SIZE:
+                        raise RuntimeError(f"truncated entry in shard {shard}")
+                    key = raw[:41]  # occupancy + pieces + stm
+                    if key in seen_keys:
+                        dropped += 1
+                        continue
+                    seen_keys.add(key)
+                    fo.write(raw)
+                    kept += 1
+
+    print(f"[merge] kept={kept} dedup_dropped={dropped}")
+    return {"kept_entries": kept, "dedup_dropped": dropped}
+
+
+def build_hard_subset(src: Path, out_path: Path, max_entries: int = 250000) -> Dict[str, float]:
+    written = 0
+    scanned = 0
+
+    with src.open("rb") as fi, out_path.open("wb") as fo:
+        while written < max_entries:
+            raw = fi.read(ENTRY_SIZE)
+            if not raw:
+                break
+            if len(raw) != ENTRY_SIZE:
+                raise RuntimeError(f"truncated entry in {src}")
+            scanned += 1
+
+            _, _, _, score, _, complexity, mcs_map, risk, resolution = unpack_entry(raw)
+            mcs_nonzero_ratio = sum(1 for v in mcs_map if v != 0) / 4096.0
+
+            hard = (
+                complexity >= 60
+                or risk >= 55
+                or resolution <= 35
+                or abs(score) >= 300
+                or mcs_nonzero_ratio >= 0.02
+            )
+            if not hard:
+                continue
+
+            fo.write(raw)
+            written += 1
+
+    if written == 0:
+        raise RuntimeError("hard subset generation produced zero entries")
+
+    ratio = written / max(1, scanned)
+    print(f"[hard] scanned={scanned} written={written} ratio={ratio:.4f}")
+    return {"scanned": scanned, "written": written, "accept_ratio": ratio}
+
+
 def maybe_compress(src: Path, prefer_zstd: bool = True) -> Tuple[Path, str]:
     if prefer_zstd:
         try:
@@ -235,23 +298,24 @@ def main() -> None:
     out_dir = (root / args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    run(
-        [
-            sys.executable,
-            "preprocess_pgn.py",
-            "--input",
-            args.book_input,
-            "--output",
-            "book_moves.txt",
-            "--lines",
-            str(args.book_lines),
-            "--plies",
-            str(args.book_plies),
-            "--seed",
-            "20260224",
-        ],
-        cwd=root,
-    )
+    preprocess_cmd = [
+        sys.executable,
+        "preprocess_pgn.py",
+        "--input",
+        args.book_input,
+        "--output",
+        "book_moves.txt",
+        "--lines",
+        str(args.book_lines),
+        "--plies",
+        str(args.book_plies),
+        "--seed",
+        "20260224",
+    ]
+    if args.strict_quality:
+        preprocess_cmd.append("--strict-source")
+
+    run(preprocess_cmd, cwd=root)
 
     workers = max(1, args.workers)
     games_per_worker = args.games // workers
@@ -278,20 +342,21 @@ def main() -> None:
         total_entries += int(st["entries"])
 
     merged = out_dir / f"{args.prefix}_{stamp}.binpack"
-    with merged.open("wb") as fo:
-        for s in shards:
-            with s.open("rb") as fi:
-                while True:
-                    chunk = fi.read(1 << 20)
-                    if not chunk:
-                        break
-                    fo.write(chunk)
+    merge_stats = merge_shards_dedup(shards, merged)
 
     merged_stats = inspect_binpack(merged)
     quality_gate(merged_stats, min_entries=args.min_entries, strict=args.strict_quality)
 
     split_paths = split_dataset(merged, out_dir, args.prefix, stamp)
     split_stats = {name: inspect_binpack(path) for name, path in split_paths.items()}
+    for name, stats in split_stats.items():
+        split_min = max(200, args.min_entries // 10)
+        quality_gate(stats, min_entries=split_min, strict=args.strict_quality)
+
+    hard_path = out_dir / f"{args.prefix}_{stamp}.hard.binpack"
+    hard_build = build_hard_subset(merged, hard_path, max_entries=250000)
+    hard_stats = inspect_binpack(hard_path)
+    quality_gate(hard_stats, min_entries=max(100, args.min_entries // 20), strict=args.strict_quality)
 
     compressed, codec = maybe_compress(merged, prefer_zstd=True)
     split_compressed = {}
@@ -303,6 +368,8 @@ def main() -> None:
             "size_bytes": cp.stat().st_size,
             "sha256": sha256_of(cp),
         }
+
+    hard_compressed, hard_codec = maybe_compress(hard_path, prefer_zstd=True)
 
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -318,6 +385,7 @@ def main() -> None:
             "strict": args.strict_quality,
             "min_entries": args.min_entries,
         },
+        "merge": merge_stats,
         "shards": shard_stats,
         "total_entries": total_entries,
         "merged": {
@@ -342,6 +410,19 @@ def main() -> None:
             "sha256": sha256_of(compressed),
         },
         "split_compressed": split_compressed,
+        "hard_subset": {
+            "path": hard_path.name,
+            "size_bytes": hard_path.stat().st_size,
+            "sha256": sha256_of(hard_path),
+            "stats": hard_stats,
+            "build": hard_build,
+            "compressed": {
+                "path": hard_compressed.name,
+                "codec": hard_codec,
+                "size_bytes": hard_compressed.stat().st_size,
+                "sha256": sha256_of(hard_compressed),
+            },
+        },
     }
 
     manifest_path = out_dir / f"{args.prefix}_{stamp}.manifest.json"

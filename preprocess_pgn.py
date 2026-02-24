@@ -49,6 +49,11 @@ def main() -> None:
     parser.add_argument("--lines", type=int, default=5000, help="Number of opening seed lines")
     parser.add_argument("--plies", type=int, default=8, help="Maximum plies extracted per game")
     parser.add_argument("--seed", type=int, default=20260224, help="Random seed")
+    parser.add_argument(
+        "--strict-source",
+        action="store_true",
+        help="Fail if PGN is missing/unreadable instead of using fallback random seeds",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -59,9 +64,13 @@ def main() -> None:
         print(f"[book] Extracting from PGN: {pgn_path}")
         lines = extract_openings_from_pgn(pgn_path, args.lines, args.plies)
         if not lines:
+            if args.strict_source:
+                raise RuntimeError(f"[book] strict-source enabled and PGN parse produced no lines: {pgn_path}")
             print("[book] PGN parse produced no lines, using fallback random seeds.")
             lines = generate_fallback_openings(args.lines)
     else:
+        if args.strict_source:
+            raise FileNotFoundError(f"[book] strict-source enabled and PGN not found: {pgn_path}")
         print(f"[book] PGN not found: {pgn_path}, using fallback random seeds.")
         lines = generate_fallback_openings(args.lines)
 

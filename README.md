@@ -20,7 +20,7 @@ g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
 2. Build opening seeds:
 
 ```bash
-python preprocess_pgn.py --input books/UHO_2022_8mvs_+110_+119.pgn --output book_moves.txt --lines 8000 --plies 8
+python preprocess_pgn.py --input books/UHO_2022_8mvs_+110_+119.pgn --output book_moves.txt --lines 8000 --plies 8 --strict-source
 ```
 
 3. Run orchestrator:
@@ -40,6 +40,7 @@ python scripts/generate_dataset.py \
 Outputs:
 - `*.binpack` merged dataset
 - `*.train.binpack`, `*.val.binpack`, `*.test.binpack` deterministic splits
+- `*.hard.binpack` hard subset for tactical/horizon-focused training
 - `*.binpack.zst` (or `.gz`) compressed dataset
 - `*.manifest.json` with quality stats and checksums
 
@@ -47,5 +48,6 @@ Outputs:
 
 - Generator now uses fixed Stockfish options for reproducibility: `Threads=1`, `Hash=256`.
 - Repeated positions in a game are deduplicated before writing labels.
-- Datagen enforces quality gates (entry count, label ranges, MCS density, phase diversity).
+- Datagen enforces quality gates on merged and splits (entry count, label ranges, MCS density, phase diversity).
+- In strict mode, opening PGN must exist and parse successfully (no random fallback).
 - Workflow uploads artifacts instead of committing large binary files into git history.
