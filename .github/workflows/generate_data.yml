@@ -118,6 +118,36 @@ jobs:
         run: |
           ls -lah "${DATA_OUT}"
 
+      - name: Quality summary
+        run: |
+          python - << 'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(".harenn_artifacts")
+          manifests = sorted(out.glob("*.manifest.json"))
+          if not manifests:
+              print("No manifest found in", out)
+              sys.exit(1)
+          m = manifests[-1]
+          data = json.loads(m.read_text(encoding="utf-8"))
+          print("Manifest:", m.name)
+          print("Total entries:", data.get("total_entries"))
+          ms = data["merged"]["stats"]
+          print("Merged avg_abs_score_cp:", round(ms["avg_abs_score_cp"], 3))
+          print("Merged avg_complexity_x100:", round(ms["avg_complexity_x100"], 3))
+          print("Merged avg_risk_x100:", round(ms["avg_risk_x100"], 3))
+          print("Merged avg_resolution_x100:", round(ms["avg_resolution_x100"], 3))
+          print("Merged avg_mcs_nonzero_ratio:", round(ms["avg_mcs_nonzero_ratio"], 6))
+          print("Phase ratios:",
+                round(ms["phase_opening_ratio"], 3),
+                round(ms["phase_middlegame_ratio"], 3),
+                round(ms["phase_endgame_ratio"], 3))
+          for split in ("train", "val", "test"):
+              s = data["splits"][split]["stats"]
+              print(f"{split}: entries={int(s['entries'])} mcs_nonzero={s['avg_mcs_nonzero_ratio']:.6f}")
+          h = data["hard_subset"]["stats"]
+          print("hard subset entries:", int(h["entries"]))
+          PY
+
       - name: Upload dataset artifacts
         uses: actions/upload-artifact@v4
         with:
