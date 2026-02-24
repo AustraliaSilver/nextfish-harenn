@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-ENTRY_STRUCT = struct.Struct("<Q32sbhb4096shh")
+# HARENNEntry (packed, see harenn_data.h):
+# occupancy(Q), pieces(32s), stm(b), score(h), result(b),
+# complexity_fixed(h), mcs_map(4096s), risk_fixed(h), resolution_fixed(h)
+ENTRY_STRUCT = struct.Struct("<Q32sbhbh4096shh")
 ENTRY_SIZE = ENTRY_STRUCT.size  # 4146 bytes
 
 
