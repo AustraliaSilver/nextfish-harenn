@@ -48,7 +48,7 @@ jobs:
       WORKERS: ${{ github.event.inputs.workers || '2' }}
       BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
       SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
-      DATA_OUT: ${{ github.workspace }}/.harenn_artifacts
+      DATA_OUT: ${{ github.workspace }}/harenn_artifacts
 
     steps:
       - name: Checkout
