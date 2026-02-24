@@ -63,9 +63,14 @@ jobs:
         run: |
           set -euxo pipefail
           curl -L -o stockfish.tar "https://github.com/official-stockfish/Stockfish/releases/download/${SF_TAG}/stockfish-ubuntu-x86-64-avx2.tar"
-          tar -xvf stockfish.tar
-          mv stockfish/stockfish-ubuntu-x86-64-avx2 ./stockfish
-          chmod +x ./stockfish
+          tar -xf stockfish.tar
+          SF_BIN="$(find . -type f -name 'stockfish-ubuntu-x86-64-avx2' | head -n 1)"
+          if [ -z "${SF_BIN}" ]; then
+            echo "Stockfish binary not found after extraction"
+            exit 1
+          fi
+          cp "${SF_BIN}" ./sf_engine
+          chmod +x ./sf_engine
 
       - name: Build HARENN generator
         run: |
@@ -87,7 +92,7 @@ jobs:
           python scripts/generate_dataset.py \
             --repo-root . \
             --generator ./harenn_gen \
-            --stockfish ./stockfish \
+            --stockfish ./sf_engine \
             --games "${GAMES}" \
             --workers "${WORKERS}" \
             --book-input UHO_2022_8mvs_+110_+119.pgn \
