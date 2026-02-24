@@ -1,0 +1,44 @@
+name: HARENN Post Dataset Pipeline
+
+on:
+  workflow_run:
+    workflows: ["HARENN Dataset Generation v2"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  post_process:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download dataset artifact from triggering run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: downloaded_artifacts
+
+      - name: Verify and summarize artifact payload
+        run: |
+          set -euxo pipefail
+          test -d downloaded_artifacts
+          file_count=$(find downloaded_artifacts -type f | wc -l)
+          echo "file_count=${file_count}" >> "$GITHUB_ENV"
+          test "${file_count}" -gt 0
+          find downloaded_artifacts -type f -maxdepth 5 | sort > artifact_file_list.txt
+          head -n 200 artifact_file_list.txt > artifact_file_list_preview.txt
+
+      - name: Upload post-process report
+        uses: actions/upload-artifact@v4
+        with:
+          name: harenn-post-report-${{ github.run_id }}
+          path: |
+            artifact_file_list.txt
+            artifact_file_list_preview.txt
+          if-no-files-found: error
+          retention-days: 14

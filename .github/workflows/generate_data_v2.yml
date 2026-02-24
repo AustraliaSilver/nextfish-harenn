@@ -16,7 +16,7 @@ on:
       games:
         description: "Total self-play games"
         required: false
-        default: "120"
+        default: "2000"
       workers:
         description: "Parallel generator workers"
         required: false
@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      GAMES: ${{ github.event.inputs.games || '120' }}
+      GAMES: ${{ github.event.inputs.games || '2000' }}
       WORKERS: ${{ github.event.inputs.workers || '2' }}
       BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
       SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
