@@ -106,7 +106,7 @@ def main() -> None:
     p.add_argument('--stockfish', default='./stockfish')
     p.add_argument('--games', type=int, default=120)
     p.add_argument('--workers', type=int, default=2)
-    p.add_argument('--book-input', default='UHO_2022_8mvs_+110_+119.pgn')
+    p.add_argument('--book-input', default='books/UHO_2022_8mvs_+110_+119.pgn')
     p.add_argument('--book-lines', type=int, default=8000)
     p.add_argument('--book-plies', type=int, default=8)
     p.add_argument('--out-dir', default='data/generated')

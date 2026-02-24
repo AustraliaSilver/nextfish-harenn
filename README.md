@@ -20,7 +20,7 @@ g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
 2. Build opening seeds:
 
 ```bash
-python preprocess_pgn.py --input UHO_2022_8mvs_+110_+119.pgn --output book_moves.txt --lines 8000 --plies 8
+python preprocess_pgn.py --input books/UHO_2022_8mvs_+110_+119.pgn --output book_moves.txt --lines 8000 --plies 8
 ```
 
 3. Run orchestrator:

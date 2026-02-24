@@ -80,7 +80,7 @@ jobs:
       - name: Generate opening seeds
         run: |
           python preprocess_pgn.py \
-            --input UHO_2022_8mvs_+110_+119.pgn \
+            --input books/UHO_2022_8mvs_+110_+119.pgn \
             --output book_moves.txt \
             --lines 8000 \
             --plies "${BOOK_PLIES}" \
@@ -95,7 +95,7 @@ jobs:
             --stockfish ./sf_engine \
             --games "${GAMES}" \
             --workers "${WORKERS}" \
-            --book-input UHO_2022_8mvs_+110_+119.pgn \
+            --book-input books/UHO_2022_8mvs_+110_+119.pgn \
             --book-lines 8000 \
             --book-plies "${BOOK_PLIES}" \
             --out-dir "${DATA_OUT}" \

@@ -44,7 +44,7 @@ def extract_openings_from_pgn(pgn_path: Path, max_lines: int, plies: int) -> lis
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build opening seeds (UCI moves) for HARENN datagen.")
-    parser.add_argument("--input", default="UHO_2022_8mvs_+110_+119.pgn", help="Optional PGN file path")
+    parser.add_argument("--input", default="books/UHO_2022_8mvs_+110_+119.pgn", help="Optional PGN file path")
     parser.add_argument("--output", default="book_moves.txt", help="Output seed line file")
     parser.add_argument("--lines", type=int, default=5000, help="Number of opening seed lines")
     parser.add_argument("--plies", type=int, default=8, help="Maximum plies extracted per game")
