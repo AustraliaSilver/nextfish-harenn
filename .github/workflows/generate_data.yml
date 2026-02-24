@@ -34,6 +34,7 @@ jobs:
       WORKERS: ${{ github.event.inputs.workers || '2' }}
       BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
       SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
+      DATA_OUT: ${{ runner.temp }}/harenn_data
 
     steps:
       - name: Checkout
@@ -73,6 +74,7 @@ jobs:
 
       - name: Run dataset orchestrator
         run: |
+          mkdir -p "${DATA_OUT}"
           python scripts/generate_dataset.py \
             --repo-root . \
             --generator ./harenn_gen \
@@ -82,17 +84,24 @@ jobs:
             --book-input UHO_2022_8mvs_+110_+119.pgn \
             --book-lines 8000 \
             --book-plies "${BOOK_PLIES}" \
-            --out-dir data/generated \
+            --out-dir "${DATA_OUT}" \
             --prefix harenn
+
+      - name: Safety guard (no dataset in git index)
+        run: |
+          if git ls-files '*.binpack' '*.binpack.zst' '*.binpack.gz' | grep -q .; then
+            echo "ERROR: dataset files are tracked by git; remove them from index/history."
+            exit 1
+          fi
 
       - name: List generated files
         run: |
-          ls -lah data/generated
+          ls -lah "${DATA_OUT}"
 
       - name: Upload dataset artifacts
         uses: actions/upload-artifact@v4
         with:
           name: harenn-dataset-${{ github.run_id }}
-          path: data/generated/*
+          path: ${{ env.DATA_OUT }}/*
           if-no-files-found: error
           retention-days: 14
