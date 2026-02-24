@@ -1,0 +1,158 @@
+name: HARENN Dataset Generation v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/generate_data.yml'
+      - '.github/workflows/generate_data_v2.yml'
+      - 'harenn_gen.cpp'
+      - 'harenn_data.h'
+      - 'preprocess_pgn.py'
+      - 'scripts/**'
+      - 'README.md'
+  workflow_dispatch:
+    inputs:
+      games:
+        description: "Total self-play games"
+        required: false
+        default: "120"
+      workers:
+        description: "Parallel generator workers"
+        required: false
+        default: "2"
+      book_plies:
+        description: "Opening plies to keep"
+        required: false
+        default: "8"
+      stockfish_release:
+        description: "Stockfish release tag"
+        required: false
+        default: "sf_18"
+  schedule:
+    - cron: "30 2 * * *"
+
+concurrency:
+  group: harenn-datagen-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GAMES: ${{ github.event.inputs.games || '120' }}
+      WORKERS: ${{ github.event.inputs.workers || '2' }}
+      BOOK_PLIES: ${{ github.event.inputs.book_plies || '8' }}
+      SF_TAG: ${{ github.event.inputs.stockfish_release || 'sf_18' }}
+      DATA_OUT: .harenn_artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-chess zstandard
+
+      - name: Download Stockfish release
+        run: |
+          set -euxo pipefail
+          curl -L -o stockfish.tar "https://github.com/official-stockfish/Stockfish/releases/download/${SF_TAG}/stockfish-ubuntu-x86-64-avx2.tar"
+          tar -xf stockfish.tar
+          SF_BIN="$(find . -type f -name 'stockfish-ubuntu-x86-64-avx2' | head -n 1)"
+          if [ -z "${SF_BIN}" ]; then
+            echo "Stockfish binary not found after extraction"
+            exit 1
+          fi
+          cp "${SF_BIN}" ./sf_engine
+          chmod +x ./sf_engine
+
+      - name: Build HARENN generator
+        run: |
+          set -euxo pipefail
+          g++ -O3 -std=c++17 harenn_gen.cpp -o harenn_gen -lpthread
+
+      - name: Generate opening seeds
+        run: |
+          python preprocess_pgn.py \
+            --input books/UHO_2022_8mvs_+110_+119.pgn \
+            --output book_moves.txt \
+            --lines 8000 \
+            --plies "${BOOK_PLIES}" \
+            --seed 20260224 \
+            --strict-source
+
+      - name: Run dataset orchestrator
+        run: |
+          mkdir -p "${DATA_OUT}"
+          python scripts/generate_dataset.py \
+            --repo-root . \
+            --generator ./harenn_gen \
+            --stockfish ./sf_engine \
+            --games "${GAMES}" \
+            --workers "${WORKERS}" \
+            --book-input books/UHO_2022_8mvs_+110_+119.pgn \
+            --book-lines 8000 \
+            --book-plies "${BOOK_PLIES}" \
+            --out-dir "${DATA_OUT}" \
+            --prefix harenn \
+            --strict-quality
+
+      - name: Safety guard (no dataset in git index)
+        run: |
+          if git ls-files '*.binpack' '*.binpack.zst' '*.binpack.gz' | grep -q .; then
+            echo "ERROR: dataset files are tracked by git; remove them from index/history."
+            exit 1
+          fi
+
+      - name: List generated files
+        run: |
+          ls -lah "${DATA_OUT}"
+
+      - name: Quality summary
+        run: |
+          python - << 'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(".harenn_artifacts")
+          manifests = sorted(out.glob("*.manifest.json"))
+          if not manifests:
+              print("No manifest found in", out)
+              sys.exit(1)
+          m = manifests[-1]
+          data = json.loads(m.read_text(encoding="utf-8"))
+          print("Manifest:", m.name)
+          print("Total entries:", data.get("total_entries"))
+          ms = data["merged"]["stats"]
+          print("Merged avg_abs_score_cp:", round(ms["avg_abs_score_cp"], 3))
+          print("Merged avg_complexity_x100:", round(ms["avg_complexity_x100"], 3))
+          print("Merged avg_risk_x100:", round(ms["avg_risk_x100"], 3))
+          print("Merged avg_resolution_x100:", round(ms["avg_resolution_x100"], 3))
+          print("Merged avg_mcs_nonzero_ratio:", round(ms["avg_mcs_nonzero_ratio"], 6))
+          print("Phase ratios:",
+                round(ms["phase_opening_ratio"], 3),
+                round(ms["phase_middlegame_ratio"], 3),
+                round(ms["phase_endgame_ratio"], 3))
+          for split in ("train", "val", "test"):
+              s = data["splits"][split]["stats"]
+              print(f"{split}: entries={int(s['entries'])} mcs_nonzero={s['avg_mcs_nonzero_ratio']:.6f}")
+          h = data["hard_subset"]["stats"]
+          print("hard subset entries:", int(h["entries"]))
+          PY
+
+      - name: Upload dataset artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: harenn-dataset-${{ github.run_id }}
+          path: ${{ env.DATA_OUT }}/*
+          if-no-files-found: error
+          retention-days: 14
