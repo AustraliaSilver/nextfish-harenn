@@ -11,6 +11,7 @@ jobs:
   data-generation:
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
     steps:
       - name: Checkout code
@@ -27,6 +28,12 @@ jobs:
           cd src
           curl -L -O https://tests.stockfishchess.org/api/nn/nn-3dd094f3dfcf.nnue
           curl -L -O https://tests.stockfishchess.org/api/nn/nn-37f18f62d772.nnue
+          
+          # Fix possible ambiguity in search.cpp by using explicit namespace
+          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' search.cpp
+          sed -i 's/HARENN::EvalResult/Stockfish::HARENN::EvalResult/g' search.cpp
+          sed -i 's/DEE::Evaluator/Stockfish::DEE::Evaluator/g' search.cpp
+          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' main.cpp
           
           make ARCH=x86-64-modern all -j$(nproc)
           mv stockfish ../harenn_engine
