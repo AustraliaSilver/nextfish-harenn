@@ -1,0 +1,83 @@
+name: HARENN Continuous Data Generation
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  data-generation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make python3-pip
+          pip install python-chess numpy
+
+      - name: Build HARENN Engine
+        run: |
+          # We need the source code. Assuming it's in the repo or we copy from local
+          # For GitHub Actions, we'll build from the 'src' directory in the repo
+          cd src
+          make ARCH=x86-64-modern all -j$(nproc)
+          mv stockfish ../harenn_engine
+          cd ..
+
+      - name: Generate Data (2 Minutes Test)
+        run: |
+          # Start time
+          START_TIME=$(date +%s)
+          # 2 minutes in seconds = 120
+          TIMEOUT=120 
+          
+          echo "Starting data generation for 2 minutes..."
+          
+          python3 <<EOF
+          import subprocess
+          import time
+          import os
+          
+          start_time = time.time()
+          timeout = 120 # 2 mins
+          
+          while time.time() - start_time < timeout:
+              print(f"Running batch at {time.time() - start_time:.0f}s")
+              subprocess.run([
+                  "python3", "generate_training_data.py",
+                  "--engine", "./harenn_engine",
+                  "--games", "2",
+                  "--output", "./data",
+                  "--epd", "openings.epd"
+              ])
+              if time.time() - start_time > timeout - 30: # 30s margin
+                  break
+          EOF
+
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name "HARENN Data Bot"
+          git config --global user.email "harenn-bot@users.noreply.github.com"
+          
+          # Create data branch if it doesn't exist or switch to it
+          git checkout -b data || git checkout data
+          
+          git add data/*.jsonl
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          git commit -m "Add HARENN training data $timestamp [skip ci]" || echo "No changes to commit"
+          git push origin data
+          
+      - name: Trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Trigger the same workflow again to create a loop
+          gh workflow run datagen.yml
