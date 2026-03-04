@@ -4,14 +4,14 @@ on:
   push:
     branches:
       - main
-      - master
+  schedule:
+    - cron: '0 */5 * * *' # Every 5 hours
   workflow_dispatch:
 
 jobs:
   data-generation:
     runs-on: ubuntu-latest
     permissions:
-      actions: write
       contents: write
     steps:
       - name: Checkout code
@@ -86,18 +86,14 @@ jobs:
           git config --global user.name "HARENN Data Bot"
           git config --global user.email "harenn-bot@users.noreply.github.com"
           
-          # Create data branch if it doesn't exist or switch to it
-          git checkout -b data || git checkout data
+          # Force checkout or create data branch
+          git fetch origin data || true
+          git checkout data || git checkout -b data
           
-          git add data/*.jsonl
+          # Merge main changes if needed to keep build scripts up to date
+          git merge main -m "Merge main into data [skip ci]" || true
+          
+          git add -f data/*.jsonl
           timestamp=$(date +%Y%m%d_%H%M%S)
           git commit -m "Add HARENN training data $timestamp [skip ci]" || echo "No changes to commit"
           git push origin data
-          
-      - name: Trigger next run
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Trigger the same workflow again to create a loop
-          gh workflow run datagen.yml
