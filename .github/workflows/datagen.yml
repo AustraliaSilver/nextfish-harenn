@@ -25,46 +25,53 @@ jobs:
       - name: Build HARENN Engine
         run: |
           cd src
-          # Download networks manually since we are in a lite repo
           curl -L -O https://tests.stockfishchess.org/api/nn/nn-3dd094f3dfcf.nnue
           curl -L -O https://tests.stockfishchess.org/api/nn/nn-37f18f62d772.nnue
           
-          # Build without net check
           make ARCH=x86-64-modern all -j$(nproc)
           mv stockfish ../harenn_engine
           cd ..
+          chmod +x harenn_engine
+          chmod +x generate_training_data.py
 
       - name: Generate Data (2 Minutes Test)
         run: |
-          # Create data directory
           mkdir -p data
-          
           echo "Starting data generation for 2 minutes..."
           
           python3 <<EOF
           import subprocess
           import time
           import os
+          import sys
           
           start_time = time.time()
           timeout = 120 # 2 mins
           
-          while time.time() - start_time < timeout:
-              print(f"Running batch at {time.time() - start_time:.0f}s")
-              # Create dummy epd if not exists for safety
-              if not os.path.exists("openings.epd"):
-                  with open("openings.epd", "w") as f:
-                      f.write("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\n")
-              
-              subprocess.run([
-                  "python3", "generate_training_data.py",
-                  "--engine", "./harenn_engine",
-                  "--games", "2",
-                  "--output", "./data",
-                  "--epd", "openings.epd"
-              ])
-              if time.time() - start_time > timeout - 30: # 30s margin
-                  break
+          try:
+              while time.time() - start_time < timeout:
+                  print(f"Running batch at {time.time() - start_time:.0f}s")
+                  if not os.path.exists("openings.epd"):
+                      with open("openings.epd", "w") as f:
+                          f.write("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\n")
+                  
+                  result = subprocess.run([
+                      "python3", "generate_training_data.py",
+                      "--engine", "./harenn_engine",
+                      "--games", "2",
+                      "--output", "./data",
+                      "--epd", "openings.epd"
+                  ], capture_output=True, text=True)
+                  
+                  print(result.stdout)
+                  if result.stderr:
+                      print(f"Error output: {result.stderr}", file=sys.stderr)
+                      
+                  if time.time() - start_time > timeout - 30:
+                      break
+          except Exception as e:
+              print(f"Python wrapper error: {e}")
+              sys.exit(1)
           EOF
 
       - name: Commit and Push Data
