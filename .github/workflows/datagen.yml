@@ -35,7 +35,8 @@ jobs:
           sed -i 's/DEE::Evaluator/Stockfish::DEE::Evaluator/g' search.cpp
           sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' main.cpp
           
-          make ARCH=x86-64-modern all -j$(nproc)
+          # Use modern ARCH name
+          make ARCH=x86-64-sse41-popcnt all -j$(nproc)
           mv stockfish ../harenn_engine
           cd ..
           chmod +x harenn_engine
@@ -45,23 +46,24 @@ jobs:
         run: |
           mkdir -p data
           echo "Starting data generation for 5 hours..."
-
+          
           python3 <<EOF
           import subprocess
           import time
           import os
           import sys
-
+          
           start_time = time.time()
           timeout = 18000 # 5 hours
-
+          
           try:
               while time.time() - start_time < timeout:
                   print(f"Running batch at {time.time() - start_time:.0f}s")
                   if not os.path.exists("openings.epd"):
                       with open("openings.epd", "w") as f:
                           f.write("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\n")
-
+                  
+                  # Run generation with memory limits
                   result = subprocess.run([
                       "python3", "generate_training_data.py",
                       "--engine", "./harenn_engine",
@@ -69,12 +71,13 @@ jobs:
                       "--output", "./data",
                       "--epd", "openings.epd"
                   ], capture_output=True, text=True)
-
-                  print(result.stdout)
-                  if result.stderr:
-                      print(f"Error output: {result.stderr}", file=sys.stderr)
-
-                  if time.time() - start_time > timeout - 600: # 10 mins margin
+                  
+                  if result.stdout:
+                      print(result.stdout)
+                  if "Error" in result.stderr:
+                      print(f"Engine/Script Alert: {result.stderr}", file=sys.stderr)
+                      
+                  if time.time() - start_time > timeout - 600:
                       break
           except Exception as e:
               print(f"Python wrapper error: {e}")
