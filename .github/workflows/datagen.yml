@@ -89,14 +89,24 @@ jobs:
           git config --global user.name "HARENN Data Bot"
           git config --global user.email "harenn-bot@users.noreply.github.com"
           
-          # Force checkout or create data branch
+          # Use run ID for unique filename to avoid merge conflicts
+          DATA_FILE="data/harenn_standard_${{ github.run_id }}.jsonl"
+          if [ -f data/harenn_standard.jsonl ]; then
+            mv data/harenn_standard.jsonl $DATA_FILE
+          fi
+
+          # Switch to data branch, creating if necessary
           git fetch origin data || true
           git checkout data || git checkout -b data
           
-          # Merge main changes if needed to keep build scripts up to date
-          git merge main -m "Merge main into data [skip ci]" || true
+          # Pull latest to minimize conflicts
+          git pull origin data --rebase || true
           
           git add -f data/*.jsonl
           timestamp=$(date +%Y%m%d_%H%M%S)
-          git commit -m "Add HARENN training data $timestamp [skip ci]" || echo "No changes to commit"
-          git push origin data
+          git commit -m "Add HARENN training data batch ${{ github.run_id }} [skip ci]" || echo "No changes to commit"
+          
+          # Push with retries
+          for i in {1..5}; do
+            git push origin data && break || (git pull origin data --rebase && sleep 5)
+          done

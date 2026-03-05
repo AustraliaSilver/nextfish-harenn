@@ -129,7 +129,7 @@ class HARENNDataGenerator:
                                 sample = self.generate_sample(board, 1) 
                                 if sample:
                                     item = {
-                                        "fen": sample.fen, 
+                                        "fen": board.fen(), # Always use board.fen() directly
                                         "tau": sample.tactical_label.tau, 
                                         "rho": sample.horizon_label_rho, 
                                         "rs": sample.resolution_label_rs
