@@ -42,27 +42,27 @@ jobs:
           chmod +x harenn_engine
           chmod +x generate_training_data.py
 
-      - name: Generate Data (5 Hours)
+      - name: Generate Data (4 Hours)
         run: |
           mkdir -p data
-          echo "Starting data generation for 5 hours..."
-          
+          echo "Starting data generation for 4 hours..."
+
           python3 <<EOF
           import subprocess
           import time
           import os
           import sys
-          
+
           start_time = time.time()
-          timeout = 18000 # 5 hours
-          
+          timeout = 14400 # 4 hours
+
           try:
               while time.time() - start_time < timeout:
                   print(f"Running batch at {time.time() - start_time:.0f}s")
                   if not os.path.exists("openings.epd"):
                       with open("openings.epd", "w") as f:
                           f.write("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\n")
-                  
+
                   # Run generation with memory limits
                   result = subprocess.run([
                       "python3", "generate_training_data.py",
@@ -71,13 +71,13 @@ jobs:
                       "--output", "./data",
                       "--epd", "openings.epd"
                   ], capture_output=True, text=True)
-                  
+
                   if result.stdout:
                       print(result.stdout)
                   if "Error" in result.stderr:
                       print(f"Engine/Script Alert: {result.stderr}", file=sys.stderr)
-                      
-                  if time.time() - start_time > timeout - 600:
+
+                  if time.time() - start_time > timeout - 600: # 10 mins margin
                       break
           except Exception as e:
               print(f"Python wrapper error: {e}")
