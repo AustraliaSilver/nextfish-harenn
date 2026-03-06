@@ -108,7 +108,19 @@ class HARENNDataGenerator:
         start_positions = []
         if epd_file and os.path.exists(epd_file):
             with open(epd_file, "r") as f:
-                start_positions = [line.strip() for line in f if line.strip()]
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    # Robust validation: Try to create a board. If invalid, skip the line.
+                    try:
+                        test_board = chess.Board()
+                        try: test_board.set_epd(line)
+                        except: test_board.set_fen(line)
+                        if test_board.is_valid():
+                            start_positions.append(line)
+                    except Exception:
+                        continue
+            print(f"Loaded {len(start_positions)} valid openings from {epd_file}")
         
         jsonl_path = self.output_dir / output_file
         with open(jsonl_path, "a") as f:
