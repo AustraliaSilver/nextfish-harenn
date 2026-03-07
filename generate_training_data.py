@@ -111,16 +111,28 @@ class HARENNDataGenerator:
                 for line in f:
                     line = line.strip()
                     if not line: continue
-                    # Robust validation: Try to create a board. If invalid, skip the line.
+                    
+                    # Strict 8-column check per rank
                     try:
-                        test_board = chess.Board()
-                        try: test_board.set_epd(line)
-                        except: test_board.set_fen(line)
-                        if test_board.is_valid():
+                        fen_part = line.split(' ')[0]
+                        ranks = fen_part.split('/')
+                        if len(ranks) != 8: continue
+                        
+                        is_valid_structure = True
+                        for r in ranks:
+                            count = 0
+                            for char in r:
+                                if char.isdigit(): count += int(char)
+                                else: count += 1
+                            if count != 8:
+                                is_valid_structure = False
+                                break
+                        
+                        if is_valid_structure:
                             start_positions.append(line)
                     except Exception:
                         continue
-            print(f"Loaded {len(start_positions)} valid openings from {epd_file}")
+            print(f"Loaded {len(start_positions)} strictly valid openings from {epd_file}")
         
         jsonl_path = self.output_dir / output_file
         with open(jsonl_path, "a") as f:
