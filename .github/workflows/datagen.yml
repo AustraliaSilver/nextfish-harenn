@@ -89,24 +89,25 @@ jobs:
           git config --global user.name "HARENN Data Bot"
           git config --global user.email "harenn-bot@users.noreply.github.com"
           
-          # Use run ID for unique filename to avoid merge conflicts
+          # 1. Prepare unique data file
           DATA_FILE="data/harenn_standard_${{ github.run_id }}.jsonl"
           if [ -f data/harenn_standard.jsonl ]; then
             mv data/harenn_standard.jsonl $DATA_FILE
           fi
 
-          # Switch to data branch, creating if necessary
-          git fetch origin data || true
-          git checkout data || git checkout -b data
-          
-          # Pull latest to minimize conflicts
-          git pull origin data --rebase || true
-          
+          # 2. Fetch and Switch to data branch (explicitly)
+          git fetch origin data
+          git checkout -B data origin/data
+
+          # 3. Add and Commit NEW data first
           git add -f data/*.jsonl
-          timestamp=$(date +%Y%m%d_%H%M%S)
           git commit -m "Add HARENN training data batch ${{ github.run_id }} [skip ci]" || echo "No changes to commit"
+
+          # 4. Pull latest with rebase to handle other workers
+          # We use -Xours to favor our new unique files in case of meta-conflicts
+          git pull origin data --rebase -Xours || true
           
-          # Push with retries
+          # 5. Push with aggressive retries
           for i in {1..5}; do
-            git push origin data && break || (git pull origin data --rebase && sleep 5)
+            git push origin data && break || (git pull origin data --rebase -Xours && sleep 5)
           done
