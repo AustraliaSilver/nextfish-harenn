@@ -121,20 +121,5 @@ jobs:
           for i in {1..5}; do
             git push
 
-      - name: Trigger next batch
-        if: github.event.inputs.trigger_next == 'true' || github.event_name == 'schedule'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'datagen.yml',
-              ref: 'main',
-              inputs: {
-                trigger_next: 'true'
-              }
-            })
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} origin data && break || (git pull origin data --rebase -Xours && sleep 5)
+ origin data && break || (git pull origin data --rebase -Xours && sleep 5)
           done
