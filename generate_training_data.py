@@ -173,10 +173,11 @@ class HARENNDataGenerator:
         jsonl_path = self.output_dir / output_file
         with open(jsonl_path, "a") as f:
             for g_idx in range(num_games):
-                        try:
-                            import chess
-                            with open_engine(self.engine_path) as engine:
-                                engine.configure({"Hash": 16})
+                try:
+                    import chess
+
+                    with open_engine(self.engine_path) as engine:
+                        engine.configure({"Hash": 16})
                         board = chess.Board()
                         if start_positions:
                             fen = random.choice(start_positions)
@@ -185,25 +186,12 @@ class HARENNDataGenerator:
                             except:
                                 board.set_fen(fen)
 
-                        stockfish_engine = None
-                        if vs_stockfish:
-                            import chess.engine
-
-                            stockfish_engine = chess.engine.SimpleEngine.popen_uci(
-                                "./stockfish.exe"
-                            )
-
-                        while not board.is_game_over() and board.ply() < 150:
-                            if (
-                                vs_stockfish and board.turn == chess.BLACK
-                            ):  # Stockfish plays black
-                                res = stockfish_engine.play(
-                                    board, chess.engine.Limit(time=0.1)
-                                )
-                            else:
-                                res = engine.play(board, chess.engine.Limit(time=0.1))
-                            board.push(res.move)
-                            if random.random() < 0.5:  # Sample ~50% of positions
+                                while not board.is_game_over() and board.ply() < 150:
+                                    res = engine.play(
+                                        board, chess.engine.Limit(time=0.1)
+                                    )
+                                    board.push(res.move)
+                            if random.random() < 0.5:
                                 sample = self.generate_sample(board, 1)
                                 if sample:
                                     item = {
@@ -215,8 +203,6 @@ class HARENNDataGenerator:
                                     f.write(json.dumps(item) + "\n")
                                     f.flush()
                     self.stats["games_played"] += 1
-                    if stockfish_engine:
-                        stockfish_engine.quit()
                     if (g_idx + 1) % 5 == 0:
                         print(
                             f" Progress: {g_idx + 1}/{num_games} games. Valid Positions: {self.stats['positions_generated']}"
