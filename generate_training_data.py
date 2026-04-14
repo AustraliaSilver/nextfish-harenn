@@ -18,6 +18,9 @@ from typing import List, Dict, Tuple, Optional
 import chess
 import chess.engine
 
+# Ensure chess is imported
+print("Chess imported successfully")
+
 
 def open_engine(engine_path: str):
     return chess.engine.SimpleEngine.popen_uci(engine_path)
