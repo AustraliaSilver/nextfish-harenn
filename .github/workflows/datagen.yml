@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ make python3-pip
-          pip install python-chess numpy
+          python3 -m pip install python-chess numpy
 
       - name: Build HARENN Engine
         run: |
