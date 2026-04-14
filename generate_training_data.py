@@ -191,17 +191,17 @@ class HARENNDataGenerator:
                                         board, chess.engine.Limit(time=0.1)
                                     )
                                     board.push(res.move)
-                            if random.random() < 0.5:
-                                sample = self.generate_sample(board, 1)
-                                if sample:
-                                    item = {
-                                        "fen": board.fen(),  # Always use board.fen() directly
-                                        "tau": sample.tactical_label.tau,
-                                        "rho": sample.horizon_label_rho,
-                                        "rs": sample.resolution_label_rs,
-                                    }
-                                    f.write(json.dumps(item) + "\n")
-                                    f.flush()
+                                    if random.random() < 0.5:
+                                        # For now, collect FEN only, labels dummy
+                                        item = {
+                                            "fen": board.fen(),
+                                            "tau": 0.5,
+                                            "rho": 0.5,
+                                            "rs": 0.5,
+                                        }
+                                        f.write(json.dumps(item) + "\n")
+                                        f.flush()
+                                        self.stats["positions_generated"] += 1
                     self.stats["games_played"] += 1
                     if (g_idx + 1) % 5 == 0:
                         print(
