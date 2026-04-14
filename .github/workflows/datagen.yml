@@ -114,7 +114,5 @@ jobs:
           
           # 5. Push with aggressive retries
           for i in {1..5}; do
-            git push
-
- origin data && break || (git pull origin data --rebase -Xours && sleep 5)
+            git push origin data && break || (git pull origin data --rebase -Xours && sleep 5)
           done
