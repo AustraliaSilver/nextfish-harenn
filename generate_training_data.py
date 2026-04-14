@@ -186,22 +186,22 @@ class HARENNDataGenerator:
                             except:
                                 board.set_fen(fen)
 
-                                while not board.is_game_over() and board.ply() < 150:
-                                    res = engine.play(
-                                        board, chess.engine.Limit(time=0.1)
-                                    )
-                                    board.push(res.move)
-                                    if random.random() < 0.5:
-                                        # For now, collect FEN only, labels dummy
-                                        item = {
-                                            "fen": board.fen(),
-                                            "tau": 0.5,
-                                            "rho": 0.5,
-                                            "rs": 0.5,
-                                        }
-                                        f.write(json.dumps(item) + "\n")
-                                        f.flush()
-                                        self.stats["positions_generated"] += 1
+                            while not board.is_game_over() and board.ply() < 150:
+                                res = engine.play(
+                                    board, chess.engine.Limit(time=0.1)
+                                )
+                                board.push(res.move)
+                                if random.random() < 0.5:
+                                    # For now, collect FEN only, labels dummy
+                                    item = {
+                                        "fen": board.fen(),
+                                        "tau": 0.5,
+                                        "rho": 0.5,
+                                        "rs": 0.5,
+                                    }
+                                    f.write(json.dumps(item) + "\n")
+                                    f.flush()
+                                    self.stats["positions_generated"] += 1
                     self.stats["games_played"] += 1
                     if (g_idx + 1) % 5 == 0:
                         print(
