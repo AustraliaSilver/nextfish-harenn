@@ -1,9 +1,17 @@
 name: HARENN Continuous Data Generation
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     - cron: '0 */5 * * *'  # Every 5 hours
   workflow_dispatch:
+    inputs:
+      trigger_next:
+        description: 'Trigger next batch after completion'
+        required: false
+        default: 'true'
     inputs:
       trigger_next:
         description: 'Trigger next batch after completion'
