@@ -126,5 +126,7 @@ jobs:
               inputs: {
                 trigger_next: 'true'
               }
-            }) origin data && break || (git pull origin data --rebase -Xours && sleep 5)
+            })
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} origin data && break || (git pull origin data --rebase -Xours && sleep 5)
           done
