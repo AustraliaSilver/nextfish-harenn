@@ -1,12 +1,14 @@
 name: HARENN Continuous Data Generation
 
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: '0 */5 * * *' # Every 5 hours
+    - cron: '0 */5 * * *'  # Every 5 hours
   workflow_dispatch:
+    inputs:
+      trigger_next:
+        description: 'Trigger next batch after completion'
+        required: false
+        default: 'true'
 
 jobs:
   data-generation:
@@ -109,5 +111,20 @@ jobs:
           
           # 5. Push with aggressive retries
           for i in {1..5}; do
-            git push origin data && break || (git pull origin data --rebase -Xours && sleep 5)
+            git push
+
+      - name: Trigger next batch
+        if: github.event.inputs.trigger_next == 'true' || github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'datagen.yml',
+              ref: 'main',
+              inputs: {
+                trigger_next: 'true'
+              }
+            }) origin data && break || (git pull origin data --rebase -Xours && sleep 5)
           done
