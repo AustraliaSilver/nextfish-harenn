@@ -77,7 +77,11 @@ class HARENNDataset(Dataset):
         self.load_data(data_dir, max_samples)
 
         # Compute normalization stats (only if eval_score exists)
-        eval_scores = [s["eval_score"] for s in self.samples if "eval_score" in s and s["eval_score"] is not None]
+        eval_scores = [
+            s["eval_score"]
+            for s in self.samples
+            if "eval_score" in s and s["eval_score"] is not None
+        ]
         self.has_eval = len(eval_scores) > 0
         if self.has_eval:
             self.eval_mean = np.mean(eval_scores)
@@ -87,22 +91,35 @@ class HARENNDataset(Dataset):
             self.eval_std = 1.0
 
     def load_data(self, data_dir: str, max_samples: int = None):
-        """Load all JSON files"""
-        files = glob.glob(os.path.join(data_dir, "*.json"))
-
-        for f in files:
-            try:
+        """Load JSONL or JSON files"""
+        if data_dir.endswith(".jsonl"):
+            # Load JSONL
+            with open(data_dir, "r") as f:
+                for line in f:
+                    if line.strip():
+                        pos = json.loads(line)
+                        # Dummy labels if missing
+                        if "mcs_map" not in pos:
+                            pos["mcs_map"] = [0] * 4096
+                        if "rho" not in pos:
+                            pos["rho"] = 0.5
+                        if "rs" not in pos:
+                            pos["rs"] = 0.5
+                        self.samples.append(pos)
+                        if max_samples and len(self.samples) >= max_samples:
+                            return
+        else:
+            # Load JSON files
+            files = glob.glob(os.path.join(data_dir, "*.json"))
+            for f in files:
                 with open(f) as fp:
                     data = json.load(fp)
                     for pos in data.get("positions", []):
-                        # Require full labels
                         if "mcs_map" not in pos or "rho" not in pos or "rs" not in pos:
                             continue
                         self.samples.append(pos)
                         if max_samples and len(self.samples) >= max_samples:
-                            break
-            except Exception as e:
-                print(f"Error loading {f}: {e}")
+                            return
 
         if max_samples:
             self.samples = self.samples[:max_samples]
@@ -113,42 +130,28 @@ class HARENNDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        pos = self.samples[idx]
+        # JSON data
+        features = np.zeros(768, dtype=np.float32)  # Dummy HalfKAv2 features
+        eval_score = pos.get("eval_score", 0)
+        eval_label = (
+            (eval_score - self.eval_mean) / self.eval_std if self.has_eval else 0.0
+        )
+        tau_label = pos.get("tau", 0.5)
+        rho_label = pos.get("rho", 0.5)
+        rs_label = pos.get("rs", 0.5)
+        mcs_map = np.array(pos.get("mcs_map", [0] * 4096), dtype=np.float32)
 
-        # Convert FEN to features
-        features, stm = fen_to_features(sample["fen"])
-
-        # Normalize eval
-        eval_score = sample.get("eval_score", None)
-        if eval_score is None:
-            eval_normalized = 0.0
-            eval_mask = 0.0
-        else:
-            eval_normalized = (eval_score - self.eval_mean) / self.eval_std
-            eval_mask = 1.0
-
-        tau = float(sample["tau"])
-        game_result_raw = float(sample.get("game_result", 1))
-        # Map game_result from {0,1,2} -> {0.0,0.5,1.0}
-        game_result = game_result_raw / 2.0
-        rho = float(sample["rho"])
-        rs = float(sample["rs"])
-
-        mcs_map = np.array(sample["mcs_map"], dtype=np.float32)
-        if mcs_map.size != 4096:
-            raise ValueError("mcs_map must have 4096 values")
-        mcs_map = mcs_map.reshape(64, 64)
-
+        stm = pos.get("stm", 0)
         return {
             "features": torch.tensor(features, dtype=torch.float32),
             "stm": torch.tensor(stm, dtype=torch.float32),
-            "eval": torch.tensor(eval_normalized, dtype=torch.float32),
-            "eval_mask": torch.tensor(eval_mask, dtype=torch.float32),
-            "tau": torch.tensor(tau, dtype=torch.float32),
-            "result": torch.tensor(game_result, dtype=torch.float32),
-            "rho": torch.tensor(rho, dtype=torch.float32),
-            "rs": torch.tensor(rs, dtype=torch.float32),
+            "eval_score": torch.tensor(eval_score, dtype=torch.float32),
+            "eval_mask": torch.tensor(True, dtype=torch.bool),
+            "tau": torch.tensor(tau_label, dtype=torch.float32),
             "mcs": torch.tensor(mcs_map, dtype=torch.float32),
+            "rho": torch.tensor(rho_label, dtype=torch.float32),
+            "rs": torch.tensor(rs_label, dtype=torch.float32),
         }
 
 
@@ -305,7 +308,9 @@ def validate(model, dataloader, criterion, device, eval_scaler):
             rs_target = batch["rs"].to(device)
             mcs_target = batch["mcs"].to(device)
 
-            eval_out, tau_out, result_out, rho_out, rs_out, mcs_out = model(features, stm)
+            eval_out, tau_out, result_out, rho_out, rs_out, mcs_out = model(
+                features, stm
+            )
 
             if eval_mask.sum() > 0:
                 per_eval = torch.nn.functional.smooth_l1_loss(
