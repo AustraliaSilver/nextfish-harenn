@@ -12,11 +12,6 @@ on:
         description: 'Trigger next batch after completion'
         required: false
         default: 'true'
-    inputs:
-      trigger_next:
-        description: 'Trigger next batch after completion'
-        required: false
-        default: 'true'
 
 jobs:
   data-generation:
