@@ -54,6 +54,7 @@ class HARENNDataGenerator:
 
     def generate_labels_from_trace(self, board) -> Optional[Dict]:
         try:
+            import chess
             import subprocess
             import chess
 
