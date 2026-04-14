@@ -176,7 +176,7 @@ class HARENNDataGenerator:
                         try:
                             import chess
                             with open_engine(self.engine_path) as engine:
-                        engine.configure({"Hash": 16})
+                                engine.configure({"Hash": 16})
                         board = chess.Board()
                         if start_positions:
                             fen = random.choice(start_positions)
