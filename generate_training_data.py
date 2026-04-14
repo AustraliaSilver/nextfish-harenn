@@ -173,8 +173,9 @@ class HARENNDataGenerator:
         jsonl_path = self.output_dir / output_file
         with open(jsonl_path, "a") as f:
             for g_idx in range(num_games):
-                try:
-                    with open_engine(self.engine_path) as engine:
+                        try:
+                            import chess
+                            with open_engine(self.engine_path) as engine:
                         engine.configure({"Hash": 16})
                         board = chess.Board()
                         if start_positions:
