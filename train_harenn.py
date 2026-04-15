@@ -225,11 +225,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, eval_scaler):
     resolution_losses = []
     mcs_losses = []
 
-    for batch in dataloader:
-        features = batch["features"].to(device)
-        stm = batch["stm"].to(device)
-        eval_target = batch["eval"].to(device)
-        eval_mask = batch["eval_mask"].to(device)
+        for batch in dataloader:
+            features = batch["features"].to(device)
+            stm = batch["stm"].to(device)
+            eval_target = batch["eval_score"].to(device)
+            eval_mask = batch["eval_mask"].to(device)
         tau_target = batch["tau"].to(device)
         result_target = batch["result"].to(device)
         rho_target = batch["rho"].to(device)
@@ -300,7 +300,7 @@ def validate(model, dataloader, criterion, device, eval_scaler):
         for batch in dataloader:
             features = batch["features"].to(device)
             stm = batch["stm"].to(device)
-            eval_target = batch["eval"].to(device)
+    eval_target = batch["eval_score"].to(device)
             eval_mask = batch["eval_mask"].to(device)
             tau_target = batch["tau"].to(device)
             result_target = batch["result"].to(device)

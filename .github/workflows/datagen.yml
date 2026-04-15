@@ -93,16 +93,18 @@ jobs:
         run: |
           git config --global user.name "HARENN Data Bot"
           git config --global user.email "harenn-bot@users.noreply.github.com"
-          
-          # 1. Prepare unique data file
+
+          # 1. Stash any local changes
+          git stash
+
+          # 2. Prepare unique data file
           DATA_FILE="data/harenn_standard_${{ github.run_id }}.jsonl"
           if [ -f data/harenn_standard.jsonl ]; then
             mv data/harenn_standard.jsonl $DATA_FILE
           fi
 
-          # 2. Fetch and Switch to data branch (explicitly)
+          # 3. Fetch and Switch to data branch (explicitly)
           git fetch origin data
-          git stash  # Stash any local changes
           git checkout -B data origin/data
 
           # 3. Add and Commit NEW data first
