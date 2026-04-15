@@ -102,6 +102,7 @@ jobs:
 
           # 2. Fetch and Switch to data branch (explicitly)
           git fetch origin data
+          git stash  # Stash any local changes
           git checkout -B data origin/data
 
           # 3. Add and Commit NEW data first
