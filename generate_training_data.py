@@ -1,233 +1,132 @@
 #!/usr/bin/env python3
 """
-HARENN Training Data Generation Pipeline (Updated for Standard Data & Validation)
+HARENN Training Data Generation Pipeline (V2 - High Quality Tactical Labels)
 """
 
 import argparse
 import os
-import sys
 import json
 import time
 import random
-import struct
-import numpy as np
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
-
 import chess
 import chess.engine
 
-# Ensure chess is imported
-print("Chess imported successfully")
+class PositionAnalyzer:
+    @staticmethod
+    def calculate_labels(board: chess.Board):
+        us = board.turn
+        them = not us
+        
+        # 1. Tau (Tactical Complexity)
+        legal_moves = list(board.legal_moves)
+        mobility = len(legal_moves) / 60.0
+        
+        captures = [m for m in legal_moves if board.is_capture(m)]
+        capture_score = len(captures) / 15.0
+        
+        our_king_sq = board.king(us)
+        enemy_attackers = board.attackers(them, our_king_sq)
+        king_pressure = len(enemy_attackers) / 4.0
+        
+        tension = 0
+        for sq, piece in board.piece_map().items():
+            if piece.color == us:
+                attackers = board.attackers(them, sq)
+                if attackers:
+                    defenders = board.attackers(us, sq)
+                    if len(attackers) > len(defenders):
+                        tension += piece.piece_type 
+                    elif len(attackers) > 0:
+                        tension += 0.5
+        tension_score = min(1.0, tension / 10.0)
+        
+        tau = (mobility * 0.2) + (capture_score * 0.3) + (king_pressure * 0.2) + (tension_score * 0.3)
+        tau = min(1.0, max(0.0, tau))
 
+        # 2. Rho (Horizon Risk)
+        queens = len(board.pieces(chess.QUEEN, chess.WHITE)) + len(board.pieces(chess.QUEEN, chess.BLACK))
+        rooks = len(board.pieces(chess.ROOK, chess.WHITE)) + len(board.pieces(chess.ROOK, chess.BLACK))
+        rho = min(1.0, (queens * 0.3 + rooks * 0.15 + 0.2))
+
+        # 3. Rs (Resolution/Phase)
+        piece_count = len(board.piece_map())
+        rs = 1.0 - (piece_count / 32.0)
+
+        return round(tau, 4), round(rho, 4), round(rs, 4)
 
 def open_engine(engine_path: str):
     return chess.engine.SimpleEngine.popen_uci(engine_path)
-
-
-@dataclass
-class TacticalLabel:
-    tau: float
-    score_volatility: float
-    research_rate: float
-    pv_tactical_density: float
-    convergence_factor: float
-
-
-@dataclass
-class HARENNTrainingSample:
-    fen: str
-    stm: int
-    game_result: int
-    tactical_label: TacticalLabel
-    horizon_label_rho: float
-    resolution_label_rs: float
-
 
 class HARENNDataGenerator:
     def __init__(self, engine_path: str, output_dir: str):
         self.engine_path = engine_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.stats = {"positions_generated": 0, "games_played": 0, "errors": 0}
+        self.stats = {"positions_generated": 0, "games_played": 0}
 
-    def generate_labels_from_trace(self, board) -> Optional[Dict]:
-        try:
-            import chess
-            import subprocess
-            import chess
-
-            # Use smaller hash to save memory on CI runners
-            proc = subprocess.Popen(
-                [self.engine_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            proc.stdin.write(
-                f"setoption name Hash value 16\nposition fen {board.fen()}\neval\nquit\n"
-            )
-            proc.stdin.flush()
-
-            output = proc.stdout.read()
-            proc.wait()
-
-            labels = {}
-            for line in output.split("\n"):
-                try:
-                    if "HARENN_TAU:" in line:
-                        labels["tau"] = float(line.split(":")[1].strip())
-                    elif "HARENN_RHO:" in line:
-                        labels["rho"] = float(line.split(":")[1].strip())
-                    elif "HARENN_RS:" in line:
-                        labels["rs"] = float(line.split(":")[1].strip())
-                except (ValueError, IndexError):
-                    continue
-
-            # Validation: Ensure standard data integrity
-            required = ["tau", "rho", "rs"]
-            if all(k in labels for k in required):
-                # Basic range checks for standard data
-                if all(
-                    0 <= labels[k] <= 1.01 for k in required
-                ):  # Allow small floating point margin
-                    return labels
-        except Exception as e:
-            print(f"Label generation error: {e}")
-            return None
-        except Exception as e:
-            print(f"Engine trace fatal error: {e}")
-            return None
-
-    def generate_sample(
-        self, board: chess.Board, game_result: int
-    ) -> Optional[HARENNTrainingSample]:
-        if board.ply() < 8 or len(board.piece_map()) < 6:
-            return None
-
-        trace_labels = self.generate_labels_from_trace(board)
-        if not trace_labels:
-            return None
-
-        self.stats["positions_generated"] += 1
-
-        tac_l = TacticalLabel(
-            tau=trace_labels["tau"],
-            score_volatility=0,
-            research_rate=0,
-            pv_tactical_density=0,
-            convergence_factor=0,
-        )
-
-        return HARENNTrainingSample(
-            fen=board.fen(),
-            stm=int(board.turn),
-            game_result=game_result,
-            tactical_label=tac_l,
-            horizon_label_rho=trace_labels["rho"],
-            resolution_label_rs=trace_labels["rs"],
-        )
-
-    def generate_game_data(
-        self, num_games: int, output_file: str, epd_file: Optional[str] = None
-    ):
-        print(f"Generating {num_games} games using Validated Trace Pipeline...")
-
+    def generate_game_data(self, num_games: int, output_file: str, epd_file: Optional[str] = None):
         start_positions = []
         if epd_file and os.path.exists(epd_file):
             with open(epd_file, "r") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # Strict 8-column check per rank
-                    try:
-                        fen_part = line.split(" ")[0]
-                        ranks = fen_part.split("/")
-                        if len(ranks) != 8:
-                            continue
-
-                        is_valid_structure = True
-                        for r in ranks:
-                            count = 0
-                            for char in r:
-                                if char.isdigit():
-                                    count += int(char)
-                                else:
-                                    count += 1
-                            if count != 8:
-                                is_valid_structure = False
-                                break
-
-                        if is_valid_structure:
-                            start_positions.append(line)
-                    except Exception:
-                        continue
-            print(
-                f"Loaded {len(start_positions)} strictly valid openings from {epd_file}"
-            )
+                    if line.strip(): start_positions.append(line.strip())
 
         jsonl_path = self.output_dir / output_file
-        with open(jsonl_path, "a") as f:
+        
+        with open_engine(self.engine_path) as engine:
             for g_idx in range(num_games):
                 try:
-                    import chess
+                    board = chess.Board()
+                    if start_positions:
+                        fen = random.choice(start_positions)
+                        try: board.set_epd(fen)
+                        except: board.set_fen(fen)
 
-                    with open_engine(self.engine_path) as engine:
-                        engine.configure({"Hash": 16})
-                        board = chess.Board()
-                        if start_positions:
-                            fen = random.choice(start_positions)
-                            try:
-                                board.set_epd(fen)
-                            except:
-                                board.set_fen(fen)
-
-                            while not board.is_game_over() and board.ply() < 150:
-                                res = engine.play(
-                                    board, chess.engine.Limit(time=0.1)
-                                )
-                                board.push(res.move)
-                                if random.random() < 0.5:
-                                    # For now, collect FEN only, labels dummy
-                                    item = {
-                                        "fen": board.fen(),
-                                        "tau": 0.5,
-                                        "rho": 0.5,
-                                        "rs": 0.5,
-                                    }
-                                    f.write(json.dumps(item) + "\n")
-                                    f.flush()
-                                    self.stats["positions_generated"] += 1
+                    while not board.is_game_over() and board.ply() < 160:
+                        # Use very fast limit for variety
+                        res = engine.play(board, chess.engine.Limit(time=0.02))
+                        board.push(res.move)
+                        
+                        # Sample 20% of positions
+                        if board.ply() > 10 and random.random() < 0.20:
+                            tau, rho, rs = PositionAnalyzer.calculate_labels(board)
+                            
+                            # Get Engine Eval for the position
+                            info = engine.analyse(board, chess.engine.Limit(depth=10))
+                            score = info["score"].relative.score(mate_score=10000)
+                            
+                            item = {
+                                "fen": board.fen(),
+                                "tau": tau,
+                                "rho": rho,
+                                "rs": rs,
+                                "eval_score": score
+                            }
+                            with open(jsonl_path, "a") as f:
+                                f.write(json.dumps(item) + "\n")
+                            self.stats["positions_generated"] += 1
+                            
                     self.stats["games_played"] += 1
-                    if (g_idx + 1) % 5 == 0:
-                        print(
-                            f" Progress: {g_idx + 1}/{num_games} games. Valid Positions: {self.stats['positions_generated']}"
-                        )
+                    if (g_idx + 1) % 10 == 0:
+                        print(f"Progress: {g_idx+1}/{num_games} games. Total: {self.stats['positions_generated']} pos")
                 except Exception as e:
-                    print(f"Game {g_idx} skip due to error: {e}")
+                    print(f"Game error: {e}")
                     continue
-
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", default="./stockfish.exe")
+    parser.add_argument("--engine", default="./harenn_engine")
     parser.add_argument("--output", default="./data")
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--epd", default=None)
-    parser.add_argument(
-        "--vs-stockfish",
-        action="store_true",
-        help="Play vs Stockfish for harder positions",
-    )
     args = parser.parse_args()
 
+    # Need typing.Optional
+    from typing import Optional
+    
     gen = HARENNDataGenerator(args.engine, args.output)
     gen.generate_game_data(args.games, "harenn_standard.jsonl", epd_file=args.epd)
-
 
 if __name__ == "__main__":
     main()
