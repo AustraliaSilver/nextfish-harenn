@@ -5,10 +5,11 @@ HARENN Training Data Generation Pipeline (V2 - High Quality Tactical Labels)
 
 import argparse
 import os
+import sys
 import json
-import time
 import random
 from pathlib import Path
+from typing import Optional
 import chess
 import chess.engine
 
@@ -84,15 +85,11 @@ class HARENNDataGenerator:
                         except: board.set_fen(fen)
 
                     while not board.is_game_over() and board.ply() < 160:
-                        # Use very fast limit for variety
                         res = engine.play(board, chess.engine.Limit(time=0.02))
                         board.push(res.move)
                         
-                        # Sample 20% of positions
                         if board.ply() > 10 and random.random() < 0.20:
                             tau, rho, rs = PositionAnalyzer.calculate_labels(board)
-                            
-                            # Get Engine Eval for the position
                             info = engine.analyse(board, chess.engine.Limit(depth=10))
                             score = info["score"].relative.score(mate_score=10000)
                             
@@ -108,10 +105,7 @@ class HARENNDataGenerator:
                             self.stats["positions_generated"] += 1
                             
                     self.stats["games_played"] += 1
-                    if (g_idx + 1) % 10 == 0:
-                        print(f"Progress: {g_idx+1}/{num_games} games. Total: {self.stats['positions_generated']} pos")
                 except Exception as e:
-                    print(f"Game error: {e}")
                     continue
 
 def main():
@@ -121,9 +115,6 @@ def main():
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--epd", default=None)
     args = parser.parse_args()
-
-    # Need typing.Optional
-    from typing import Optional
     
     gen = HARENNDataGenerator(args.engine, args.output)
     gen.generate_game_data(args.games, "harenn_standard.jsonl", epd_file=args.epd)
