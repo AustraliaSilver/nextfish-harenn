@@ -1,0 +1,68 @@
+name: HARENN Continuous Data Generation
+
+on:
+  push:
+    branches:
+      - data
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  data-generation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make python3-pip
+          pip install python-chess numpy
+
+      - name: Build HARENN Engine (PGO Optimized)
+        run: |
+          # 1. Create dummy net.sh to satisfy Makefile
+          mkdir -p scripts
+          echo "#!/bin/sh" > scripts/net.sh
+          echo "exit 0" >> scripts/net.sh
+          chmod +x scripts/net.sh
+          
+          cd src
+          # 2. Download NNUE nets directly into src/
+          curl -L -O https://tests.stockfishchess.org/api/nn/nn-3dd094f3dfcf.nnue
+          curl -L -O https://tests.stockfishchess.org/api/nn/nn-37f18f62d772.nnue
+          
+          # 3. Fix namespace ambiguity
+          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' search.cpp
+          sed -i 's/HARENN::EvalResult/Stockfish::HARENN::EvalResult/g' search.cpp
+          sed -i 's/DEE::Evaluator/Stockfish::DEE::Evaluator/g' search.cpp
+          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' main.cpp
+          
+          # 4. Build with PGO
+          make ARCH=x86-64-avx2 profile-build -j$(nproc)
+          
+          mv stockfish ../harenn_engine
+          cd ..
+          chmod +x harenn_engine
+          chmod +x parallel_generate.py
+
+      - name: Generate Data (5 Hours Continuous)
+        run: |
+          mkdir -p data
+          python3 parallel_generate.py --engine ./harenn_engine --output ./data --timeout 18000 --concurrency 2
+
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name "HARENN Data Bot"
+          git config --global user.email "harenn-bot@users.noreply.github.com"
+          git config advice.addIgnoredFile false
+          git add -f data/
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          git commit -m "Add HARENN training data $timestamp" || echo "No changes to commit"
+          git push origin data
