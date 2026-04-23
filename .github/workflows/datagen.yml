@@ -22,33 +22,15 @@ jobs:
       - name: Setup environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make python3-pip
+          sudo apt-get install -y python3-pip
           pip install python-chess numpy
 
-      - name: Build HARENN Engine (PGO Optimized)
+      - name: Download Stockfish 18
         run: |
-          # 1. Create dummy net.sh to satisfy Makefile
-          mkdir -p scripts
-          echo "#!/bin/sh" > scripts/net.sh
-          echo "exit 0" >> scripts/net.sh
-          chmod +x scripts/net.sh
-          
-          cd src
-          # 2. Download NNUE nets directly into src/
-          curl -L -O https://tests.stockfishchess.org/api/nn/nn-3dd094f3dfcf.nnue
-          curl -L -O https://tests.stockfishchess.org/api/nn/nn-37f18f62d772.nnue
-          
-          # 3. Fix namespace ambiguity
-          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' search.cpp
-          sed -i 's/HARENN::EvalResult/Stockfish::HARENN::EvalResult/g' search.cpp
-          sed -i 's/DEE::Evaluator/Stockfish::DEE::Evaluator/g' search.cpp
-          sed -i 's/HARENN::GuidanceProvider/Stockfish::HARENN::GuidanceProvider/g' main.cpp
-          
-          # 4. Build with PGO
-          make ARCH=x86-64-avx2 profile-build -j$(nproc)
-          
-          mv stockfish ../harenn_engine
-          cd ..
+          curl -L -o stockfish.tar https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-avx2.tar
+          tar -xvf stockfish.tar
+          # The tar usually extracts to a directory named stockfish/
+          mv stockfish/stockfish-ubuntu-x86-64-avx2 ./harenn_engine
           chmod +x harenn_engine
           chmod +x parallel_generate.py
 
