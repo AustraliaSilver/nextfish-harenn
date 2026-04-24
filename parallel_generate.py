@@ -82,11 +82,11 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
-            # Use nodes limit instead of time limit for deterministic and hardware-independent behavior.
-            # The engine will stop IMMEDIATELY when reaching the target depth OR the node limit.
-            res8 = engine.analyse(board, chess.engine.Limit(depth=8, nodes=50000))
-            res16_multi = engine.analyse(board, chess.engine.Limit(depth=16, nodes=1000000), multipv=3)
-            res26 = engine.analyse(board, chess.engine.Limit(depth=26, nodes=6000000))
+            # Use broader time limits to ensure deep search completes normally, 
+            # while still preventing infinite hangs on extremely complex positions.
+            res8 = engine.analyse(board, chess.engine.Limit(depth=8, time=1.0))
+            res16_multi = engine.analyse(board, chess.engine.Limit(depth=16, time=5.0), multipv=3)
+            res26 = engine.analyse(board, chess.engine.Limit(depth=26, time=15.0))
             if not isinstance(res16_multi, list): res16_multi = [res16_multi]
             m8 = res8.get("pv", [None])[0]
             m16 = res16_multi[0].get("pv", [None])[0]
