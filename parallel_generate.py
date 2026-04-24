@@ -82,14 +82,21 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
-            res8 = engine.analyse(board, chess.engine.Limit(depth=8))
-            res16_multi = engine.analyse(board, chess.engine.Limit(depth=16), multipv=3)
-            res26 = engine.analyse(board, chess.engine.Limit(depth=26))
+            res8 = engine.analyse(board, chess.engine.Limit(depth=8, time=0.5))
+            res16_multi = engine.analyse(board, chess.engine.Limit(depth=16, time=2.0), multipv=3)
+            res26 = engine.analyse(board, chess.engine.Limit(depth=26, time=5.0))
             if not isinstance(res16_multi, list): res16_multi = [res16_multi]
             m8 = res8.get("pv", [None])[0]
             m16 = res16_multi[0].get("pv", [None])[0]
             m26 = res26.get("pv", [None])[0]
             cp = res16_multi[0]["score"].relative.score(mate_score=10000) or 0
+            
+            # WDL estimation instead of fake label
+            try:
+                wdl = res16_multi[0]["score"].relative.wdl(model="sf").expectation()
+            except:
+                wdl = 0.5 + (max(min(cp, 1000), -1000) / 2000.0) # Fallback heuristic
+
             rho = 1.0 if (m8 != m16 or m16 != m26) else min(abs(cp - (res26["score"].relative.score(mate_score=10000) or 0)) / 200.0 + (0.25 if board.is_check() else 0), 1.0)
             tau = 0.0
             if len(res16_multi) > 1:
@@ -98,7 +105,7 @@ class ParallelGenerator:
             m16, l16 = [r["pv"][0].uci() for r in res16_multi], [self.move_to_label(board, r["pv"][0]) for r in res16_multi]
             m20, l20 = self.get_top_moves_safe(board, engine, 20)
             m24, l24 = self.get_top_moves_safe(board, engine, 24)
-            return {"cp": cp, "tau": round(tau, 4), "rho": round(min(rho, 1.0), 4), "rs": self.calculate_rs(board, cp), "m16": m16, "l16": l16, "m20": m20, "l20": l20, "m24": m24, "l24": l24}
+            return {"cp": cp, "tau": round(tau, 4), "rho": round(min(rho, 1.0), 4), "rs": self.calculate_rs(board, cp), "wdl": round(wdl, 4), "m16": m16, "l16": l16, "m20": m20, "l20": l20, "m24": m24, "l24": l24}
         except: return None
 
     def worker_loop(self, worker_id, end_time):
@@ -128,7 +135,7 @@ class ParallelGenerator:
                                 best_move_label=self.move_to_label(board, chess.Move.from_uci(data["m16"][0])),
                                 best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
                                 best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-                                game_result=1, material=self.count_material(board), piece_count=len(board.piece_map()),
+                                game_result=data["wdl"], material=self.count_material(board), piece_count=len(board.piece_map()),
                                 tau=data["tau"], rho=data["rho"], rs=data["rs"]
                             )
                             positions.append(asdict(pos))
