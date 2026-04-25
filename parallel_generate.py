@@ -141,11 +141,11 @@ class ParallelGenerator:
                                 tau=data["tau"], rho=data["rho"], rs=data["rs"]
                             )
                             positions.append(asdict(pos))
-                            if len(positions) >= 5:
+                            if len(positions) >= 500:
                                 filename = f"w{worker_id}_g{game_id}_b{batch_num}_{int(time.time())}.json"
                                 with open(self.output_dir / filename, 'w') as f: json.dump({"positions": positions}, f, indent=2)
                                 positions, batch_num = [], batch_num + 1
-                                print(f"Worker {worker_id} saved batch {batch_num}", flush=True)
+                                print(f"Worker {worker_id} saved large batch {batch_num} (500 pos)", flush=True)
                 if positions:
                     filename = f"w{worker_id}_g{game_id}_final_{int(time.time())}.json"
                     with open(self.output_dir / filename, 'w') as f: json.dump({"positions": positions}, f, indent=2)

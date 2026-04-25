@@ -11,6 +11,7 @@ on:
 jobs:
   data-generation:
     runs-on: ubuntu-latest
+    timeout-minutes: 300
     permissions:
       contents: write
     steps:
@@ -34,10 +35,10 @@ jobs:
           chmod +x harenn_engine
           chmod +x parallel_generate.py
 
-      - name: Generate Data (5 Hours Continuous)
+      - name: Generate Data (4 Hours Continuous)
         run: |
           mkdir -p data
-          python3 parallel_generate.py --engine ./harenn_engine --output ./data --timeout 18000 --concurrency 2
+          python3 parallel_generate.py --engine ./harenn_engine --output ./data --timeout 14400 --concurrency 2
 
       - name: Commit and Push Data
         run: |
