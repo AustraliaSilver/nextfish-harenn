@@ -111,6 +111,8 @@ class ParallelGenerator:
         except: return None
 
     def worker_loop(self, worker_id, end_time):
+        # Seed random with time and worker_id for unique data per matrix job
+        random.seed(int(time.time()) + hash(worker_id))
         engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
         total_game_pos = 0
         game_id = 0
