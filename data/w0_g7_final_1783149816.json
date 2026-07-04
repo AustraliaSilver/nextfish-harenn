@@ -1,0 +1,136 @@
+{
+  "positions": [
+    {
+      "fen": "rnbqkbnr/p2p1ppp/4p3/1Pp5/4P3/5N2/PP1P1PPP/RNBQKB1R b KQkq - 0 4",
+      "stm": 1,
+      "eval_score": -77,
+      "depth": 16,
+      "best_move": "c8b7",
+      "best_move_label": 116,
+      "best_moves_d16": [
+        "c8b7",
+        "g8f6",
+        "a7a6"
+      ],
+      "best_moves_d20": [
+        "c8b7",
+        "g8f6",
+        "a7a6"
+      ],
+      "best_moves_d24": [
+        "g8f6",
+        "c8b7",
+        "a7a6"
+      ],
+      "best_move_labels_d16": [
+        116,
+        259,
+        198
+      ],
+      "best_move_labels_d20": [
+        116,
+        259,
+        198
+      ],
+      "best_move_labels_d24": [
+        259,
+        116,
+        198
+      ],
+      "game_result": 0.354,
+      "material": 1,
+      "piece_count": 31,
+      "tau": 0.145,
+      "rho": 0.09,
+      "rs": 0.1
+    },
+    {
+      "fen": "rnbqkb1r/p2p1ppp/4pn2/1Pp5/4P3/5N2/PP1P1PPP/RNBQKB1R w KQkq - 1 5",
+      "stm": 0,
+      "eval_score": 90,
+      "depth": 16,
+      "best_move": "e4e5",
+      "best_move_label": 336,
+      "best_moves_d16": [
+        "e4e5",
+        "b1c3",
+        "f1d3"
+      ],
+      "best_moves_d20": [
+        "b1c3",
+        "e4e5",
+        "f1d3"
+      ],
+      "best_moves_d24": [
+        "b1c3",
+        "e4e5",
+        "f1d3"
+      ],
+      "best_move_labels_d16": [
+        336,
+        505,
+        518
+      ],
+      "best_move_labels_d20": [
+        505,
+        336,
+        518
+      ],
+      "best_move_labels_d24": [
+        505,
+        336,
+        518
+      ],
+      "game_result": 0.707,
+      "material": 1,
+      "piece_count": 31,
+      "tau": 0.165,
+      "rho": 1.0,
+      "rs": 0.1
+    },
+    {
+      "fen": "rnbqkb1r/p2p1ppp/4pn2/1Pp1P3/8/5N2/PP1P1PPP/RNBQKB1R b KQkq - 0 5",
+      "stm": 1,
+      "eval_score": -89,
+      "depth": 16,
+      "best_move": "f6d5",
+      "best_move_label": 331,
+      "best_moves_d16": [
+        "f6d5",
+        "f6g4",
+        "f6g8"
+      ],
+      "best_moves_d20": [
+        "f6d5",
+        "f6g8",
+        "f6g4"
+      ],
+      "best_moves_d24": [
+        "f6d5",
+        "f6g8",
+        "f6g4"
+      ],
+      "best_move_labels_d16": [
+        331,
+        463,
+        79
+      ],
+      "best_move_labels_d20": [
+        331,
+        79,
+        463
+      ],
+      "best_move_labels_d24": [
+        331,
+        79,
+        463
+      ],
+      "game_result": 0.298,
+      "material": 1,
+      "piece_count": 31,
+      "tau": 1.0,
+      "rho": 0.01,
+      "rs": 0.1
+    }
+  ]
+}
