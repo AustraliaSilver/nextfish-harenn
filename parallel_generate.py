@@ -99,11 +99,43 @@ class ParallelGenerator:
             except:
                 wdl = 0.5 + (max(min(cp, 1000), -1000) / 2000.0) # Fallback heuristic
 
-            rho = 1.0 if (m8 != m16 or m16 != m26) else min(abs(cp - (res26["score"].relative.score(mate_score=10000) or 0)) / 200.0 + (0.25 if board.is_check() else 0), 1.0)
+            # Improved HARENN labels (continuous, calibrated)
+            cp26 = res26["score"].relative.score(mate_score=10000) or 0
+            swing = max(abs(cp - cp26), abs((res8.get("pv", [None])[0].uci() if res8.get("pv") else 0) and 0))
+            # Use actual eval swing if available
+            try:
+                swing = max(abs(cp - cp26), abs(cp - (res26["score"].relative.score(mate_score=10000) or 0)))
+            except:
+                swing = abs(cp - cp26)
+            rho_vol = min(swing / 250.0, 0.6)
+            rho = rho_vol
+            if m8 != m16:
+                rho += 0.15
+            if m16 != m26:
+                rho += 0.30
+            if abs(cp) < 30:
+                rho += 0.25
+            elif abs(cp) < 80:
+                rho += 0.10
+            if board.is_check():
+                rho += 0.15
+            rho = min(rho, 1.0)
+
             tau = 0.0
-            if len(res16_multi) > 1:
-                diffs = [abs(cp - (r["score"].relative.score(mate_score=10000) or 0)) for r in res16_multi[1:]]
-                tau = min((sum(diffs) / len(diffs)) / 100.0, 1.0)
+            if m8 != m16:
+                tau += 0.35
+            if m16 != m26:
+                tau += 0.45
+            # top3 overlap bonus
+            if len(res16_multi) >= 3:
+                m16_top3 = [r["pv"][0].uci() for r in res16_multi[:3] if "pv" in r and r["pv"]]
+                if m26 not in m16_top3:
+                    tau += 0.15
+            else:
+                if len(res16_multi) > 1:
+                    diffs = [abs(cp - (r["score"].relative.score(mate_score=10000) or 0)) for r in res16_multi[1:]]
+                    tau = max(tau, min((sum(diffs) / len(diffs)) / 120.0, 0.5))
+            tau = min(tau, 1.0)
             m16, l16 = [r["pv"][0].uci() for r in res16_multi], [self.move_to_label(board, r["pv"][0]) for r in res16_multi]
             m20, l20 = self.get_top_moves_safe(board, engine, 20)
             m24, l24 = self.get_top_moves_safe(board, engine, 24)
