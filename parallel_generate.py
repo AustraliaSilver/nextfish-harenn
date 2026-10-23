@@ -42,7 +42,9 @@ class TrainingPosition:
     rs: float
 
 class ParallelGenerator:
-    def __init__(self, engine_path, output_dir, depth=16):
+    def __init__(self, engine_path, output_dir, depth=16, time_budget=None):
+        self.time_budget = time_budget
+        self.start_time = time.time()
         self.engine_path = engine_path
         self.output_dir = Path(output_dir)
         self.depth = depth
@@ -89,24 +91,24 @@ class ParallelGenerator:
         try:
             res8 = engine.analyse(board, chess.engine.Limit(depth=8))
             res16_multi = engine.analyse(board, chess.engine.Limit(depth=16), multipv=3)
-            res26 = engine.analyse(board, chess.engine.Limit(depth=26))
+            res20 = engine.analyse(board, chess.engine.Limit(depth=20))
 
             if not isinstance(res16_multi, list): res16_multi = [res16_multi]
 
             m8 = res8.get("pv", [None])[0]
             m16 = res16_multi[0].get("pv", [None])[0]
-            m26 = res26.get("pv", [None])[0]
+            m20 = res20.get("pv", [None])[0]
 
             cp = res16_multi[0]["score"].relative.score(mate_score=10000) or 0
             # Improved HARENN labels (continuous, calibrated with harenn_ctrl thresholds)
             # RHO: eval volatility + move instability + near-zero uncertainty
-            cp26 = res26["score"].relative.score(mate_score=10000) or 0
-            swing = max(abs(cp - cp26), abs((res16_multi[0]["score"].relative.score(mate_score=10000) or 0) - cp26))
+            cp20 = res20["score"].relative.score(mate_score=10000) or 0
+            swing = max(abs(cp - cp20), abs((res16_multi[0]["score"].relative.score(mate_score=10000) or 0) - cp20))
             rho_vol = min(swing / 250.0, 0.6)
             rho = rho_vol
             if m8 != m16:
                 rho += 0.15
-            if m16 != m26:
+            if m16 != m20:
                 rho += 0.30
             if abs(cp) < 30:
                 rho += 0.25
@@ -120,15 +122,15 @@ class ParallelGenerator:
             tau = 0.0
             if m8 != m16:
                 tau += 0.35
-            if m16 != m26:
+            if m16 != m20:
                 tau += 0.45
             # top3 overlap between 16 and 26 if multipv available
             if len(res16_multi) >= 3:
                 # res16_multi has 3 PVs at depth 16, but we need top3 at depth 26 as well
-                # Use res16_multi top3 vs m26 single -> approximate
+                # Use res16_multi top3 vs m20 single -> approximate
                 m16_top3 = [r["pv"][0].uci() for r in res16_multi[:3] if "pv" in r and r["pv"]]
-                # For m26 we only have single PV, so overlap at least 1 if m16==m26
-                overlap = 1 if m16 in m16_top3 and m16 == m26 else 0
+                # For m20 we only have single PV, so overlap at least 1 if m16==m20
+                overlap = 1 if m16 in m16_top3 and m16 == m20 else 0
                 if overlap == 0 and len(m16_top3) >= 2:
                     tau += 0.15
             else:
@@ -140,7 +142,7 @@ class ParallelGenerator:
 
             m16, l16 = [r["pv"][0].uci() for r in res16_multi], [self.move_to_label(board, r["pv"][0]) for r in res16_multi]
             m20, l20 = self.get_top_moves_safe(board, engine, 20)
-            m24, l24 = self.get_top_moves_safe(board, engine, 24)
+            m24, l24 = self.get_top_moves_safe(board, engine, 20)
 
             return {
                 "cp": cp, "tau": round(tau, 4), "rho": round(min(rho, 1.0), 4), 
@@ -156,6 +158,9 @@ class ParallelGenerator:
         positions, batch_num, board = [], 0, chess.Board()
         total_game_pos = 0
         try:
+            if self.time_budget and (time.time() - self.start_time) > self.time_budget:
+                print(f"  [W{worker_id} | G{game_id}] Time budget exceeded, stopping", flush=True)
+                return total_game_pos
             for move_num in range(1, 100):
                 if board.is_game_over(): break
                 if random.random() < 0.08:
@@ -194,10 +199,11 @@ def main():
     parser.add_argument("--engine", "-e", default="../nextfish.exe")
     parser.add_argument("--output", "-o", default="D:/nextfish/data")
     parser.add_argument("--games", "-g", type=int, default=100)
-    parser.add_argument("--concurrency", "-j", type=int, default=multiprocessing.cpu_count() - 1)
+    parser.add_argument("--concurrency", "-j", type=int, default=multiprocessing.cpu_count() - 1)
+    parser.add_argument("--time-budget", type=int, default=None, help="Stop after N seconds (leave time for commit)")
     args = parser.parse_args()
     print(f"=== HARENN Turbo Generator V8 (Raw Data) ===")
-    gen = ParallelGenerator(args.engine, args.output)
+    gen = ParallelGenerator(args.engine, args.output, time_budget=args.time_budget)
     total_pos, start_time = 0, time.time()
     with ProcessPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {executor.submit(gen.worker_task, i): i for i in range(args.games)}

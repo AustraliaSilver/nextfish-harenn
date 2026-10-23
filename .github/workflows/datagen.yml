@@ -8,10 +8,14 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: datagen-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   data-generation:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 290
     strategy:
       matrix:
         worker_id: [1, 2, 3, 4, 5]
@@ -28,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip
-          pip install python-chess numpy
+          pip install --break-system-packages python-chess numpy
 
       - name: Download Stockfish 18
         run: |
@@ -38,41 +42,42 @@ jobs:
           chmod +x harenn_engine
           chmod +x parallel_generate.py
 
-      - name: Generate Data (4 Hours Continuous)
+      - name: Generate Data (time-budgeted)
         run: |
           mkdir -p data
-          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 100 --concurrency 2
+          # 270 minutes = 16200 seconds, leaving ~20 minutes for the commit step
+          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 100 --concurrency 2 --time-budget 16200
 
       - name: Commit and Push Data
         run: |
+          set -euo pipefail
           git config --global user.name "HARENN Data Bot ${{ matrix.worker_id }}"
           git config --global user.email "harenn-bot-${{ matrix.worker_id }}@users.noreply.github.com"
           git config advice.addIgnoredFile false
-          
-          # Đảm bảo các tệp engine không làm phiền Git
-          echo "harenn_engine" >> .gitignore
-          echo "stockfish.tar" >> .gitignore
-          echo "stockfish/" >> .gitignore
-          
-          for i in {1..20}; do
-            # Chỉ add các file json trong data
-            git add -f data/*.json
-            timestamp=$(date +%Y%m%d_%H%M%S)
-            
-            # Commit nếu có thay đổi
-            if git commit -m "Add HARENN training data (Worker ${{ matrix.worker_id }}) $timestamp"; then
-              # Nếu commit thành công, cố gắng pull và push
-              # Dùng --autostash để tự động cất các tệp rác và lấy lại sau khi rebase
-              if git pull --rebase --autostash origin data; then
-                if git push origin data; then
-                  echo "Push successful!"
-                  break
-                fi
-              fi
-            else
-              echo "No changes to commit or commit failed"
+
+          # Keep engine artifacts out of git
+          printf 'harenn_engine\nstockfish.tar\nstockfish/\n' >> .gitignore
+
+          pushed=false
+          for i in $(seq 1 20); do
+            git add -f data/*.json data/*.jsonl 2>/dev/null || true
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
               break
+            fi
+            timestamp=$(date +%Y%m%d_%H%M%S)
+            git commit -m "Add HARENN training data (Worker ${{ matrix.worker_id }}) $timestamp"
+            if git pull --rebase --autostash origin data; then
+              if git push origin data; then
+                echo "Push successful!"
+                pushed=true
+                break
+              fi
             fi
             echo "Conflict or race condition detected, retrying in 30s... (Attempt $i)"
             sleep 30
           done
+
+          if [ "$pushed" != "true" ]; then
+            echo "::warning::Push was not successful, but the job continues"
+          fi
