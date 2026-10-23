@@ -100,53 +100,61 @@ class ParallelGenerator:
             m20 = res20.get("pv", [None])[0]
 
             cp = res16_multi[0]["score"].relative.score(mate_score=10000) or 0
-            # Improved HARENN labels (continuous, calibrated with harenn_ctrl thresholds)
-            # RHO: eval volatility + move instability + near-zero uncertainty
-            cp20 = res20["score"].relative.score(mate_score=10000) or 0
-            swing = max(abs(cp - cp20), abs((res16_multi[0]["score"].relative.score(mate_score=10000) or 0) - cp20))
-            rho_vol = min(swing / 250.0, 0.6)
-            rho = rho_vol
-            if m8 != m16:
-                rho += 0.15
-            if m16 != m20:
-                rho += 0.30
-            if abs(cp) < 30:
-                rho += 0.25
-            elif abs(cp) < 80:
-                rho += 0.10
-            if board.is_check():
-                rho += 0.15
-            rho = min(rho, 1.0)
-
-            # TAU: best-move instability + top3 overlap (if available)
-            tau = 0.0
-            if m8 != m16:
-                tau += 0.35
-            if m16 != m20:
-                tau += 0.45
-            # top3 overlap between 16 and 26 if multipv available
-            if len(res16_multi) >= 3:
-                # res16_multi has 3 PVs at depth 16, but we need top3 at depth 26 as well
-                # Use res16_multi top3 vs m20 single -> approximate
-                m16_top3 = [r["pv"][0].uci() for r in res16_multi[:3] if "pv" in r and r["pv"]]
-                # For m20 we only have single PV, so overlap at least 1 if m16==m20
-                overlap = 1 if m16 in m16_top3 and m16 == m20 else 0
-                if overlap == 0 and len(m16_top3) >= 2:
-                    tau += 0.15
-            else:
-                # Fallback: score volatility among multipv
-                if len(res16_multi) > 1:
-                    diffs = [abs(cp - (r["score"].relative.score(mate_score=10000) or 0)) for r in res16_multi[1:]]
-                    tau = max(tau, min((sum(diffs) / len(diffs)) / 120.0, 0.5))
-            tau = min(tau, 1.0)
-
+            # Search instability labels: measure how much the engine's opinion
+            # changes when the search depth increases. A position whose eval
+            # swings or whose best move changes between depths is unresolved
+            # and benefits from more search.
+            cp20 = res20["score"].relative.score(mate_score=10000) or 0
+            cp8 = res8["score"].relative.score(mate_score=10000) or 0
+
+            # Eval swing between depths (absolute, in centipawns)
+            swing_8_16 = abs(cp8 - cp)
+            swing_16_20 = abs(cp - cp20)
+            max_swing = max(swing_8_16, swing_16_20)
+
+            # RHO (horizon risk): how much the eval moves between depths.
+            # Normalized so that 200 cp of swing maps to 1.0.
+            rho = min(max_swing / 200.0, 1.0)
+
+            # TAU (tactical complexity): how often the best move changes
+            # between depths. With 3 depths there are 2 transitions.
+            transitions = 0
+            changes = 0
+            if m8 is not None and m16 is not None:
+                transitions += 1
+                if m8 != m16:
+                    changes += 1
+            if m16 is not None and m20 is not None:
+                transitions += 1
+                if m16 != m20:
+                    changes += 1
+            if transitions > 0:
+                tau = changes / transitions
+            else:
+                tau = 0.0
+
+            # Bonus for near-zero eval (positions where the outcome is unclear)
+            if abs(cp) < 30:
+                rho = min(rho + 0.15, 1.0)
+                tau = min(tau + 0.15, 1.0)
+            elif abs(cp) < 80:
+                rho = min(rho + 0.05, 1.0)
+
+            # Bonus for check (tactical positions)
+            if board.is_check():
+                rho = min(rho + 0.10, 1.0)
+                tau = min(tau + 0.10, 1.0)
+
+            # RS (resolution score): inverse of rho. A position where the
+            # search is stable (low swing, same best move) is resolved.
+            rs = max(0.05, 1.0 - rho)
             m16, l16 = [r["pv"][0].uci() for r in res16_multi], [self.move_to_label(board, r["pv"][0]) for r in res16_multi]
             m20, l20 = self.get_top_moves_safe(board, engine, 20)
             m24, l24 = self.get_top_moves_safe(board, engine, 20)
 
             return {
                 "cp": cp, "tau": round(tau, 4), "rho": round(min(rho, 1.0), 4), 
-                "rs": self.calculate_rs(board, cp),
+                "rs": round(rs, 4),
                 "m16": m16, "l16": l16, "m20": m20, "l20": l20, "m24": m24, "l24": l24
             }
         except: return None
