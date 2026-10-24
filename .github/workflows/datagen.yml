@@ -45,8 +45,10 @@ jobs:
       - name: Generate Data (time-budgeted)
         run: |
           mkdir -p data
-          # 270 minutes = 16200 seconds, leaving ~20 minutes for the commit step
           python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 100 --concurrency 2 --time-budget 16200
+          echo "=== files in data/ ==="
+          ls data/ | head -5
+          echo "total files: $(ls data/ | wc -l)"
 
       - name: Commit and Push Data
         run: |
@@ -58,11 +60,16 @@ jobs:
           # Keep engine artifacts out of git
           printf 'harenn_engine\nstockfish.tar\nstockfish/\n' >> .gitignore
 
+          echo "=== before add ==="
+          ls data/ | wc -l
+
           pushed=false
           for i in $(seq 1 20); do
-            git add -f data/*.json data/*.jsonl 2>/dev/null || true
+            # Use find to stage all files, not glob (glob may not match)
+            find data/ -type f -name '*.json' -exec git add -f {} \;
+            find data/ -type f -name '*.jsonl' -exec git add -f {} \;
             if git diff --cached --quiet; then
-              echo "No changes to commit"
+              echo "No changes to commit (attempt $i)"
               break
             fi
             timestamp=$(date +%Y%m%d_%H%M%S)
@@ -79,5 +86,5 @@ jobs:
           done
 
           if [ "$pushed" != "true" ]; then
-            echo "::warning::Push was not successful, but the job continues"
+            echo "::warning::Push was not successful"
           fi
