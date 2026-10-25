@@ -1,49 +1,59 @@
 #ifndef HARENN_H_INCLUDED
 #define HARENN_H_INCLUDED
 
-#include <vector>
-#include <string>
-#include <fstream>
 #include "types.h"
+#include "numa.h"
+#include <string>
+#include <vector>
+#include <utility>
 
 namespace Stockfish {
 
-class Position;
+class Position; // Forward declaration
 
 namespace HARENN {
 
 struct EvalResult {
-    float eval;              // Standard evaluation
-    float tau;               // Tactical complexity
-    float horizonRisk;       // Probability of horizon effect
-    float resolutionScore;   // Quietness/Resolution of position
-    float moveCriticality[64][64]; // Criticality map for move ordering
+    float eval;
+    float tau;
+    float rho;
+    float rs;
 };
 
-class Evaluator {
-public:
-    Evaluator();
-    ~Evaluator();
+struct Layer {
+    int rows, cols;
+    std::vector<int16_t> weights;
+    std::vector<int32_t> bias;
+};
 
-    bool load_model(const std::string& filename);
-    EvalResult evaluate(const Position& pos) const;
+class Network {
+public:
+    bool load(const std::string& filename);
+    EvalResult forward(const int* active_features, int count) const;
+    
+    // Lazy evaluation methods - compute individual heads
+    float compute_eval(const int* active_features, int count) const;
+    float compute_tau(const int* active_features, int count) const;
+    float compute_rho(const int* active_features, int count) const;
+    float compute_rs(const int* active_features, int count) const;
+    std::pair<float, float> compute_rho_and_rs(const int* active_features, int count) const;
 
 private:
-    // Model weights and architecture details would go here
-    // For now, we'll implement the interface and a placeholder/mock
-    // that uses the standard NNUE but adds head predictions
-    bool modelLoaded = false;
+    float eval_mean, eval_std;
+    Layer fc1;
+    Layer fc2;
+    Layer eval_head;
+    Layer tau_head;
+    Layer rho_head;
+    Layer rs_head;
 };
 
-// Global HARENN provider for search guidance
 class GuidanceProvider {
 public:
-    static void init();
-    static EvalResult query(const Position& pos);
-    
-    // Adjust search parameters based on HARENN
-    static int compute_reduction_adjustment(const Position& pos, Depth depth, Move m, int r);
-    static int compute_aspiration_delta(const Position& pos, int iteration, int currentDelta);
+    static void init(const std::string& binaryDirectory);
+    static EvalResult query(const Position& pos, NumaReplicatedAccessToken numaToken);
+    static std::pair<float, float> query_rho_and_rs(const Position& pos, NumaReplicatedAccessToken numaToken);
+    static bool is_model_loaded();
 };
 
 } // namespace HARENN

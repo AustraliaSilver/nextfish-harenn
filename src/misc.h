@@ -33,7 +33,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <string_view>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -137,17 +137,21 @@ class ValueList {
     std::size_t size() const { return size_; }
     int         ssize() const { return int(size_); }
     void        push_back(const T& value) {
-        assert(size_ < MaxSize);
+        // The list is a fixed capacity buffer. Dropping an element is
+        // preferable to writing past its end, which would corrupt the heap.
+        if (size_ >= MaxSize) return;
         values_[size_++] = value;
     }
     const T* begin() const { return values_; }
     const T* end() const { return values_ + size_; }
     const T& operator[](int index) const { return values_[index]; }
 
+    // Reserves 'count' slots and returns a pointer to them, or nullptr when
+    // the list has not enough room left.
     T* make_space(size_t count) {
+        if (count > MaxSize - size_) return nullptr;
         T* result = &values_[size_];
         size_ += count;
-        assert(size_ <= MaxSize);
         return result;
     }
 
@@ -444,12 +448,12 @@ void move_to_front(std::vector<T>& vec, Predicate pred) {
     #define sf_always_inline
 #endif
 
-#if defined(__clang__)
-    #define sf_assume(cond) __builtin_assume(cond)
-#elif defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__clang__)
     #if __GNUC__ >= 13
+        #define sf_unreachable() __builtin_unreachable()
         #define sf_assume(cond) __attribute__((assume(cond)))
     #else
+        #define sf_unreachable() __builtin_unreachable()
         #define sf_assume(cond) \
             do \
             { \
@@ -458,14 +462,9 @@ void move_to_front(std::vector<T>& vec, Predicate pred) {
             } while (0)
     #endif
 #else
+    #define sf_unreachable()
     // do nothing for other compilers
     #define sf_assume(cond)
-#endif
-
-#ifdef __GNUC__
-    #define sf_unreachable() __builtin_unreachable()
-#else
-    #define sf_unreachable()
 #endif
 
 }  // namespace Stockfish

@@ -42,7 +42,7 @@ namespace Stockfish {
 
 // Constructor launches the thread and waits until it goes to sleep
 // in idle_loop(). Note that 'searching' and 'exit' should be already set.
-Thread::Thread(Search::SharedState&                    sharedState,
+Thread::Thread(const Search::SharedState&              sharedState,
                std::unique_ptr<Search::ISearchManager> sm,
                size_t                                  n,
                size_t                                  numaN,
@@ -115,6 +115,9 @@ void Thread::ensure_network_replicated() { worker->ensure_network_replicated(); 
 // Thread gets parked here, blocked on the condition variable
 // when the thread has no work to do.
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((force_align_arg_pointer))
+#endif
 void Thread::idle_loop() {
     while (true)
     {
@@ -147,7 +150,7 @@ static size_t next_power_of_two(uint64_t count) { return count > 1 ? (2ULL << ms
 // Created and launched threads will immediately go to sleep in idle_loop.
 // Upon resizing, threads are recreated to allow for binding if necessary.
 void ThreadPool::set(const NumaConfig&                           numaConfig,
-                     Search::SharedState                         sharedState,
+                     const Search::SharedState&                  sharedState,
                      const Search::SearchManager::UpdateContext& updateContext) {
 
     if (threads.size() > 0)  // destroy any existing thread(s)
@@ -218,7 +221,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
             auto            create_thread = [&]() {
                 auto manager = threadId == 0
                                           ? std::unique_ptr<Search::ISearchManager>(
-                                   std::make_unique<Search::SearchManager>(updateContext))
+                                    std::make_unique<Search::SearchManager>(updateContext))
                                           : std::make_unique<Search::NullSearchManager>();
 
                 // When not binding threads we want to force all access to happen

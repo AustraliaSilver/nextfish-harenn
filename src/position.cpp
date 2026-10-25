@@ -264,31 +264,23 @@ Position& Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
 
     // 4. En passant square.
     // Ignore if square is invalid or not on side to move relative rank 6.
-    bool enpassant = false, legalEP = false;
+    bool enpassant = false;
 
     if (((ss >> col) && (col >= 'a' && col <= 'h'))
         && ((ss >> row) && (row == (sideToMove == WHITE ? '6' : '3'))))
     {
         st->epSquare = make_square(File(col - 'a'), Rank(row - '1'));
 
-        Bitboard pawns  = attacks_bb<PAWN>(st->epSquare, ~sideToMove) & pieces(sideToMove, PAWN);
-        Bitboard target = (pieces(~sideToMove, PAWN) & (st->epSquare + pawn_push(~sideToMove)));
-        Bitboard occ    = pieces() ^ target ^ st->epSquare;
-
         // En passant square will be considered only if
         // a) side to move have a pawn threatening epSquare
         // b) there is an enemy pawn in front of epSquare
         // c) there is no piece on epSquare or behind epSquare
-        enpassant =
-          pawns && target && !(pieces() & (st->epSquare | (st->epSquare + pawn_push(sideToMove))));
-
-        // If no pawn can execute the en passant capture without leaving the king in check, don't record the epSquare
-        while (pawns)
-            legalEP |= !(attackers_to(square<KING>(sideToMove), occ ^ pop_lsb(pawns))
-                         & pieces(~sideToMove) & ~target);
+        enpassant = attacks_bb<PAWN>(st->epSquare, ~sideToMove) & pieces(sideToMove, PAWN)
+                 && (pieces(~sideToMove, PAWN) & (st->epSquare + pawn_push(~sideToMove)))
+                 && !(pieces() & (st->epSquare | (st->epSquare + pawn_push(sideToMove))));
     }
 
-    if (!enpassant || !legalEP)
+    if (!enpassant)
         st->epSquare = SQ_NONE;
 
     // 5-6. Halfmove clock and fullmove number
@@ -739,6 +731,8 @@ void Position::do_move(Move                      m,
     Piece  pc       = piece_on(from);
     Piece  captured = m.type_of() == EN_PASSANT ? make_piece(them, PAWN) : piece_on(to);
 
+    bool checkEP = false;
+
     dp.pc             = pc;
     dp.from           = from;
     dp.to             = to;
@@ -819,10 +813,13 @@ void Position::do_move(Move                      m,
         st->epSquare = SQ_NONE;
     }
 
-    // Update castling rights.
-    k ^= Zobrist::castling[st->castlingRights];
-    st->castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
-    k ^= Zobrist::castling[st->castlingRights];
+    // Update castling rights if needed
+    if (st->castlingRights && (castlingRightsMask[from] | castlingRightsMask[to]))
+    {
+        k ^= Zobrist::castling[st->castlingRights];
+        st->castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
+        k ^= Zobrist::castling[st->castlingRights];
+    }
 
     // Move the piece. The tricky Chess960 castling is handled earlier
     if (m.type_of() != CASTLING)
@@ -839,30 +836,9 @@ void Position::do_move(Move                      m,
     // If the moving piece is a pawn do some special extra work
     if (type_of(pc) == PAWN)
     {
-        // Check if the en passant square needs to be set. Accurate e.p. info is needed
-        // for correct zobrist key generation and 3-fold checking.
+        // Check later if the en passant square needs to be set
         if ((int(to) ^ int(from)) == 16)
-        {
-            Square   epSquare = to - pawn_push(us);
-            Bitboard pawns    = attacks_bb<PAWN>(epSquare, us) & pieces(them, PAWN);
-
-            // If there are no pawns attacking the ep square, ep is not possible.
-            if (pawns)
-            {
-                Square   ksq         = square<KING>(them);
-                Bitboard notBlockers = ~st->previous->blockersForKing[them];
-                bool     noDiscovery = (from & notBlockers) || file_of(from) == file_of(ksq);
-
-                // If the pawn gives discovered check, ep is never legal. Else, if at least one
-                // pawn was not a blocker for the enemy king or lies on the same line as the
-                // enemy king and en passant square, a legal capture exists.
-                if (noDiscovery && (pawns & (notBlockers | line_bb(epSquare, ksq))))
-                {
-                    st->epSquare = epSquare;
-                    k ^= Zobrist::enpassant[file_of(epSquare)];
-                }
-            }
-        }
+            checkEP = true;
 
         else if (m.type_of() == PROMOTION)
         {
@@ -907,10 +883,9 @@ void Position::do_move(Move                      m,
             st->minorPieceKey ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     }
 
-    // Update the key with the final value
-    st->key = k;
-    if (tt)
-        prefetch(tt->first_entry(key()));
+    // If en passant is impossible, then k will not change and we can prefetch earlier
+    if (tt && !checkEP)
+        prefetch(tt->first_entry(adjust_key50(k)));
 
     if (history)
     {
@@ -931,6 +906,63 @@ void Position::do_move(Move                      m,
 
     // Update king attacks used for fast check detection
     set_check_info();
+
+    // Accurate e.p. info is needed for correct zobrist key generation and 3-fold checking
+    while (checkEP)
+    {
+        auto updateEpSquare = [&] {
+            st->epSquare = to - pawn_push(us);
+            k ^= Zobrist::enpassant[file_of(st->epSquare)];
+        };
+
+        Bitboard pawns = attacks_bb<PAWN>(to - pawn_push(us), us) & pieces(them, PAWN);
+
+        // If there are no pawns attacking the ep square, ep is not possible
+        if (!pawns)
+            break;
+
+        // If there are checkers other than the to be captured pawn, ep is never legal
+        if (checkers() & ~square_bb(to))
+            break;
+
+        if (more_than_one(pawns))
+        {
+            // If there are two pawns potentially being able to capture and at least one
+            // is not pinned, ep is legal as there are no horizontal exposed checks
+            if (!more_than_one(blockers_for_king(them) & pawns))
+            {
+                updateEpSquare();
+                break;
+            }
+
+            // If there is no pawn on our king's file, and thus both pawns are pinned
+            // by bishops, ep is not legal as the king square must be in front of the to square.
+            // And because the ep square and the king are not on a common diagonal, either ep capture
+            // would expose the king to a check from one of the bishops
+            if (!(file_bb(square<KING>(them)) & pawns))
+                break;
+
+            // Otherwise remove the pawn on the king file, as an ep capture by it can never be legal and the
+            // check below relies on there only being one pawn
+            pawns &= ~file_bb(square<KING>(them));
+        }
+
+        Square   ksq      = square<KING>(them);
+        Square   capsq    = to;
+        Bitboard occupied = (pieces() ^ lsb(pawns) ^ capsq) | (to - pawn_push(us));
+
+        // If our king is not attacked after making the move, ep is legal.
+        if (!(attacks_bb<ROOK>(ksq, occupied) & pieces(us, QUEEN, ROOK))
+            && !(attacks_bb<BISHOP>(ksq, occupied) & pieces(us, QUEEN, BISHOP)))
+            updateEpSquare();
+
+        break;
+    }
+
+    // Update the key with the final value
+    st->key = k;
+    if (tt)
+        prefetch(tt->first_entry(key()));
 
     // Calculate the repetition info. It is the ply distance from the previous
     // occurrence of the same position, negative in the 3-fold case, or zero
@@ -1029,8 +1061,8 @@ inline void add_dirty_threat(
   DirtyThreats* const dts, Piece pc, Piece threatened, Square s, Square threatenedSq) {
     if (PutPiece)
     {
-        dts->threatenedSqs |= threatenedSq;
-        dts->threateningSqs |= s;
+        dts->threatenedSqs |= square_bb(threatenedSq);
+        dts->threateningSqs |= square_bb(s);
     }
 
     dts->list.push_back({pc, threatened, s, threatenedSq, PutPiece});
@@ -1052,27 +1084,46 @@ void write_multiple_dirties(const Position& p,
       40, 39, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18,
       17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
 
-    const int dt_count = popcount(mask);
-    assert(dt_count <= 16);
-
     const __m512i template_v = _mm512_set1_epi32(dt_template.raw());
-    auto*         write      = dts->list.make_space(dt_count);
 
-    // Extract the list of squares and upconvert to 32 bits. There are never more than 16
-    // incoming threats so this is sufficient.
-    __m512i threat_squares = _mm512_maskz_compress_epi8(mask, AllSquares);
-    threat_squares         = _mm512_cvtepi8_epi32(_mm512_castsi512_si128(threat_squares));
+    // The number of threats is not bounded by 16: a queen attacks up to 27
+    // occupied squares. The mask is therefore processed in chunks of 16.
+    while (mask)
+    {
+        std::uint64_t chunk_mask = 0;
+        int           chunk_count = 0;
+        Bitboard      remaining  = mask;
 
-    __m512i threat_pieces =
-      _mm512_maskz_permutexvar_epi8(0x1111111111111111ULL, threat_squares, board);
+        while (remaining && chunk_count < 16)
+        {
+            const Bitboard sq = remaining & -remaining;
+            chunk_mask |= 1ULL << lsb(sq);
+            remaining &= remaining - 1;
+            ++chunk_count;
+        }
+        mask = remaining;
 
-    // Shift the piece and square into place
-    threat_squares = _mm512_slli_epi32(threat_squares, SqShift);
-    threat_pieces  = _mm512_slli_epi32(threat_pieces, PcShift);
+        auto* write = dts->list.make_space(chunk_count);
+        if (!write) return;  // The list is full, drop the remaining threats.
 
-    const __m512i dirties =
-      _mm512_ternarylogic_epi32(template_v, threat_squares, threat_pieces, 254 /* A | B | C */);
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(write), dirties);
+        // Extract the list of squares and upconvert to 32 bits.
+        __m512i threat_squares = _mm512_maskz_compress_epi8(chunk_mask, AllSquares);
+        threat_squares         = _mm512_cvtepi8_epi32(_mm512_castsi512_si128(threat_squares));
+
+        __m512i threat_pieces =
+          _mm512_maskz_permutexvar_epi8(0x1111111111111111ULL, threat_squares, board);
+
+        // Shift the piece and square into place
+        threat_squares = _mm512_slli_epi32(threat_squares, SqShift);
+        threat_pieces  = _mm512_slli_epi32(threat_pieces, PcShift);
+
+        const __m512i dirties =
+          _mm512_ternarylogic_epi32(template_v, threat_squares, threat_pieces, 254 /* A | B | C */);
+
+        // Store only the lanes that belong to this chunk.
+        const __mmask16 store_mask = (__mmask16) ((1u << chunk_count) - 1);
+        _mm512_mask_storeu_epi32(reinterpret_cast<__m512i*>(write), store_mask, dirties);
+    }
 }
 #endif
 
@@ -1099,25 +1150,30 @@ void Position::update_piece_threats(Piece                     pc,
       | (attacks_bb<PAWN>(s, BLACK) & whitePawns) | (PseudoAttacks[KING][s] & kings);
 
 #ifdef USE_AVX512ICL
-    if constexpr (PutPiece)
+    if (threatened)
     {
-        dts->threatenedSqs |= threatened;
-        dts->threateningSqs |= s;
+        if constexpr (PutPiece)
+        {
+            dts->threatenedSqs |= threatened;
+            dts->threateningSqs |= square_bb(s);
+        }
+
+        DirtyThreat dt_template{pc, NO_PIECE, s, Square(0), PutPiece};
+        write_multiple_dirties<DirtyThreat::ThreatenedSqOffset, DirtyThreat::ThreatenedPcOffset>(
+          *this, threatened, dt_template, dts);
     }
 
-    DirtyThreat dt_template{pc, NO_PIECE, s, Square(0), PutPiece};
-    write_multiple_dirties<DirtyThreat::ThreatenedSqOffset, DirtyThreat::ThreatenedPcOffset>(
-      *this, threatened, dt_template, dts);
-
     Bitboard all_attackers = sliders | incoming_threats;
+    if (!all_attackers)
+        return;  // Square s is threatened iff there's at least one attacker
 
     if constexpr (PutPiece)
     {
-        dts->threatenedSqs |= s;
+        dts->threatenedSqs |= square_bb(s);
         dts->threateningSqs |= all_attackers;
     }
 
-    dt_template = {NO_PIECE, pc, Square(0), s, PutPiece};
+    DirtyThreat dt_template{NO_PIECE, pc, Square(0), s, PutPiece};
     write_multiple_dirties<DirtyThreat::PcSqOffset, DirtyThreat::PcOffset>(*this, all_attackers,
                                                                            dt_template, dts);
 #else

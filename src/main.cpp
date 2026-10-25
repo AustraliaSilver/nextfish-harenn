@@ -18,9 +18,9 @@
 
 #include <iostream>
 #include <memory>
+#include <cstdlib>
 
 #include "bitboard.h"
-#include "harenn.h"
 #include "misc.h"
 #include "position.h"
 #include "tune.h"
@@ -28,12 +28,14 @@
 
 using namespace Stockfish;
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((force_align_arg_pointer))
+#endif
 int main(int argc, char* argv[]) {
     std::cout << engine_info() << std::endl;
 
     Bitboards::init();
     Position::init();
-    HARENN::GuidanceProvider::init();
 
     auto uci = std::make_unique<UCIEngine>(argc, argv);
 

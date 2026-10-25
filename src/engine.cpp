@@ -17,6 +17,7 @@
 */
 
 #include "engine.h"
+#include "harenn.h"
 
 #include <algorithm>
 #include <cassert>
@@ -38,6 +39,7 @@
 #include "perft.h"
 #include "position.h"
 #include "search.h"
+#include "harenn_ctrl.h"
 #include "shm.h"
 #include "syzygy/tbprobe.h"
 #include "types.h"
@@ -67,7 +69,6 @@ Engine::Engine(std::optional<std::string> path) :
              // Heap-allocate because sizeof(NN::Networks) is large
              std::make_unique<NN::Networks>(NN::EvalFile{EvalFileDefaultNameBig, "None", ""},
                                             NN::EvalFile{EvalFileDefaultNameSmall, "None", ""})) {
-
     pos.set(StartFEN, false, &states->back());
 
     options.add(  //
@@ -147,6 +148,22 @@ Engine::Engine(std::optional<std::string> path) :
           return std::nullopt;
       }));
 
+    options.add("Use DEE/HARENN", Option(true));
+    options.add("Use DEE Capture Ordering", Option(true));
+    options.add("Use DEE Capture Pruning", Option(false));
+    options.add("Use DEE Capture LMR", Option(false));
+    options.add("Use HARE Time Management", Option(true));
+    options.add("HARE TM Center", Option(35, 20, 50));       // centi-tau: 35 = 0.35
+    options.add("HARE TM Slope", Option(143, 50, 300));       // deci-slope: 143 = 14.3
+    options.add("HARE TM Range Min", Option(95, 85, 100));    // integer %
+    options.add("HARE TM Range Max", Option(105, 100, 115));   // integer %
+    options.add("HARE Ext Threshold White", Option(823, 500, 950));  // thousandths: 823 = 0.823
+    options.add("HARE Ext Threshold Black", Option(706, 500, 950));  // thousandths: 706 = 0.706
+    options.add("Contempt", Option(8, 0, 50));
+
+    // Initialize HARENN controller
+    HARENN::Controller::init(binaryDirectory);
+    
     load_networks();
     resize_threads();
 }
@@ -334,6 +351,17 @@ void Engine::trace_eval() const {
     verify_networks();
 
     sync_cout << "\n" << Eval::trace(p, *networks) << sync_endl;
+}
+
+void Engine::trace_harenn() const {
+    verify_networks();
+    HARENN::EvalResult res = HARENN::GuidanceProvider::query(pos, NumaReplicatedAccessToken(0));
+    sync_cout << "\n--- HARENN Model Inference ---"
+              << "\nEvaluation: " << (res.eval * 100.0f) << " cp"
+              << "\nTactical Complexity (Tau): " << res.tau
+              << "\nHorizon Risk (Rho): " << res.rho
+              << "\nResolution Score (RS): " << res.rs
+              << sync_endl;
 }
 
 const OptionsMap& Engine::get_options() const { return options; }

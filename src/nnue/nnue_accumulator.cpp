@@ -20,6 +20,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
 #include <type_traits>
 
@@ -155,19 +156,36 @@ void AccumulatorStack::evaluate(const Position&                       pos,
         evaluate_side<ThreatFeatureSet>(BLACK, pos, featureTransformer, cache);
 }
 
+namespace {
+    // Diagnostic switch. When the environment variable NEXTFISH_FULL_REFRESH
+    // is set, the threat accumulator is always recomputed from scratch
+    // instead of being updated incrementally. Comparing the benchmark hash of
+    // both modes proves whether the incremental update is exact.
+    bool force_full_threat_refresh() {
+        static const bool value = std::getenv("NEXTFISH_FULL_REFRESH") != nullptr;
+        return value;
+    }
+}
+
 template<typename FeatureSet, IndexType Dimensions>
 void AccumulatorStack::evaluate_side(Color                                 perspective,
                                      const Position&                       pos,
                                      const FeatureTransformer<Dimensions>& featureTransformer,
                                      AccumulatorCaches::Cache<Dimensions>& cache) noexcept {
 
-    const auto last_usable_accum =
+    const auto last_usable_acc =
       find_last_usable_accumulator<FeatureSet, Dimensions>(perspective);
 
-    if ((accumulators<FeatureSet>()[last_usable_accum].template acc<Dimensions>())
-          .computed[perspective])
+    const bool have_computed =
+      (accumulators<FeatureSet>()[last_usable_acc].template acc<Dimensions>()).computed[perspective];
+
+    const bool use_incremental = have_computed
+                                 && !(std::is_same_v<FeatureSet, ThreatFeatureSet>
+                                      && force_full_threat_refresh());
+
+    if (use_incremental)
         forward_update_incremental<FeatureSet>(perspective, pos, featureTransformer,
-                                               last_usable_accum);
+                                               last_usable_acc);
 
     else
     {
@@ -179,7 +197,7 @@ void AccumulatorStack::evaluate_side(Color                                 persp
                                             mut_latest<ThreatFeatureSet>());
 
         backward_update_incremental<FeatureSet>(perspective, pos, featureTransformer,
-                                                last_usable_accum);
+                                                last_usable_acc);
     }
 }
 
@@ -507,23 +525,19 @@ void double_inc_update(Color                                                   p
     assert(added.size() < 2);
     PSQFeatureSet::append_changed_indices(perspective, ksq, target_state.diff, removed, added);
 
-    [[maybe_unused]] const int addedSize   = added.ssize();
-    [[maybe_unused]] const int removedSize = removed.ssize();
-
-    assert(addedSize == 1);
-    assert(removedSize == 2 || removedSize == 3);
+    assert(added.size() == 1);
+    assert(removed.size() == 2 || removed.size() == 3);
 
     // Workaround compiler warning for uninitialized variables, replicated on
     // profile builds on windows with gcc 14.2.0.
-    // Also helps with optimizations on some compilers.
-
-    sf_assume(addedSize == 1);
-    sf_assume(removedSize == 2 || removedSize == 3);
+    // TODO remove once unneeded
+    sf_assume(added.size() == 1);
+    sf_assume(removed.size() == 2 || removed.size() == 3);
 
     auto updateContext =
       make_accumulator_update_context(perspective, featureTransformer, computed, target_state);
 
-    if (removedSize == 2)
+    if (removed.size() == 2)
     {
         updateContext.template apply<Add, Sub, Sub>(added[0], removed[0], removed[1]);
     }
@@ -597,41 +611,35 @@ void update_accumulator_incremental(
         updateContext.apply(added, removed);
     else
     {
-        [[maybe_unused]] const int addedSize   = added.ssize();
-        [[maybe_unused]] const int removedSize = removed.ssize();
-
-        assert(addedSize == 1 || addedSize == 2);
-        assert(removedSize == 1 || removedSize == 2);
-        assert((Forward && addedSize <= removedSize) || (!Forward && addedSize >= removedSize));
+        assert(added.size() == 1 || added.size() == 2);
+        assert(removed.size() == 1 || removed.size() == 2);
+        assert((Forward && added.size() <= removed.size())
+               || (!Forward && added.size() >= removed.size()));
 
         // Workaround compiler warning for uninitialized variables, replicated
         // on profile builds on windows with gcc 14.2.0.
-        // Also helps with optimizations on some compilers.
+        // TODO remove once unneeded
+        sf_assume(added.size() == 1 || added.size() == 2);
+        sf_assume(removed.size() == 1 || removed.size() == 2);
 
-        sf_assume(addedSize == 1 || addedSize == 2);
-        sf_assume(removedSize == 1 || removedSize == 2);
-
-        if (!(removedSize == 1 || removedSize == 2) || !(addedSize == 1 || addedSize == 2))
-            sf_unreachable();
-
-        if ((Forward && removedSize == 1) || (!Forward && addedSize == 1))
+        if ((Forward && removed.size() == 1) || (!Forward && added.size() == 1))
         {
-            assert(addedSize == 1 && removedSize == 1);
+            assert(added.size() == 1 && removed.size() == 1);
             updateContext.template apply<Add, Sub>(added[0], removed[0]);
         }
-        else if (Forward && addedSize == 1)
+        else if (Forward && added.size() == 1)
         {
-            assert(removedSize == 2);
+            assert(removed.size() == 2);
             updateContext.template apply<Add, Sub, Sub>(added[0], removed[0], removed[1]);
         }
-        else if (!Forward && removedSize == 1)
+        else if (!Forward && removed.size() == 1)
         {
-            assert(addedSize == 2);
+            assert(added.size() == 2);
             updateContext.template apply<Add, Add, Sub>(added[0], added[1], removed[0]);
         }
         else
         {
-            assert(addedSize == 2 && removedSize == 2);
+            assert(added.size() == 2 && removed.size() == 2);
             updateContext.template apply<Add, Add, Sub, Sub>(added[0], added[1], removed[0],
                                                              removed[1]);
         }

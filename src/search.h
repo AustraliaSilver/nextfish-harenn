@@ -32,9 +32,6 @@
 #include <string_view>
 #include <vector>
 
-#include "dee.h"
-#include "dqrs.h"
-#include "harenn.h"
 #include "history.h"
 #include "misc.h"
 #include "nnue/network.h"
@@ -47,9 +44,6 @@
 #include "types.h"
 
 namespace Stockfish {
-
-namespace HARENN { struct EvalResult; }
-namespace DEE { struct DEE_Result; }
 
 // Different node types, used as a template parameter
 enum NodeType {
@@ -82,9 +76,11 @@ struct Stack {
     bool                        ttHit;
     int                         cutoffCnt;
     int                         reduction;
-    DQRS::TrajectoryPredictor   trajectory;
-    HARENN::EvalResult          harenn;
-    DEE::DEE_Result             dee;
+
+    // Number of HARENN selective extensions already granted on the current
+    // principal variation. It bounds the extension so a chain of consecutive
+    // checking moves cannot keep the search depth constant.
+    int                         harennExtensions;
 };
 
 
@@ -276,7 +272,7 @@ class NullSearchManager: public ISearchManager {
 // of the search history, and storing data required for the search.
 class Worker {
    public:
-    Worker(SharedState&,
+    Worker(const SharedState&,
            std::unique_ptr<ISearchManager>,
            size_t,
            size_t,
@@ -366,6 +362,12 @@ class Worker {
     ThreadPool&                                               threads;
     TranspositionTable&                                       tt;
     const LazyNumaReplicatedSystemWide<Eval::NNUE::Networks>& networks;
+
+    // Cached option flags for hot search paths
+    bool useDEE = true;
+    bool useDEECaptureOrdering = true;
+    bool useDEECaptureLMR = false;
+    bool useDEECapturePruning = false;
 
     // Used by NNUE
     Eval::NNUE::AccumulatorStack  accumulatorStack;

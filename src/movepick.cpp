@@ -23,6 +23,8 @@
 #include <utility>
 
 #include "bitboard.h"
+#include "dee.h"
+#include "harenn_ctrl.h"
 #include "misc.h"
 #include "position.h"
 
@@ -88,7 +90,8 @@ MovePicker::MovePicker(const Position&              p,
                        const CapturePieceToHistory* cph,
                        const PieceToHistory**       ch,
                        const SharedHistories*       sh,
-                       int                          pl) :
+                       int                          pl,
+                       bool                         useDeeOrdering) :
     pos(p),
     mainHistory(mh),
     lowPlyHistory(lph),
@@ -97,7 +100,8 @@ MovePicker::MovePicker(const Position&              p,
     sharedHistory(sh),
     ttMove(ttm),
     depth(d),
-    ply(pl) {
+    ply(pl),
+    useDeeCaptureOrdering(useDeeOrdering) {
 
     if (pos.checkers())
         stage = EVASION_TT + !(ttm && pos.pseudo_legal(ttm));
@@ -152,8 +156,18 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
         const Piece     capturedPiece = pos.piece_on(to);
 
         if constexpr (Type == CAPTURES)
+        {
             m.value = (*captureHistory)[pc][to][type_of(capturedPiece)]
                     + 7 * int(PieceValue[capturedPiece]);
+
+            // DEE Micro-Ordering: Subtle tie-breaker for captures
+            if (useDeeCaptureOrdering && depth >= 6)
+            {
+                const int dee = int(DEE::Evaluator::adjusted_see(pos, m));
+                if (dee > 0)
+                    m.value += std::min(40, dee); // V17 stable weight
+            }
+        }
 
         else if constexpr (Type == QUIETS)
         {
@@ -170,13 +184,12 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
             m.value += (bool(pos.check_squares(pt) & to) && pos.see_ge(m, -75)) * 16384;
 
             // penalty for moving to a square threatened by a lesser piece
-            // or bonus for escaping an attack by a lesser piece.
             int v = threatByLesser[pt] & to ? -19 : 20 * bool(threatByLesser[pt] & from);
             m.value += PieceValue[pt] * v;
 
-
             if (ply < LOW_PLY_HISTORY_SIZE)
                 m.value += 8 * (*lowPlyHistory)[ply][m.raw()] / (1 + ply);
+
         }
 
         else  // Type == EVASIONS

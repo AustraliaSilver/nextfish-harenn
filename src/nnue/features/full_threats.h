@@ -30,8 +30,8 @@ class Position;
 
 namespace Stockfish::Eval::NNUE::Features {
 
-static constexpr int numValidTargets[PIECE_NB] = {0, 6, 10, 8, 8, 10, 8, 0,
-                                                  0, 6, 10, 8, 8, 10, 8, 0};
+static constexpr int numValidTargets[PIECE_NB] = {0, 6, 12, 10, 10, 12, 8, 0,
+                                                  0, 6, 12, 10, 10, 12, 8, 0};
 
 class FullThreats {
    public:
@@ -42,7 +42,7 @@ class FullThreats {
     static constexpr std::uint32_t HashValue = 0x8f234cb8u;
 
     // Number of feature dimensions
-    static constexpr IndexType Dimensions = 66864;
+    static constexpr IndexType Dimensions = 79856;
 
     // clang-format off
     // Orient a square according to perspective (rotates by 180 for black)
@@ -59,10 +59,10 @@ class FullThreats {
 
     static constexpr int map[PIECE_TYPE_NB-2][PIECE_TYPE_NB-2] = {
       {0,  1, -1,  2, -1, -1},
-      {0,  1,  2,  3,  4, -1},
-      {0,  1,  2,  3, -1, -1},
-      {0,  1,  2,  3, -1, -1},
-      {0,  1,  2,  3,  4, -1},
+      {0,  1,  2,  3,  4,  5},
+      {0,  1,  2,  3, -1,  4},
+      {0,  1,  2,  3, -1,  4},
+      {0,  1,  2,  3,  4,  5},
       {0,  1,  2,  3, -1, -1}
     };
     // clang-format on
@@ -74,8 +74,11 @@ class FullThreats {
         Square dp2removed;
     };
 
-    // Maximum number of simultaneously active features.
-    static constexpr IndexType MaxActiveDimensions = 128;
+    // Maximum number of simultaneously active features, and of the feature
+    // indices produced when the changes of a move are merged. A single move
+    // can produce up to 192 dirty threats, and the double extension merges the
+    // changes of two moves, so the list must hold twice that many indices.
+    static constexpr IndexType MaxActiveDimensions = 384;
     using IndexList                                = ValueList<IndexType, MaxActiveDimensions>;
     using DiffType                                 = DirtyThreats;
 

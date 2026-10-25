@@ -323,8 +323,14 @@ struct DirtyThreat {
 // By similar logic, a castling move can change at most (5 + 1 + 3 + 9) * 2 = 36 features.
 // Thus, 80 should work as an upper bound. Finally, 16 entries are added to accommodate
 // unmasked vector stores near the end of the list.
+//
+// The bound above only counts the *attacking* relations of the moved piece.
+// The threat feature set additionally records one entry per occupied square
+// the piece attacks, which is up to 27 squares for a queen. A capture touches
+// three pieces (the mover leaves its square, the captured piece is removed and
+// the mover is placed), so the real bound is 3 * (27 + 16 + 19) = 186 entries.
 
-using DirtyThreatList = ValueList<DirtyThreat, 96>;
+using DirtyThreatList = ValueList<DirtyThreat, 192>;
 
 struct DirtyThreats {
     DirtyThreatList list;
@@ -448,10 +454,6 @@ class Move {
         assert(is_ok());
         return Square(data & 0x3F);
     }
-
-    // Same as to_sq() but without assertion, for branchless code paths
-    // where the result is masked/ignored when move is not ok
-    constexpr Square to_sq_unchecked() const { return Square(data & 0x3F); }
 
     constexpr MoveType type_of() const { return MoveType(data & (3 << 14)); }
 

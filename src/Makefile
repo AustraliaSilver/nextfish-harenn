@@ -64,7 +64,7 @@ PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 
 ### Built-in benchmark for pgo-builds
-PGOBENCH = $(RUN_PREFIX) ./$(EXE) bench
+PGOBENCH = $(RUN_PREFIX) ./$(EXE) bench 16 1 12
 
 ### Source and object files
 SRCS = benchmark.cpp bitboard.cpp evaluate.cpp main.cpp \
@@ -72,7 +72,7 @@ SRCS = benchmark.cpp bitboard.cpp evaluate.cpp main.cpp \
 	search.cpp thread.cpp timeman.cpp tt.cpp uci.cpp ucioption.cpp tune.cpp syzygy/tbprobe.cpp \
 	nnue/nnue_accumulator.cpp nnue/nnue_misc.cpp nnue/network.cpp \
 	nnue/features/half_ka_v2_hm.cpp nnue/features/full_threats.cpp \
-	engine.cpp score.cpp memory.cpp harenn.cpp dqrs.cpp dee.cpp
+	engine.cpp score.cpp memory.cpp harenn.cpp harenn_ctrl.cpp dee.cpp
 
 HEADERS = benchmark.h bitboard.h evaluate.h misc.h movegen.h movepick.h history.h \
 		nnue/nnue_misc.h nnue/features/half_ka_v2_hm.h nnue/features/full_threats.h \
@@ -80,8 +80,7 @@ HEADERS = benchmark.h bitboard.h evaluate.h misc.h movegen.h movepick.h history.
 		nnue/layers/clipped_relu.h nnue/layers/sqr_clipped_relu.h nnue/nnue_accumulator.h \
 		nnue/nnue_architecture.h nnue/nnue_common.h nnue/nnue_feature_transformer.h nnue/simd.h \
 		position.h search.h syzygy/tbprobe.h thread.h thread_win32_osx.h timeman.h \
-		tt.h tune.h types.h uci.h ucioption.h perft.h nnue/network.h engine.h score.h numa.h memory.h shm.h shm_linux.h \
-		harenn.h dqrs.h dee.h
+		tt.h tune.h types.h uci.h ucioption.h perft.h nnue/network.h engine.h score.h numa.h memory.h harenn.h harenn_ctrl.h dee.h
 
 OBJS = $(notdir $(SRCS:.cpp=.o))
 
@@ -479,7 +478,10 @@ ifeq ($(COMP),gcc)
 endif
 
 ifeq ($(target_windows),yes)
-	LDFLAGS += -static
+	# The deep search needs a large stack. GNU ld accepts --stack=<bytes> and
+	# lld accepts it as well, so the flag does not depend on which of the two
+	# linkers the selected compiler ends up using.
+	LDFLAGS += -static -Wl,--stack=8388608
 endif
 
 ifeq ($(COMP),mingw)
@@ -512,11 +514,18 @@ ifeq ($(COMP),clang)
 	comp=clang
 	CXX=clang++
 	ifeq ($(target_windows),yes)
-		CXX=x86_64-w64-mingw32-clang++
+		# A cross compiler is named x86_64-w64-mingw32-clang++, but the MSYS2
+		# toolchain installs the plain clang++ in the mingw64 prefix. Use
+		# whichever of the two is actually available.
+		ifeq ($(shell which x86_64-w64-mingw32-clang++ 2> /dev/null),)
+			CXX=clang++
+		else
+			CXX=x86_64-w64-mingw32-clang++
+		endif
 	endif
 
 	CXXFLAGS += -pedantic -Wextra -Wshadow -Wmissing-prototypes \
-	            -Wconditional-uninitialized -flax-vector-conversions=none
+	            -Wconditional-uninitialized
 
 	ifeq ($(filter $(KERNEL),Darwin OpenBSD FreeBSD),)
 	ifeq ($(target_windows),)
@@ -628,8 +637,8 @@ ifeq ($(COMP),gcc)
 	endif
 endif
 
-### On mingw use Windows threads, otherwise POSIX
-ifneq ($(comp),mingw)
+### On Windows use standard C++ threads, otherwise POSIX
+ifneq ($(target_windows),yes)
 	CXXFLAGS += -DUSE_PTHREADS
 	# On Android Bionic's C library comes with its own pthread implementation bundled in
 	ifneq ($(OS),Android)
@@ -694,7 +703,7 @@ ifeq ($(optimize),yes)
 
 	ifeq ($(comp),clang)
 		clangmajorversion := $(shell $(CXX) -dumpversion 2>/dev/null | cut -f1 -d.)
-		ifeq ($(shell expr $(clangmajorversion) \< 16),1)
+		ifeq ($(shell expr $(clangmajorversion) \< 16 2>/dev/null),1)
 			CXXFLAGS += -fexperimental-new-pass-manager
 		endif
 	endif
@@ -873,15 +882,16 @@ ifeq ($(debug), no)
 		CXXFLAGS += -flto -flto-partition=one
 		LDFLAGS += $(CXXFLAGS) -flto=jobserver
 	else
-		CXXFLAGS += -flto=full
-		LDFLAGS += $(CXXFLAGS)
+		CXXFLAGS += -flto -flto-partition=one
+		LDFLAGS += $(CXXFLAGS) -flto=jobserver
 	endif
 
 # To use LTO and static linking on Windows,
 # the tool chain requires gcc version 10.1 or later.
 	else ifeq ($(comp),mingw)
-		CXXFLAGS += -flto -flto-partition=one
-		LDFLAGS += $(CXXFLAGS) -save-temps
+		# LTO is disabled on MinGW to prevent fprofile-generate segmentation faults
+		# CXXFLAGS += -flto -flto-partition=one
+		# LDFLAGS += $(CXXFLAGS) -save-temps
 	endif
 endif
 endif
@@ -980,20 +990,19 @@ endif
 	clang-profile-use clang-profile-make FORCE \
 	format analyze
 
-analyze: net config-sanity objclean
+analyze: net objclean config-sanity
 	$(MAKE) -k ARCH=$(ARCH) COMP=$(COMP) $(OBJS)
 
 build: net config-sanity
 	$(MAKE) ARCH=$(ARCH) COMP=$(COMP) all
 
-profile-build: net config-sanity objclean profileclean
+profile-build: net objclean profileclean config-sanity
 	@echo ""
 	@echo "Step 1/4. Building instrumented executable ..."
 	$(MAKE) ARCH=$(ARCH) COMP=$(COMP) $(profile_make)
 	@echo ""
 	@echo "Step 2/4. Running benchmark for pgo-build ..."
-	$(PGOBENCH) > PGOBENCH.out 2>&1
-	tail -n 4 PGOBENCH.out
+	$(PGOBENCH) > PGOBENCH.out 2>&1; val=$$?; cat PGOBENCH.out; if [ $$val -ne 0 ]; then exit $$val; fi
 	@echo ""
 	@echo "Step 3/4. Building optimized executable ..."
 	$(MAKE) ARCH=$(ARCH) COMP=$(COMP) objclean
@@ -1109,6 +1118,8 @@ config-sanity: net
 	 test "$(comp)" = "clang" || test "$(comp)" = "armv7a-linux-androideabi16-clang" || \
 	 test "$(comp)" = "aarch64-linux-android21-clang")
 
+# No overrides for engine.o and thread.o to allow full O3/PGO optimization
+
 $(EXE): $(OBJS)
 	+$(CXX) -o $@ $(OBJS) $(LDFLAGS)
 
@@ -1130,16 +1141,15 @@ clang-profile-use:
 	all
 
 gcc-profile-make:
-	@mkdir -p profdir
 	$(MAKE) ARCH=$(ARCH) COMP=$(COMP) \
-	EXTRACXXFLAGS='-fprofile-generate=profdir' \
+	EXTRACXXFLAGS='-fprofile-generate' \
 	EXTRACXXFLAGS+=$(EXTRAPROFILEFLAGS) \
 	EXTRALDFLAGS='-lgcov' \
 	all
 
 gcc-profile-use:
 	$(MAKE) ARCH=$(ARCH) COMP=$(COMP) \
-	EXTRACXXFLAGS='-fprofile-use=profdir -fno-peel-loops -fno-tracer' \
+	EXTRACXXFLAGS='-fprofile-use -fno-peel-loops -fno-tracer' \
 	EXTRACXXFLAGS+=$(EXTRAPROFILEFLAGS) \
 	EXTRALDFLAGS='-lgcov' \
 	all

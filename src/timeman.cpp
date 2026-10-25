@@ -25,6 +25,8 @@
 
 #include "search.h"
 #include "ucioption.h"
+#include "position.h"
+#include "harenn_ctrl.h"
 
 namespace Stockfish {
 
@@ -48,7 +50,8 @@ void TimeManagement::init(Search::LimitsType& limits,
                           Color               us,
                           int                 ply,
                           const OptionsMap&   options,
-                          double&             originalTimeAdjust) {
+                          double&             originalTimeAdjust,
+                          const Position&     pos) {
     TimePoint npmsec = TimePoint(options["nodestime"]);
 
     // If we have no time, we don't need to fully initialize TM.
@@ -110,14 +113,14 @@ void TimeManagement::init(Search::LimitsType& limits,
 
         // Calculate time constants based on current time left.
         double logTimeInSec = std::log10(scaledTime / 1000.0);
-        double optConstant  = std::min(0.0032116 + 0.000321123 * logTimeInSec, 0.00508017);
-        double maxConstant  = std::max(3.3977 + 3.03950 * logTimeInSec, 2.94761);
+        double optConstant  = std::min(0.0032116 + 0.000351123 * logTimeInSec, 0.00508017);
+        double maxConstant  = std::max(3.3977 + 3.23950 * logTimeInSec, 2.94761);
 
-        optScale = std::min(0.0121431 + std::pow(ply + 2.94693, 0.461073) * optConstant,
+        optScale = std::min(0.0121431 + std::pow(ply + 3.14693, 0.481073) * optConstant,
                             0.213035 * limits.time[us] / timeLeft)
                  * originalTimeAdjust;
 
-        maxScale = std::min(6.67704, maxConstant + ply / 11.9847);
+        maxScale = std::min(6.67704, maxConstant + ply / 10.9847);
     }
 
     // x moves in y seconds (+ z increment)
@@ -130,6 +133,23 @@ void TimeManagement::init(Search::LimitsType& limits,
 
     // Limit the maximum possible time for this move
     optimumTime = TimePoint(optScale * timeLeft);
+
+    if (options["Use DEE/HARENN"] && options["Use HARE Time Management"])
+    {
+        double mult = HARENN::Controller::get_time_multiplier(pos) / 100.0;
+        // scaledTime is always expressed in milliseconds, while limits.time[us]
+        // holds a node count in 'nodes as time' mode. Using the raw value
+        // would silently disable the low-time safety ramp.
+        double timeLeftMs = (double) scaledTime;
+        // Safety: symmetric interpolation to 100% below 2000ms
+        // Prevents both boosting AND starving at low time
+        if (timeLeftMs < 2000.0) {
+            double ratio = std::max(0.0, (timeLeftMs - 500.0) / 1500.0);
+            mult = 1.0 + (mult - 1.0) * ratio;
+        }
+        optimumTime = TimePoint(optimumTime * mult);
+    }
+
     maximumTime =
       TimePoint(std::min(0.825179 * limits.time[us] - moveOverhead, maxScale * optimumTime)) - 10;
 

@@ -1,46 +1,42 @@
+/*
+  Stockfish, a UCI chess playing engine derived from Glaurung 2.1
+  Copyright (C) 2004-2026 The Stockfish developers (see AUTHORS file)
+
+  Stockfish is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  Stockfish is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 #ifndef DEE_H_INCLUDED
 #define DEE_H_INCLUDED
 
 #include "types.h"
 #include "position.h"
-#include <vector>
 
 namespace Stockfish {
 
 namespace DEE {
 
-struct ExchangeSequence {
-    std::vector<Move> moves;
-    Value material_delta;
-    Value structural_impact;
-    Value dynamic_impact;
-};
-
-struct DEE_Result {
-    Value total_score;
-    Value threat_value;
-    bool  should_execute_now;
-    Move  best_exchange_move;
-};
-
 class Evaluator {
 public:
-    // Core DEE evaluation
-    static DEE_Result evaluate(const Position& pos);
-    
-    // Quick check for tactical tension
-    static bool has_tension(const Position& pos);
-
-    // Get adjusted SEE value with DEE principles
+    // Tie-breaker used in MovePicker for capture ordering
     static Value adjusted_see(const Position& pos, Move m);
 
-private:
-    static Value compute_structural_impact(const Position& pos, const ExchangeSequence& seq);
-    static Value compute_dynamic_impact(const Position& pos, const ExchangeSequence& seq);
+    // QS Pruning Logic (V15)
+    static bool should_prune_in_qs(const Position& pos, Move m, Value adjustedSee);
 };
 
-} // namespace DEE
+}  // namespace DEE
 
-} // namespace Stockfish
+}  // namespace Stockfish
 
-#endif // DEE_H_INCLUDED
+#endif  // DEE_H_INCLUDED
