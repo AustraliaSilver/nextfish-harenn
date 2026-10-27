@@ -247,9 +247,36 @@ class ParallelGenerator:
                 rho = min(rho + 0.10, 1.0)
                 tau = min(tau + 0.10, 1.0)
 
-            # RS (resolution score): inverse of rho. A position where the
-            # search is stable (low swing, same best move) is resolved.
-            rs = max(0.05, 1.0 - rho)
+            # RS (Confidence Score / Resolution): Measures how confident the
+            # engine is in its evaluation and move choice compared to potential error/deviation.
+            # 1. Depth Stability: Eval deviation across depth 8, 16, and 20
+            max_eval_dev = max(abs(cp8 - cp), abs(cp - cp20), abs(cp8 - cp20))
+            s_stability = max(0.0, 1.0 - (max_eval_dev / 150.0))
+
+            # 2. Move Consistency: Agreement of best move across depths
+            if m8 is not None and m16 is not None and m20 is not None:
+                if m8 == m16 == m20:
+                    s_agreement = 1.0
+                elif m16 == m20:
+                    s_agreement = 0.75
+                elif m8 == m20:
+                    s_agreement = 0.50
+                else:
+                    s_agreement = 0.25
+            else:
+                s_agreement = 0.50
+
+            # 3. Decision Margin: Dominance of best move over second best move in MultiPV
+            if len(res16_multi) >= 2 and 'score' in res16_multi[1] and res16_multi[1].get('pv'):
+                cp_second = res16_multi[1]['score'].relative.score(mate_score=10000) or 0
+                margin = max(0, cp - cp_second)
+                s_margin = min(1.0, margin / 80.0)
+            else:
+                s_margin = 0.50
+
+            # Composite confidence score
+            rs = 0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin
+            rs = max(0.05, min(0.99, rs))
             m16, l16 = [r["pv"][0].uci() for r in res16_multi], [self.move_to_label(board, r["pv"][0]) for r in res16_multi]
 
             m20, l20 = self.get_top_moves_safe(board, engine, 20)
