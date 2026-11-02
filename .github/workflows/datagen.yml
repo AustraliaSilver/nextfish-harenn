@@ -45,12 +45,13 @@ jobs:
       - name: Generate Data (time-budgeted)
         run: |
           mkdir -p data
-          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 5000 --batch-size 100 --concurrency 4 --hash 2048 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 16384
+          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 10000 --batch-size 100 --concurrency 4 --hash 2048 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 16384
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
 
       - name: Pack and Upload Data to Hugging Face Bucket
+        if: always()
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -115,3 +116,23 @@ jobs:
           dt = time.time() - t0
           print(f"Upload completed in {dt:.2f} seconds!")
           EOF
+
+  auto-retrigger:
+    needs: data-generation
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Cool down 30 minutes before next run
+        run: |
+          echo "=========================================================="
+          echo "Ca chay da hoan tat va du lieu da duoc day len Hugging Face."
+          echo "Bat dau thoi gian nghi lam mat 30 phut (1,800 giay)..."
+          echo "=========================================================="
+          sleep 1800
+          echo "Ket thuc 30 phut nghi. Tu dong kich hoat ca chay moi..."
+
+      - name: Trigger next workflow run
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_DISPATCH_TOKEN }}
+        run: |
+          gh workflow run datagen.yml --repo ${{ github.repository }} --ref data
