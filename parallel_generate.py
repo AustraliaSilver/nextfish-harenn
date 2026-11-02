@@ -292,7 +292,7 @@ class ParallelGenerator:
 
         engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
         try:
-            engine.configure({"Threads": 1, "Hash": 128})
+            engine.configure({"Threads": 1, "Hash": 128, "Move Overhead": 0})
         except Exception:
             pass
 
