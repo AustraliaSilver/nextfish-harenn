@@ -87,17 +87,18 @@ class TrainingPosition:
 
 class ParallelGenerator:
 
-    def __init__(self, engine_path, output_dir, depth=16, time_budget=None, worker_id=None, batch_size=100):
+    def __init__(self, engine_path, output_dir, nodes=16384, time_budget=None, worker_id=None, batch_size=100):
         self.batch_size = batch_size
         self.worker_id = worker_id
         self.time_budget = time_budget
         self.start_time = time.time()
+        self.nodes = nodes
+        self.nodes_shallow = max(512, nodes // 16)
+        self.nodes_mid = max(1024, nodes // 4)
 
         self.engine_path = engine_path
 
         self.output_dir = Path(output_dir)
-
-        self.depth = depth
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,40 +180,41 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
-            res8 = engine.analyse(board, chess.engine.Limit(depth=8))
-            res14_multi = engine.analyse(board, chess.engine.Limit(depth=14), multipv=2)
-            res18 = engine.analyse(board, chess.engine.Limit(depth=18))
+            res_shallow = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow))
+            res_mid_multi = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_mid), multipv=2)
+            res_deep = engine.analyse(board, chess.engine.Limit(nodes=self.nodes))
 
-            if not isinstance(res14_multi, list):
-                res14_multi = [res14_multi]
+            if not isinstance(res_mid_multi, list):
+                res_mid_multi = [res_mid_multi]
 
-            m8 = res8.get("pv", [None])[0]
-            m14 = res14_multi[0].get("pv", [None])[0]
-            m18 = res18.get("pv", [None])[0]
+            m_shallow = res_shallow.get("pv", [None])[0]
+            m_mid = res_mid_multi[0].get("pv", [None])[0]
+            m_deep = res_deep.get("pv", [None])[0]
 
-            cp = res14_multi[0]["score"].relative.score(mate_score=10000) or 0
-            cp18 = res18["score"].relative.score(mate_score=10000) or 0
-            cp8 = res8["score"].relative.score(mate_score=10000) or 0
+            cp_deep = res_deep["score"].relative.score(mate_score=10000) or 0
+            cp_mid = res_mid_multi[0]["score"].relative.score(mate_score=10000) or 0
+            cp_shallow = res_shallow["score"].relative.score(mate_score=10000) or 0
+            cp = cp_deep
 
-            # Eval swing between depths (absolute, in centipawns)
-            swing_8_14 = abs(cp8 - cp)
-            swing_14_18 = abs(cp - cp18)
-            max_swing = max(swing_8_14, swing_14_18)
+            # Eval swing between node budgets (absolute, in centipawns)
+            swing_shallow_mid = abs(cp_shallow - cp_mid)
+            swing_mid_deep = abs(cp_mid - cp_deep)
+            max_swing = max(swing_shallow_mid, swing_mid_deep)
 
-            # RHO (horizon risk): how much the eval moves between depths.
+            # RHO (horizon risk): how much the eval moves between node budgets.
             # Normalized so that 200 cp of swing maps to 1.0.
             rho = min(max_swing / 200.0, 1.0)
 
-            # TAU (tactical complexity): how often the best move changes between depths.
+            # TAU (tactical complexity): how often the best move changes between node budgets.
             transitions = 0
             changes = 0
-            if m8 is not None and m14 is not None:
+            if m_shallow is not None and m_mid is not None:
                 transitions += 1
-                if m8 != m14:
+                if m_shallow != m_mid:
                     changes += 1
-            if m14 is not None and m18 is not None:
+            if m_mid is not None and m_deep is not None:
                 transitions += 1
-                if m14 != m18:
+                if m_mid != m_deep:
                     changes += 1
             tau = (changes / transitions) if transitions > 0 else 0.0
 
@@ -230,17 +232,17 @@ class ParallelGenerator:
 
             # RS (Confidence Score / Resolution): Measures how confident the
             # engine is in its evaluation and move choice compared to potential error/deviation.
-            # 1. Depth Stability: Eval deviation across depth 8, 14, and 18
-            max_eval_dev = max(abs(cp8 - cp), abs(cp - cp18), abs(cp8 - cp18))
+            # 1. Budget Stability: Eval deviation across shallow, mid, and deep node budgets
+            max_eval_dev = max(abs(cp_shallow - cp_mid), abs(cp_mid - cp_deep), abs(cp_shallow - cp_deep))
             s_stability = max(0.0, 1.0 - (max_eval_dev / 150.0))
 
-            # 2. Move Consistency: Agreement of best move across depths
-            if m8 is not None and m14 is not None and m18 is not None:
-                if m8 == m14 == m18:
+            # 2. Move Consistency: Agreement of best move across node budgets
+            if m_shallow is not None and m_mid is not None and m_deep is not None:
+                if m_shallow == m_mid == m_deep:
                     s_agreement = 1.0
-                elif m14 == m18:
+                elif m_mid == m_deep:
                     s_agreement = 0.75
-                elif m8 == m18:
+                elif m_shallow == m_deep:
                     s_agreement = 0.50
                 else:
                     s_agreement = 0.25
@@ -248,9 +250,9 @@ class ParallelGenerator:
                 s_agreement = 0.50
 
             # 3. Decision Margin: Dominance of best move over second best move in MultiPV
-            if len(res14_multi) >= 2 and 'score' in res14_multi[1] and res14_multi[1].get('pv'):
-                cp_second = res14_multi[1]['score'].relative.score(mate_score=10000) or 0
-                margin = max(0, cp - cp_second)
+            if len(res_mid_multi) >= 2 and 'score' in res_mid_multi[1] and res_mid_multi[1].get('pv'):
+                cp_second = res_mid_multi[1]['score'].relative.score(mate_score=10000) or 0
+                margin = max(0, cp_mid - cp_second)
                 s_margin = min(1.0, margin / 80.0)
             else:
                 s_margin = 0.50
@@ -259,22 +261,24 @@ class ParallelGenerator:
             rs = 0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin
             rs = max(0.05, min(0.99, rs))
 
-            m14_uci = [r["pv"][0].uci() for r in res14_multi if r.get("pv")]
-            l14_lbl = [self.move_to_label(board, r["pv"][0]) for r in res14_multi if r.get("pv")]
-            m18_uci = [m18.uci()] if m18 else []
-            l18_lbl = [self.move_to_label(board, m18)] if m18 else []
+            m_mid_uci = [r["pv"][0].uci() for r in res_mid_multi if r.get("pv")]
+            l_mid_lbl = [self.move_to_label(board, r["pv"][0]) for r in res_mid_multi if r.get("pv")]
+            m_deep_uci = [m_deep.uci()] if m_deep else []
+            l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
+            achieved_depth = int(res_deep.get("depth", 24))
 
             return {
                 "cp": cp,
+                "depth": achieved_depth,
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
-                "m16": m14_uci,
-                "l16": l14_lbl,
-                "m20": m18_uci,
-                "l20": l18_lbl,
-                "m24": m18_uci,
-                "l24": l18_lbl,
+                "m16": m_mid_uci,
+                "l16": l_mid_lbl,
+                "m20": m_deep_uci,
+                "l20": l_deep_lbl,
+                "m24": m_deep_uci,
+                "l24": l_deep_lbl,
             }
 
         except Exception:
@@ -332,24 +336,17 @@ class ParallelGenerator:
 
                         print(f"  [W{worker_id} | G{game_id}] Pos {total_game_pos}: Eval {data['cp']}", flush=True)
 
+                        chosen_best = data["m20"][0] if data["m20"] else (data["m16"][0] if data["m16"] else "0000")
+                        chosen_best_obj = chess.Move.from_uci(chosen_best) if chosen_best != "0000" else None
                         pos = TrainingPosition(
-
                             fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
-
-                            eval_score=data["cp"], depth=16,
-
-                            best_move=data["m16"][0] if data["m16"] else "0000",
-
-                            best_move_label=self.move_to_label(board, chess.Move.from_uci(data["m16"][0])) if data["m16"] else 0,
-
+                            eval_score=data["cp"], depth=data.get("depth", 24),
+                            best_move=chosen_best,
+                            best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
                             best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
-
                             best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-
                             game_result=1, material=self.count_material(board), piece_count=len(board.piece_map()),
-
                             tau=data["tau"], rho=data["rho"], rs=data["rs"]
-
                         )
 
                         positions.append(asdict(pos))
@@ -385,6 +382,7 @@ def main():
     parser.add_argument("--output", "-o", default="D:/nextfish/data")
 
     parser.add_argument("--games", "-g", type=int, default=100)
+    parser.add_argument("--nodes", "-n", type=int, default=16384, help="Stockfish node budget per position (default: 16384)")
     parser.add_argument("--batch-size", "-b", type=int, default=100, help="Number of positions per JSON file (default: 100)")
 
     parser.add_argument("--concurrency", "-j", type=int, default=multiprocessing.cpu_count() - 1)
@@ -393,11 +391,12 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"=== HARENN Turbo Generator V8 (Raw Data) ===")
+    print(f"=== HARENN Turbo Generator V8 (Raw Data - Budget: {args.nodes:,} Nodes) ===")
 
     gen = ParallelGenerator(
         args.engine,
         args.output,
+        nodes=args.nodes,
         time_budget=args.time_budget,
         worker_id=args.worker_id,
         batch_size=args.batch_size
