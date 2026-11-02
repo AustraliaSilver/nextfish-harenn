@@ -87,12 +87,13 @@ class TrainingPosition:
 
 class ParallelGenerator:
 
-    def __init__(self, engine_path, output_dir, nodes=16384, time_budget=None, worker_id=None, batch_size=100):
+    def __init__(self, engine_path, output_dir, nodes=16384, hash_mb=2048, time_budget=None, worker_id=None, batch_size=100):
         self.batch_size = batch_size
         self.worker_id = worker_id
         self.time_budget = time_budget
         self.start_time = time.time()
         self.nodes = nodes
+        self.hash_mb = hash_mb
         self.nodes_shallow = max(512, nodes // 16)
         self.nodes_mid = max(1024, nodes // 4)
 
@@ -292,7 +293,7 @@ class ParallelGenerator:
 
         engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
         try:
-            engine.configure({"Threads": 1, "Hash": 128, "Move Overhead": 0})
+            engine.configure({"Threads": 1, "Hash": self.hash_mb, "Move Overhead": 0})
         except Exception:
             pass
 
@@ -383,20 +384,22 @@ def main():
 
     parser.add_argument("--games", "-g", type=int, default=100)
     parser.add_argument("--nodes", "-n", type=int, default=16384, help="Stockfish node budget per position (default: 16384)")
+    parser.add_argument("--hash", type=int, default=2048, help="Hash table size in MB per engine (default: 2048)")
     parser.add_argument("--batch-size", "-b", type=int, default=100, help="Number of positions per JSON file (default: 100)")
 
-    parser.add_argument("--concurrency", "-j", type=int, default=multiprocessing.cpu_count() - 1)
+    parser.add_argument("--concurrency", "-j", type=int, default=4, help="Number of concurrent worker processes (default: 4)")
     parser.add_argument("--time-budget", type=int, default=None, help="Stop after N seconds (leave time for commit)")
     parser.add_argument("--worker-id", "-w", default=None, help="Worker identifier for naming")
 
     args = parser.parse_args()
 
-    print(f"=== HARENN Turbo Generator V8 (Raw Data - Budget: {args.nodes:,} Nodes) ===")
+    print(f"=== HARENN Turbo Generator V8 (Raw Data - Budget: {args.nodes:,} Nodes | Hash: {args.hash}MB | Concurrency: {args.concurrency}) ===")
 
     gen = ParallelGenerator(
         args.engine,
         args.output,
         nodes=args.nodes,
+        hash_mb=args.hash,
         time_budget=args.time_budget,
         worker_id=args.worker_id,
         batch_size=args.batch_size
