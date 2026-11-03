@@ -386,6 +386,29 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
             labels_tau = data["labels_tau"]
             labels_rho = data["labels_rho"]
             labels_rs = data["labels_rs"]
+
+            # Tự động phát hiện và chuẩn hóa nếu file cache được sinh ở không gian 64-King cũ
+            max_feat = max(int(us_indices.max()), int(them_indices.max()))
+            if max_feat > HKV3_NUM_FEATURES:
+                print(f"[Cache Auto-Fix] Phát hiện file cache không gian 64-King (max={max_feat})...", flush=True)
+                print(f"[Cache Auto-Fix] Đang tự động chuyển đổi sang 32 Mirrored King Buckets chuẩn HalfKPv3...", flush=True)
+                t_fix = time.time()
+                lut = np.full(65536, PADDING_FEATURE_IDX, dtype=np.uint16)
+                for f in range(64 * HKV3_PLANES_PER_BUCKET):
+                    ksq = f // HKV3_PLANES_PER_BUCKET
+                    rem = f % HKV3_PLANES_PER_BUCKET
+                    ch = rem // 64
+                    sq = rem % 64
+                    mirror = 7 if (ksq & 7) >= 4 else 0
+                    knorm = ksq ^ mirror
+                    kb = ((knorm >> 3) * 4 + (knorm & 3)) * HKV3_PLANES_PER_BUCKET
+                    lut[f] = kb + ch * 64 + (sq ^ mirror)
+                lut[PADDING_FEATURE_IDX] = PADDING_FEATURE_IDX
+
+                us_indices = lut[us_indices]
+                them_indices = lut[them_indices]
+                print(f"[Cache Auto-Fix] Chuẩn hóa thành công trong {time.time() - t_fix:.2f}s! (Max index mới: {max(int(us_indices.max()), int(them_indices.max()))})", flush=True)
+
             print(f"[Cache] Đã nạp {len(labels_eval):,} thế cờ duy nhất trong {time.time() - t0:.2f}s!", flush=True)
             return us_indices, them_indices, labels_eval, labels_tau, labels_rho, labels_rs
         except Exception as e:
