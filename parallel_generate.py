@@ -73,6 +73,8 @@ class TrainingPosition:
 
     game_result: int
 
+    wdl: float
+
     material: int
 
     piece_count: int
@@ -297,45 +299,48 @@ class ParallelGenerator:
         except Exception:
             pass
 
-        positions, batch_num, board = [], 0, chess.Board()
-
-        total_game_pos = 0
+        game_positions, board = [], chess.Board()
 
         try:
-
             if self.time_budget and (time.time() - self.start_time) > self.time_budget:
                 print(f"  [W{worker_id} | G{game_id}] Time budget exceeded, stopping", flush=True)
-                return total_game_pos
+                return 0
+
             for move_num in range(1, 100):
                 if self.time_budget and (time.time() - self.start_time) > self.time_budget:
                     print(f"  [W{worker_id} | G{game_id}] Time budget reached mid-game, finishing game", flush=True)
                     break
 
-                if board.is_game_over(): break
+                if board.is_game_over():
+                    break
 
-                if random.random() < 0.08:
-
-                    move = random.choice(list(board.legal_moves))
-
-                else:
-
+                # Stockfish 19 Intelligent Exploration:
+                # 75% best move, 25% second-best move (nếu chênh lệch eval <= 250 cp)
+                try:
+                    move_info = engine.analyse(board, chess.engine.Limit(nodes=4096), multipv=2)
+                    if not isinstance(move_info, list):
+                        move_info = [move_info]
+                    best_m = move_info[0]["pv"][0]
+                    best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
+                    if len(move_info) >= 2 and move_info[1].get("pv"):
+                        sec_m = move_info[1]["pv"][0]
+                        sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
+                        eval_gap = abs(best_cp - sec_cp)
+                        if eval_gap <= 250 and random.random() < 0.25:
+                            move = sec_m
+                        else:
+                            move = best_m
+                    else:
+                        move = best_m
+                except Exception:
                     move = engine.play(board, chess.engine.Limit(nodes=4096)).move
 
                 board.push(move)
 
-                
-
-                # BỎ LỌC, LẤY TẤT CẢ SAU NƯỚC 6
-
+                # Thu thập dữ liệu sau nước 6
                 if move_num > 6:
-
                     data = self.analyze_full(board, engine)
-
                     if data:
-
-                        total_game_pos += 1
-
-
                         chosen_best = data["m20"][0] if data["m20"] else (data["m16"][0] if data["m16"] else "0000")
                         chosen_best_obj = chess.Move.from_uci(chosen_best) if chosen_best != "0000" else None
                         pos = TrainingPosition(
@@ -345,29 +350,56 @@ class ParallelGenerator:
                             best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
                             best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
                             best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-                            game_result=1, material=self.count_material(board), piece_count=len(board.piece_map()),
+                            game_result=1, wdl=0.5,
+                            material=self.count_material(board), piece_count=len(board.piece_map()),
                             tau=data["tau"], rho=data["rho"], rs=data["rs"]
                         )
+                        game_positions.append(asdict(pos))
 
-                        positions.append(asdict(pos))
+            # Xác định kết quả chung cuộc chuẩn xác (Ground-truth Game Result & WDL)
+            # white_outcome: 1.0 (Trắng thắng), 0.5 (Hòa), 0.0 (Đen thắng)
+            if board.is_checkmate():
+                white_outcome = 0.0 if board.turn == chess.WHITE else 1.0
+            elif (
+                board.is_stalemate()
+                or board.is_insufficient_material()
+                or board.can_claim_draw()
+                or board.is_fivefold_repetition()
+                or board.is_seventyfive_moves()
+            ):
+                white_outcome = 0.5
+            else:
+                # Trọng tài phán quyết ở nước cuối (Adjudication by Stockfish 19)
+                try:
+                    final_info = engine.analyse(board, chess.engine.Limit(nodes=4096))
+                    final_cp = final_info["score"].white().score(mate_score=10000) or 0
+                    if final_cp >= 200:
+                        white_outcome = 1.0
+                    elif final_cp <= -200:
+                        white_outcome = 0.0
+                    else:
+                        white_outcome = 0.5
+                except Exception:
+                    white_outcome = 0.5
 
-                        if len(positions) >= self.batch_size:
-                            ts = time.strftime("%H%M%S")
-                            worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
-                            rand_id = uuid.uuid4().hex[:6]
-                            with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_b{batch_num}_{ts}_{rand_id}.json", 'w') as f:
-                                json.dump({"positions": positions}, f, separators=(",", ":"))
-                            positions, batch_num = [], batch_num + 1
+            # Cập nhật nhãn game_result và wdl theo góc nhìn của bên đi (side to move - stm)
+            # stm: 0 (White), 1 (Black)
+            for p in game_positions:
+                stm = p["stm"]
+                stm_win = white_outcome if stm == 0 else (1.0 - white_outcome)
+                p["wdl"] = round(stm_win, 2)
+                p["game_result"] = 2 if stm_win == 1.0 else (0 if stm_win == 0.0 else 1)
 
-            # Flush any remaining positions at the end of the game (guarantee no lost data)
-            if positions:
+            total_game_pos = len(game_positions)
+            if game_positions:
                 ts = time.strftime("%H%M%S")
                 worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
                 rand_id = uuid.uuid4().hex[:6]
-                with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_b{batch_num}_{ts}_{rand_id}.json", 'w') as f:
-                    json.dump({"positions": positions}, f, separators=(",", ":"))
+                with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_{ts}_{rand_id}.json", 'w') as f:
+                    json.dump({"positions": game_positions}, f, separators=(",", ":"))
 
-            print(f"  [W{worker_id} | G{game_id}] Game finished: {total_game_pos} positions collected", flush=True)
+            outcome_str = "White win" if white_outcome == 1.0 else ("Black win" if white_outcome == 0.0 else "Draw")
+            print(f"  [W{worker_id} | G{game_id}] Game finished ({outcome_str}): {total_game_pos} positions collected with Ground-truth WDL", flush=True)
             return total_game_pos
 
         finally: engine.quit()
