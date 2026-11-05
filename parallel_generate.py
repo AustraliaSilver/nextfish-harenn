@@ -319,7 +319,7 @@ class ParallelGenerator:
 
                 else:
 
-                    move = engine.play(board, chess.engine.Limit(time=0.04)).move
+                    move = engine.play(board, chess.engine.Limit(nodes=4096)).move
 
                 board.push(move)
 
@@ -335,7 +335,6 @@ class ParallelGenerator:
 
                         total_game_pos += 1
 
-                        print(f"  [W{worker_id} | G{game_id}] Pos {total_game_pos}: Eval {data['cp']}", flush=True)
 
                         chosen_best = data["m20"][0] if data["m20"] else (data["m16"][0] if data["m16"] else "0000")
                         chosen_best_obj = chess.Move.from_uci(chosen_best) if chosen_best != "0000" else None
@@ -357,7 +356,7 @@ class ParallelGenerator:
                             worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
                             rand_id = uuid.uuid4().hex[:6]
                             with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_b{batch_num}_{ts}_{rand_id}.json", 'w') as f:
-                                json.dump({"positions": positions}, f, indent=2)
+                                json.dump({"positions": positions}, f, separators=(",", ":"))
                             positions, batch_num = [], batch_num + 1
 
             # Flush any remaining positions at the end of the game (guarantee no lost data)
@@ -366,8 +365,9 @@ class ParallelGenerator:
                 worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
                 rand_id = uuid.uuid4().hex[:6]
                 with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_b{batch_num}_{ts}_{rand_id}.json", 'w') as f:
-                    json.dump({"positions": positions}, f, indent=2)
+                    json.dump({"positions": positions}, f, separators=(",", ":"))
 
+            print(f"  [W{worker_id} | G{game_id}] Game finished: {total_game_pos} positions collected", flush=True)
             return total_game_pos
 
         finally: engine.quit()

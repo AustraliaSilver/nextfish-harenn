@@ -125,10 +125,10 @@ jobs:
         run: |
           echo "=========================================================="
           echo "Ca chay da hoan tat va du lieu da duoc day len Hugging Face."
-          echo "Bat dau thoi gian nghi lam mat 30 phut (1,800 giay)..."
+          echo "Bat dau thoi gian nghi lam mat 2 phut (120 giay)..."
           echo "=========================================================="
-          sleep 1800
-          echo "Ket thuc 30 phut nghi. Tu dong kich hoat ca chay moi..."
+          sleep 120
+          echo "Ket thuc 2 phut nghi. Tu dong kich hoat ca chay moi..."
 
       - name: Trigger next workflow run
         env:
