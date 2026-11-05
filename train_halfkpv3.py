@@ -43,14 +43,21 @@ Kaggle T4x2 Quickstart:
 """
 
 import argparse
+import contextlib
+import gc
 import glob
+import hashlib
 import json
 import math
 import os
+import queue
 import random
+import re
 import struct
 import sys
+import threading
 import time
+import zlib
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -60,6 +67,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -130,7 +144,7 @@ def make_hkv3_feature_index(perspective: int, ksq: int, channel: int, sq: int) -
     return king_bucket * HKV3_PLANES_PER_BUCKET + channel * 64 + s_norm
 
 
-def fen_to_hkv3_sparse_pair(fen: str, stm_override: Optional[int] = None) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+def fen_to_hkv3_sparse_pair(fen: str, stm_override: Optional[object] = None) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
     """
     Chuyển chuỗi FEN thành cặp mảng chỉ số thưa uint16[32] (us_indices, them_indices, stm).
     """
@@ -143,7 +157,19 @@ def fen_to_hkv3_sparse_pair(fen: str, stm_override: Optional[int] = None) -> Opt
         return None
 
     if stm_override is not None:
-        stm = int(stm_override)
+        if isinstance(stm_override, str):
+            s_low = stm_override.strip().lower()
+            if s_low in ("b", "black", "1", "true"):
+                stm = 1
+            elif s_low in ("w", "white", "0", "false"):
+                stm = 0
+            else:
+                stm = 1 if (len(parts) > 1 and parts[1] == 'b') else 0
+        else:
+            try:
+                stm = 1 if int(stm_override) != 0 else 0
+            except (ValueError, TypeError):
+                stm = 1 if (len(parts) > 1 and parts[1] == 'b') else 0
     else:
         stm = 1 if (len(parts) > 1 and parts[1] == 'b') else 0
 
@@ -294,21 +320,58 @@ def _parse_single_data_file_worker(file_path_str: str):
     rs_list = []
     hash_list = []
 
-    def process_record(pos: dict):
-        fen = pos.get("fen", "")
-        if not fen:
-            return
-        board_key = fen.split()[0] + " " + (fen.split()[1] if len(fen.split()) > 1 else "w")
-        h = hash(board_key)
+    total_lines = 0
+    parsed_lines = 0
+    sample_first_dict = None
 
-        parsed = fen_to_hkv3_sparse_pair(fen, pos.get("stm"))
+    def process_record(pos: dict):
+        nonlocal sample_first_dict, parsed_lines
+        if not isinstance(pos, dict):
+            return
+
+        if sample_first_dict is None:
+            sample_first_dict = pos
+
+        # Hỗ trợ linh hoạt các biến thể tên trường FEN
+        fen = pos.get("fen") or pos.get("FEN") or pos.get("fen_string") or pos.get("board")
+        if not fen or not isinstance(fen, str):
+            return
+
+        parts = fen.split()
+        if len(parts) < 2:
+            return
+
+        # Bao gồm quân (0), lượt đi (1) và quyền nhập thành (2) để phân biệt thế cờ
+        board_key = " ".join(parts[:3]) if len(parts) >= 3 else fen
+        # Dùng hàm băm mật mã 64-bit blake2b triệt tiêu 100% rủi ro đụng độ birthday collision trên 50M-100M vị trí
+        h = struct.unpack("<q", hashlib.blake2b(board_key.encode("utf-8"), digest_size=8).digest())[0]
+
+        # Không dùng toán tử `or` vì pos["stm"] == 0 (Trắng đi) sẽ bị coi là False!
+        stm = None
+        for k in ("stm", "turn", "side_to_move", "to_move"):
+            if k in pos and pos[k] is not None:
+                stm = pos[k]
+                break
+        parsed = fen_to_hkv3_sparse_pair(fen, stm)
         if parsed is None:
             return
         us_arr, them_arr, _ = parsed
 
-        # Lưu ý: Trong dữ liệu .jsonl sinh bởi parallel_generate.py, eval_score ĐÃ LÀ điểm
-        # theo góc nhìn bên đi (side-to-move / 'us').
-        ev_cp = float(pos.get("eval_score", 0.0))
+        # Hỗ trợ linh hoạt các biến thể tên trường điểm Eval
+        ev_raw = None
+        for k in ("eval_score", "eval", "score", "cp", "evaluation"):
+            if k in pos:
+                ev_raw = pos[k]
+                break
+
+        if ev_raw is None:
+            return
+
+        try:
+            ev_cp = float(ev_raw)
+        except (ValueError, TypeError):
+            return
+
         ev_cp = max(-1000.0, min(1000.0, ev_cp))
         ev_pawns = ev_cp / 100.0
 
@@ -323,28 +386,35 @@ def _parse_single_data_file_worker(file_path_str: str):
         tau_list.append(tau)
         rho_list.append(rho)
         rs_list.append(rs)
+        parsed_lines += 1
 
     try:
         if path.suffix == ".json":
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for pos in data.get("positions", []):
-                if isinstance(pos, dict):
-                    process_record(pos)
+            positions = data.get("positions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            total_lines = len(positions)
+            for pos in positions:
+                process_record(pos)
         else:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
+                    total_lines += 1
                     try:
                         pos = json.loads(line)
-                        if isinstance(pos, dict):
-                            process_record(pos)
+                        process_record(pos)
                     except Exception:
                         continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Worker Error] Lỗi đọc file {path.name}: {e}", flush=True)
+
+    if total_lines > 0 and parsed_lines == 0:
+        found_keys = list(sample_first_dict.keys()) if sample_first_dict else []
+        print(f"[Schema Warning] File {path.name}: Đọc {total_lines} dòng nhưng 0 dòng parse được! "
+              f"Keys tìm thấy: {found_keys}. Yêu cầu tối thiểu: 'fen' và 'eval_score' (hoặc 'eval'/'score'/'cp').", flush=True)
 
     if not us_list:
         return None
@@ -372,6 +442,15 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
                 f"[Cache] Không tìm thấy file cache được chỉ định: {cpath}\n"
                 f"Gợi ý: Chạy lệnh `!find /kaggle/input -name '*.npz'` để kiểm tra đường dẫn chính xác của file dataset trên Kaggle."
             )
+    elif data_path.is_file() and data_path.suffix == ".npz":
+        cpath = data_path
+    elif data_path.is_dir():
+        default_cache = data_path / "_hkv3_sparse_cache_v1.npz"
+        if default_cache.exists():
+            cpath = default_cache
+        else:
+            npz_files = list(data_path.glob("*.npz"))
+            cpath = npz_files[0] if npz_files else default_cache
     else:
         cpath = data_path / "_hkv3_sparse_cache_v1.npz"
 
@@ -403,8 +482,9 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
                     knorm = ksq ^ mirror
                     kb = ((knorm >> 3) * 4 + (knorm & 3)) * HKV3_PLANES_PER_BUCKET
                     lut[f] = kb + ch * 64 + (sq ^ mirror)
-                lut[PADDING_FEATURE_IDX] = PADDING_FEATURE_IDX
-
+                # Lưu ý: Trong không gian 64-King cũ (0..45055), chỉ số padding là >= 45056 (đã được khởi tạo
+                # bằng PADDING_FEATURE_IDX trong np.full ở trên). Tuyệt đối KHÔNG gán lut[22528] = 22528
+                # vì 22528 là đặc trưng hợp lệ của 64-King (ksq=32 [a5], ch=0 [Tốt mình], sq=0 [a1])!
                 us_indices = lut[us_indices]
                 them_indices = lut[them_indices]
                 print(f"[Cache Auto-Fix] Chuẩn hóa thành công trong {time.time() - t_fix:.2f}s! (Max index mới: {max(int(us_indices.max()), int(them_indices.max()))})", flush=True)
@@ -431,6 +511,7 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
         results = pool.map(_parse_single_data_file_worker, file_strs)
 
     valid_results = [r for r in results if r is not None]
+    del results
     if not valid_results:
         raise RuntimeError("Không trích xuất được thế cờ hợp lệ nào từ các file dữ liệu!")
 
@@ -441,17 +522,33 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
     all_tau = np.concatenate([r[4] for r in valid_results], axis=0)
     all_rho = np.concatenate([r[5] for r in valid_results], axis=0)
     all_rs = np.concatenate([r[6] for r in valid_results], axis=0)
+    del valid_results
+    gc.collect()
 
     total_raw = len(all_eval)
-    _, unique_idx = np.unique(all_hashes, return_index=True)
-    unique_idx.sort()
+    _, unique_idx, inv_idx, counts = np.unique(
+        all_hashes, return_index=True, return_inverse=True, return_counts=True
+    )
+    del all_hashes
 
     us_indices = all_us[unique_idx]
+    del all_us
     them_indices = all_them[unique_idx]
-    labels_eval = all_eval[unique_idx]
-    labels_tau = all_tau[unique_idx]
-    labels_rho = all_rho[unique_idx]
-    labels_rs = all_rs[unique_idx]
+    del all_them, unique_idx
+
+    # Tính kỳ vọng trung bình (mean) của các nhãn khi 1 thế cờ xuất hiện nhiều lần trong các ván khác nhau:
+    # Tránh việc thế cờ bị gán nhãn thiên lệch do chỉ lấy ngẫu nhiên bản ghi đầu tiên!
+    counts_f = counts.astype(np.float32)
+    del counts
+    labels_eval = (np.bincount(inv_idx, weights=all_eval) / counts_f).astype(np.float32)
+    del all_eval
+    labels_tau = (np.bincount(inv_idx, weights=all_tau) / counts_f).astype(np.float32)
+    del all_tau
+    labels_rho = (np.bincount(inv_idx, weights=all_rho) / counts_f).astype(np.float32)
+    del all_rho
+    labels_rs = (np.bincount(inv_idx, weights=all_rs) / counts_f).astype(np.float32)
+    del all_rs, inv_idx, counts_f
+    gc.collect()
 
     dt = time.time() - t0
     print(f"[Dataset] Hoàn tất lọc trùng: giữ lại {len(labels_eval):,} thế cờ duy nhất "
@@ -479,13 +576,16 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. BỘ NẠP BATCH SIÊU TỐC TRÊN GPU VỚI ĐỐI XỨNG LẬT MÀU 2X (SYMMETRY=2)
+# 4. BỘ NẠP BATCH SIÊU TỐC TRÊN GPU VỚI PINNED MEMORY DMA
 # ═══════════════════════════════════════════════════════════════════════════
 class FastHKV3BatchLoader:
     """
-    Bộ nạp dữ liệu trực tiếp từ bộ nhớ NumPy sang GPU với:
-      - Đối xứng lật màu dọc 2x (symmetry=2): Hoán vị (us, them) <-> (them, us) và đảo dấu eval -> -eval.
-      - Feature Dropout (nhiễu bàn cờ trên các quân không phải Vua để chống overfitting ở bảng W_full).
+    Bộ nạp dữ liệu trực tiếp từ bộ nhớ NumPy sang GPU / TPU v5e-1 với:
+      - Pinned Memory DMA (bất đồng bộ thực sự qua PCIe với non_blocking=True trên CUDA).
+      - Truyền uint16 (2 bytes) qua PCIe rồi ép kiểu int64 ngay trên GPU/TPU HBM (giảm 75% băng thông PCIe).
+      - Strictly Static Batch Shape trên TPU/XLA (tránh 100% lỗi biên dịch lại đồ thị HLO ở batch cuối).
+      - Background Thread Prefetching giúp chồng lấp hoàn toàn việc cắt mảng NumPy trên CPU với tính toán MXU/GPU.
+      - Mặc định symmetry=1 vì kiến trúc HalfKPv3 đã thỏa mãn đối xứng đại số tuyệt đối (E(them, us) == -E(us, them)).
     """
 
     def __init__(
@@ -499,9 +599,9 @@ class FastHKV3BatchLoader:
         indices: np.ndarray,
         batch_size: int,
         shuffle: bool = True,
-        symmetry: int = 2,
-        feature_dropout: float = 0.0,
+        symmetry: int = 1,
         device: torch.device = torch.device("cuda"),
+        static_shape: Optional[bool] = None,
     ):
         self.us_data = us_data
         self.them_data = them_data
@@ -511,15 +611,53 @@ class FastHKV3BatchLoader:
         self.rs_data = rs_data
         self.base_indices = np.asarray(indices, dtype=np.int64)
         self.num_base = len(self.base_indices)
-        self.symmetry = symmetry if symmetry in (1, 2) else 2
+        self.symmetry = symmetry if symmetry in (1, 2) else 1
         self.total_samples = self.num_base * self.symmetry
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.feature_dropout = feature_dropout
         self.device = device
+        self.is_xla = (self.device.type == "xla")
+        self.pin_memory = (self.device.type == "cuda")
+        self.static_shape = self.is_xla if static_shape is None else static_shape
 
     def __len__(self) -> int:
-        return (self.total_samples + self.batch_size - 1) // self.batch_size
+        return max(1, (self.total_samples + self.batch_size - 1) // self.batch_size)
+
+    def _to_device(self, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        if self.is_xla and target_dtype == torch.int64:
+            # Trên TPU/XLA, ép sang int64 từ mảng con kích thước 1 batch trên CPU hoặc truyền trực tiếp vào XLA tensor
+            t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
+            return t.to(self.device)
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        if self.pin_memory:
+            t = t.pin_memory()
+        t_dev = t.to(self.device, non_blocking=not self.is_xla)
+        if target_dtype is not None and t_dev.dtype != target_dtype:
+            t_dev = t_dev.to(target_dtype)
+        return t_dev
+
+    def _prepare_cpu_batch(self, v_ids: np.ndarray):
+        if self.symmetry == 2:
+            is_flipped = (v_ids >= self.num_base)
+            raw_pos = v_ids % self.num_base
+            actual_ids = self.base_indices[raw_pos]
+            us_np = self.us_data[actual_ids]
+            them_np = self.them_data[actual_ids]
+            ev_np = self.eval_data[actual_ids]
+            if np.any(is_flipped):
+                us_np = np.where(is_flipped[:, None], self.them_data[actual_ids], us_np)
+                them_np = np.where(is_flipped[:, None], self.us_data[actual_ids], them_np)
+                ev_np = np.where(is_flipped, -ev_np, ev_np)
+        else:
+            actual_ids = self.base_indices[v_ids]
+            us_np = self.us_data[actual_ids]
+            them_np = self.them_data[actual_ids]
+            ev_np = self.eval_data[actual_ids]
+
+        tau_np = self.tau_data[actual_ids]
+        rho_np = self.rho_data[actual_ids]
+        rs_np = self.rs_data[actual_ids]
+        return us_np, them_np, ev_np, tau_np, rho_np, rs_np
 
     def __iter__(self):
         if self.shuffle:
@@ -527,36 +665,45 @@ class FastHKV3BatchLoader:
         else:
             perm = np.arange(self.total_samples, dtype=np.int64)
 
-        for start in range(0, self.total_samples, self.batch_size):
-            v_ids = perm[start:start + self.batch_size]
-            is_flipped = (v_ids >= self.num_base)
-            raw_pos = v_ids % self.num_base
-            actual_ids = self.base_indices[raw_pos]
+        # Trên TPU v5e-1 (XLA), bắt buộc mọi batch (kể cả batch cuối cùng) có kích thước cố định [batch_size, 32]
+        # để tránh XLA phải biên dịch lại đồ thị HLO (tốn 30-60s).
+        if self.static_shape and len(perm) > 0:
+            rem = len(perm) % self.batch_size
+            if rem != 0:
+                pad_needed = self.batch_size - rem
+                pad_ids = perm[np.arange(pad_needed) % len(perm)]
+                perm = np.concatenate([perm, pad_ids])
 
-            us_np = self.us_data[actual_ids]
-            them_np = self.them_data[actual_ids]
-            ev_np = self.eval_data[actual_ids]
+        batch_q: "queue.Queue" = queue.Queue(maxsize=3)
+        sentinel = object()
 
-            if self.symmetry == 2 and np.any(is_flipped):
-                us_np = np.where(is_flipped[:, None], self.them_data[actual_ids], us_np)
-                them_np = np.where(is_flipped[:, None], self.us_data[actual_ids], them_np)
-                ev_np = np.where(is_flipped, -ev_np, ev_np)
+        def _producer():
+            try:
+                for start in range(0, len(perm), self.batch_size):
+                    v_ids = perm[start:start + self.batch_size]
+                    batch_q.put(self._prepare_cpu_batch(v_ids))
+            except Exception as exc:
+                batch_q.put(exc)
+            finally:
+                batch_q.put(sentinel)
 
-            us_t = torch.from_numpy(us_np.astype(np.int64, copy=False)).to(self.device, non_blocking=True)
-            them_t = torch.from_numpy(them_np.astype(np.int64, copy=False)).to(self.device, non_blocking=True)
+        prod_thread = threading.Thread(target=_producer, daemon=True)
+        prod_thread.start()
 
-            if self.feature_dropout > 0.0 and self.shuffle:
-                pad_val = PADDING_FEATURE_IDX
-                drop_u = (torch.rand_like(us_t, dtype=torch.float32) < self.feature_dropout) & (us_t < pad_val)
-                drop_v = (torch.rand_like(them_t, dtype=torch.float32) < self.feature_dropout) & (them_t < pad_val)
-                us_t = torch.where(drop_u, pad_val, us_t)
-                them_t = torch.where(drop_v, pad_val, them_t)
-
+        while True:
+            item = batch_q.get()
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                raise item
+            us_np, them_np, ev_np, tau_np, rho_np, rs_np = item
+            us_t = self._to_device(us_np, target_dtype=torch.int64)
+            them_t = self._to_device(them_np, target_dtype=torch.int64)
             targets = {
-                "eval": torch.from_numpy(ev_np.copy()).to(self.device, non_blocking=True),
-                "tau": torch.from_numpy(self.tau_data[actual_ids]).to(self.device, non_blocking=True),
-                "rho": torch.from_numpy(self.rho_data[actual_ids]).to(self.device, non_blocking=True),
-                "rs": torch.from_numpy(self.rs_data[actual_ids]).to(self.device, non_blocking=True),
+                "eval": self._to_device(ev_np),
+                "tau": self._to_device(tau_np),
+                "rho": self._to_device(rho_np),
+                "rs": self._to_device(rs_np),
             }
             yield us_t, them_t, targets
 
@@ -564,10 +711,53 @@ class FastHKV3BatchLoader:
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. KIẾN TRÚC MẠNG NƠ-RON ĐA NHIỆM HALFKPV3 (HKV3) CHUẨN ĐẠI SỐ & SIMD
 # ═══════════════════════════════════════════════════════════════════════════
+def _bag_sum(emb: nn.EmbeddingBag, idx: torch.Tensor) -> torch.Tensor:
+    """
+    Thực thi phép cộng nhúng thưa (EmbeddingBag mode='sum'):
+      - Trên TPU/XLA: Hạ trực tiếp xuống F.embedding(...).sum(dim=1) (native XLA Gather + ReduceSum trên HBM2e 819 GB/s).
+      - Trên CUDA/CPU: Gọi kernel C++/CUDA nn.EmbeddingBag nguyên bản.
+    """
+    if idx.device.type == "xla":
+        return F.embedding(idx, emb.weight, padding_idx=emb.padding_idx).sum(dim=1)
+    return emb(idx)
+
+
 def fake_quant_ste(x: torch.Tensor, scale: float, min_q: float, max_q: float) -> torch.Tensor:
-    """Straight-Through Estimator (STE) mô phỏng lượng tử hóa số nguyên C++ trong quá trình train."""
+    """Straight-Through Estimator (STE) mô phỏng lượng tử hóa làm tròn (round) của trọng số C++."""
     q = torch.clamp(torch.round(x * scale), min=min_q, max=max_q) / scale
     return x + (q - x).detach()
+
+
+def bilinear_gate_ste(x_left: torch.Tensor, x_right: torch.Tensor, qat: bool) -> torch.Tensor:
+    """
+    Mô phỏng chính xác 100% lệnh Pairwise Bilinear Gating trong C++ AVX2:
+      u_u8 = (u_i16 * v_i16) >> 7   (chia cho 128 làm tròn xuống floor, giá trị thuộc [0, 126]).
+    """
+    prod_cont = (x_left * x_right) * (QA_SCALE / 128.0)
+    if not qat:
+        return prod_cont
+    xl_i16 = torch.clamp(torch.round(x_left.float() * QA_SCALE), 0.0, 127.0)
+    xr_i16 = torch.clamp(torch.round(x_right.float() * QA_SCALE), 0.0, 127.0)
+    u_u8 = torch.clamp(torch.div(xl_i16 * xr_i16, 128.0, rounding_mode="floor"), 0.0, 127.0)
+    u_q = (u_u8 / QA_SCALE).to(prod_cont.dtype)
+    return prod_cont + (u_q - prod_cont).detach()
+
+
+def fc2_screlu_ste(z: torch.Tensor, qat: bool) -> torch.Tensor:
+    """
+    Mô phỏng chính xác 100% phép dịch bit số nguyên (sum_i32 >> 6) rồi clamp [0, 127] và bình phương SCReLU của C++.
+    Thực hiện ở FP32 để tránh tràn số FP16 khi nhân (QA_SCALE * QW_FC2_SCALE = 8128.0).
+    """
+    z_f32 = z.float()
+    z_clamped = torch.clamp(z_f32, 0.0, 1.0)
+    if qat:
+        z_i32 = torch.round(z_f32 * (QA_SCALE * QW_FC2_SCALE))
+        z_shifted = torch.div(z_i32, QW_FC2_SCALE, rounding_mode="floor")
+        z_q = torch.clamp(z_shifted, 0.0, 127.0) / QA_SCALE
+        z_act = z_clamped + (z_q - z_clamped).detach()
+    else:
+        z_act = z_clamped
+    return z_act.square().to(z.dtype)
 
 
 class HalfKPv3BranchL1(nn.Module):
@@ -576,12 +766,20 @@ class HalfKPv3BranchL1(nn.Module):
     Thiết kế tách nhánh này cho phép chạy Tensor-Parallel tự nhiên trên Kaggle T4x2:
       - GPU 0 (cuda:0) giữ nhánh Left  (cột 0..1023)
       - GPU 1 (cuda:1) giữ nhánh Right (cột 1024..2047)
-    Triệt tiêu 100% chi phí đồng bộ trọng số 184 MB qua PCIe của DataParallel truyền thống!
+    Đặc biệt: full_dropout CHỈ áp dụng lên bảng dư `emb_full`, giữ nguyên 100% `emb_piece` và `emb_rel`
+    để không bao giờ làm mất quân cờ hay làm lệch điểm vật chất trên bàn cờ!
     """
 
-    def __init__(self, piece_map_pad: torch.Tensor, rel_map_pad: torch.Tensor, qat: bool = True):
+    def __init__(
+        self,
+        piece_map_pad: torch.Tensor,
+        rel_map_pad: torch.Tensor,
+        qat: bool = True,
+        full_dropout: float = 0.0,
+    ):
         super().__init__()
         self.qat = qat
+        self.full_dropout = full_dropout
         self.register_buffer("piece_map_pad", piece_map_pad.clone())
         self.register_buffer("rel_map_pad", rel_map_pad.clone())
 
@@ -608,18 +806,38 @@ class HalfKPv3BranchL1(nn.Module):
         self.emb_piece.weight[PADDING_PIECE_IDX].zero_()
         self.emb_rel.weight[PADDING_REL_IDX].zero_()
 
-    def forward(self, us_idx: torch.Tensor, them_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        us_p = self.piece_map_pad[us_idx]
-        us_r = self.rel_map_pad[us_idx]
-        acc_us = self.emb_full(us_idx) + self.emb_piece(us_p) + self.emb_rel(us_r) + self.bias
+    def forward(
+        self,
+        us_idx: torch.Tensor,
+        them_idx: torch.Tensor,
+        shared_maps: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if shared_maps is not None:
+            us_p, us_r, them_p, them_r = shared_maps
+        else:
+            us_p = self.piece_map_pad[us_idx]
+            us_r = self.rel_map_pad[us_idx]
+            them_p = self.piece_map_pad[them_idx]
+            them_r = self.rel_map_pad[them_idx]
 
-        them_p = self.piece_map_pad[them_idx]
-        them_r = self.rel_map_pad[them_idx]
-        acc_them = self.emb_full(them_idx) + self.emb_piece(them_p) + self.emb_rel(them_r) + self.bias
+        # Chỉ dropout trên bảng dư emb_full để ép mạng học quy luật tổng quát qua emb_piece & emb_rel
+        # mà không làm mất quân cờ hay làm lệch vật chất giữa us và them!
+        if self.training and self.full_dropout > 0.0:
+            pad_val = us_idx.new_full((), PADDING_FEATURE_IDX)
+            drop_u = (torch.rand_like(us_idx, dtype=torch.float32) < self.full_dropout) & (us_idx < PADDING_FEATURE_IDX)
+            drop_v = (torch.rand_like(them_idx, dtype=torch.float32) < self.full_dropout) & (them_idx < PADDING_FEATURE_IDX)
+            us_idx_full = torch.where(drop_u, pad_val, us_idx)
+            them_idx_full = torch.where(drop_v, pad_val, them_idx)
+        else:
+            us_idx_full = us_idx
+            them_idx_full = them_idx
+
+        acc_us = _bag_sum(self.emb_full, us_idx_full) + _bag_sum(self.emb_piece, us_p) + _bag_sum(self.emb_rel, us_r) + self.bias
+        acc_them = _bag_sum(self.emb_full, them_idx_full) + _bag_sum(self.emb_piece, them_p) + _bag_sum(self.emb_rel, them_r) + self.bias
 
         c_us = torch.clamp(acc_us, 0.0, 1.0)
         c_them = torch.clamp(acc_them, 0.0, 1.0)
-        if self.qat and self.training:
+        if self.qat:
             c_us = fake_quant_ste(c_us, QA_SCALE, 0.0, 127.0)
             c_them = fake_quant_ste(c_them, QA_SCALE, 0.0, 127.0)
         return c_us, c_them
@@ -643,25 +861,34 @@ class HalfKPv3Network(nn.Module):
       - Tri-Scale Virtual Factorizer: W_full(22,528) + W_piece(704) + W_rel(1,815)
       - Hỗ trợ Tensor-Parallel tự nhiên trên 2 GPU (Kaggle T4x2):
         Left Branch (1024) trên cuda:0 || Right Branch (1024) trên cuda:1
+      - Hỗ trợ tối ưu đồ thị tĩnh XLA + bfloat16 trên Google Cloud / Colab TPU v5e-1
       - 4-Channel Multi-Task PSQT Skip Connection: psqt_full + psqt_piece + psqt_rel
-      - Pairwise Bilinear Gating: 2048 -> 1024 per perspective
-      - Siamese Perspective Twin FC2: W_self(256x1024) & W_opp(256x1024)
+      - Pairwise Bilinear Gating: 2048 -> 1024 per perspective (khớp bit-exact >> 7 của C++)
+      - Siamese Perspective Twin FC2: W_self(256x1024) & W_opp(256x1024) (khớp bit-exact >> 6 của C++)
       - Orthogonal Parity Readout Heads: eval_head (Odd, No Bias) & tac_head (Even, With Bias)
     """
 
-    def __init__(self, qat: bool = True, dev0: torch.device = torch.device("cpu"), dev1: Optional[torch.device] = None):
+    def __init__(
+        self,
+        qat: bool = True,
+        dev0: torch.device = torch.device("cpu"),
+        dev1: Optional[torch.device] = None,
+        full_dropout: float = 0.0,
+        use_amp: bool = True,
+    ):
         super().__init__()
         self.qat = qat
         self.dev0 = dev0
         self.dev1 = dev1 if dev1 is not None else dev0
+        self.use_amp = use_amp
 
         piece_map_pad, rel_map_pad = build_hkv3_canonical_factorizer_maps()
         self.register_buffer("piece_map_pad", piece_map_pad.to(self.dev0))
         self.register_buffer("rel_map_pad", rel_map_pad.to(self.dev0))
 
         # ─── 1. Tầng 1: Hai nhánh Left (0..1023) & Right (1024..2047) của Virtual Factorizer ───
-        self.left_branch = HalfKPv3BranchL1(piece_map_pad, rel_map_pad, qat=qat).to(self.dev0)
-        self.right_branch = HalfKPv3BranchL1(piece_map_pad, rel_map_pad, qat=qat).to(self.dev1)
+        self.left_branch = HalfKPv3BranchL1(piece_map_pad, rel_map_pad, qat=qat, full_dropout=full_dropout).to(self.dev0)
+        self.right_branch = HalfKPv3BranchL1(piece_map_pad, rel_map_pad, qat=qat, full_dropout=full_dropout).to(self.dev1)
 
         # ─── 2. Nhánh tắt PSQT 4 Kênh (trên dev0) ───
         self.psqt_full = nn.EmbeddingBag(
@@ -683,6 +910,10 @@ class HalfKPv3Network(nn.Module):
         self.tac_head = nn.Linear(HKV3_L2_SIZE, 3, bias=True).to(self.dev0)
 
         self._init_head_and_psqt_weights()
+
+    def set_full_dropout(self, p: float):
+        self.left_branch.full_dropout = p
+        self.right_branch.full_dropout = p
 
     def _init_head_and_psqt_weights(self):
         with torch.no_grad():
@@ -726,37 +957,54 @@ class HalfKPv3Network(nn.Module):
         self.psqt_piece.weight[PADDING_PIECE_IDX].zero_()
         self.psqt_rel.weight[PADDING_REL_IDX].zero_()
 
-    def _compute_psqt(self, idx: torch.Tensor) -> torch.Tensor:
-        p_idx = self.piece_map_pad[idx]
-        r_idx = self.rel_map_pad[idx]
-        return self.psqt_full(idx) + self.psqt_piece(p_idx) + self.psqt_rel(r_idx)
+    def _compute_psqt(
+        self,
+        idx: torch.Tensor,
+        p_idx: Optional[torch.Tensor] = None,
+        r_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if p_idx is None:
+            p_idx = self.piece_map_pad[idx]
+        if r_idx is None:
+            r_idx = self.rel_map_pad[idx]
+        return _bag_sum(self.psqt_full, idx) + _bag_sum(self.psqt_piece, p_idx) + _bag_sum(self.psqt_rel, r_idx)
 
     def forward(self, us_idx: torch.Tensor, them_idx: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Bước 1: Chạy song song nhánh Left trên dev0 và nhánh Right trên dev1 (Tensor-Parallel trên T4x2!)
+        # Bước 1: Chạy song song nhánh Left trên dev0 và nhánh Right trên dev1 (Tensor-Parallel trên T4x2)
+        # hoặc dùng chung bảng tra chỉ số (Shared Factorizer Index Gather) khi chạy trên 1 chip như TPU v5e-1.
+        us_p = self.piece_map_pad[us_idx]
+        us_r = self.rel_map_pad[us_idx]
+        them_p = self.piece_map_pad[them_idx]
+        them_r = self.rel_map_pad[them_idx]
+        shared_maps_0 = (us_p, us_r, them_p, them_r)
+
         if self.dev1 != self.dev0:
+            amp_enabled = us_idx.is_cuda and self.use_amp
             us_idx_1 = us_idx.to(self.dev1, non_blocking=True)
             them_idx_1 = them_idx.to(self.dev1, non_blocking=True)
-            with torch.amp.autocast("cuda", enabled=us_idx.is_cuda):
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 u_right, v_right = self.right_branch(us_idx_1, them_idx_1)
-            u_left, v_left = self.left_branch(us_idx, them_idx)
-            u_right = u_right.to(self.dev0, non_blocking=True)
-            v_right = v_right.to(self.dev0, non_blocking=True)
+            u_left, v_left = self.left_branch(us_idx, them_idx, shared_maps=shared_maps_0)
+            # Nén sang FP16 trên dev1 trước khi truyền qua PCIe về dev0 để giảm 50% băng thông PCIe:
+            if amp_enabled:
+                u_right = u_right.to(dtype=torch.float16).to(self.dev0, non_blocking=True).to(dtype=u_left.dtype)
+                v_right = v_right.to(dtype=torch.float16).to(self.dev0, non_blocking=True).to(dtype=v_left.dtype)
+            else:
+                u_right = u_right.to(self.dev0, non_blocking=True)
+                v_right = v_right.to(self.dev0, non_blocking=True)
         else:
-            u_left, v_left = self.left_branch(us_idx, them_idx)
-            u_right, v_right = self.right_branch(us_idx, them_idx)
+            u_left, v_left = self.left_branch(us_idx, them_idx, shared_maps=shared_maps_0)
+            u_right, v_right = self.right_branch(us_idx, them_idx, shared_maps=shared_maps_0)
 
-        # Bước 2: Pairwise Bilinear Gating (u = u_left * u_right, v = v_left * v_right)
-        u = u_left * u_right
-        v = v_left * v_right
-        if self.qat and self.training:
-            u = fake_quant_ste(u, QA_SCALE, 0.0, 127.0)
-            v = fake_quant_ste(v, QA_SCALE, 0.0, 127.0)
+        # Bước 2: Pairwise Bilinear Gating khớp chính xác phép dịch >> 7 (chia 128 floor) của C++ AVX2
+        u = bilinear_gate_ste(u_left, u_right, self.qat)
+        v = bilinear_gate_ste(v_left, v_right, self.qat)
 
-        psqt_us = self._compute_psqt(us_idx)
-        psqt_them = self._compute_psqt(them_idx)
+        psqt_us = self._compute_psqt(us_idx, us_p, us_r)
+        psqt_them = self._compute_psqt(them_idx, them_p, them_r)
 
-        # Bước 3: Siamese Perspective Twin FC2
-        if self.qat and self.training:
+        # Bước 3: Siamese Perspective Twin FC2 (QAT luôn bật cả lúc train và eval để val khớp 100% với .harenn)
+        if self.qat:
             w_self = fake_quant_ste(self.fc2_self.weight, QW_FC2_SCALE, -127.0, 127.0)
             b_fc2 = fake_quant_ste(self.fc2_self.bias, QA_SCALE * QW_FC2_SCALE, -2147483647.0, 2147483647.0)
             w_opp = fake_quant_ste(self.fc2_opp.weight, QW_FC2_SCALE, -127.0, 127.0)
@@ -766,9 +1014,9 @@ class HalfKPv3Network(nn.Module):
             z_us = self.fc2_self(u) + self.fc2_opp(v)
             z_them = self.fc2_self(v) + self.fc2_opp(u)
 
-        # Bước 4: Kích hoạt phi tuyến SCReLU tại tầng 2
-        h_us = torch.clamp(z_us, 0.0, 1.0).square()
-        h_them = torch.clamp(z_them, 0.0, 1.0).square()
+        # Bước 4: Kích hoạt phi tuyến SCReLU tại tầng 2 (khớp hoàn toàn với z >> 6 floor và clamp 0..127 trong C++)
+        h_us = fc2_screlu_ste(z_us, self.qat)
+        h_them = fc2_screlu_ste(z_them, self.qat)
 
         # Bước 5: Phân rã Trực giao Chẵn - Lẻ ngay sau phi tuyến FC2
         h_odd = h_us - h_them
@@ -778,8 +1026,15 @@ class HalfKPv3Network(nn.Module):
         psqt_eval = psqt_us[:, 0] - psqt_them[:, 0]
         psqt_tac = psqt_us[:, 1:4] + psqt_them[:, 1:4]
 
-        eval_pawns = self.eval_head(h_odd).squeeze(-1) + psqt_eval
-        tac_logits = self.tac_head(h_even) + psqt_tac
+        if self.qat:
+            eval_w = fake_quant_ste(self.eval_head.weight, Q_HEAD_SCALE, -32767.0, 32767.0)
+            tac_w = fake_quant_ste(self.tac_head.weight, Q_HEAD_SCALE, -32767.0, 32767.0)
+            tac_b = fake_quant_ste(self.tac_head.bias, OUTPUT_SCALE, -2147483647.0, 2147483647.0)
+            eval_pawns = F.linear(h_odd, eval_w, None).squeeze(-1) + psqt_eval
+            tac_logits = F.linear(h_even, tac_w, tac_b) + psqt_tac
+        else:
+            eval_pawns = self.eval_head(h_odd).squeeze(-1) + psqt_eval
+            tac_logits = self.tac_head(h_even) + psqt_tac
 
         return {
             "eval": eval_pawns,
@@ -817,7 +1072,8 @@ class HKV3MultiTaskLoss(nn.Module):
     Hàm mục tiêu huấn luyện đa nhiệm chuẩn Stockfish NNUE + HARENN:
       - Eval Loss: Kết hợp WDL Cross-Entropy (trên xác suất thắng/hòa/thua) và Smooth-L1 Huber Loss (trên Pawns).
       - Auxiliary Search Loss: Binary Cross-Entropy trên logits của tau, rho, rs.
-      - L2 Regularization nhẹ trên bảng dư W_full để khuyến khích mạng ưu tiên học quy luật hình học tổng quát ở W_rel & W_piece.
+      - Giữ toàn bộ metrics dưới dạng Tensor trên GPU/TPU trong suốt epoch (Zero Host-Device Sync .item() mỗi step!),
+        giúp TPU v5e-1 chạy bất đồng bộ liên tục với hiệu suất tối đa.
     """
 
     def __init__(self, wdl_weight: float = 0.75, wdl_scale_pawns: float = WDL_SCALE_PAWNS):
@@ -831,7 +1087,7 @@ class HKV3MultiTaskLoss(nn.Module):
         # 1. Smooth-L1 Huber Loss trực tiếp trên đơn vị Pawns (beta = 0.5 pawns = 50 cp)
         loss_huber = F.smooth_l1_loss(pred_pawns, target_clamped, reduction="mean", beta=0.5)
 
-        # 2. WDL Sigmoid Binary Cross-Entropy (with logits để an toàn tuyệt đối với FP16 autocast)
+        # 2. WDL Sigmoid Binary Cross-Entropy (with logits để an toàn tuyệt đối với FP16/BF16 autocast)
         target_wdl = torch.sigmoid(target_clamped / self.wdl_scale_pawns)
         loss_wdl = F.binary_cross_entropy_with_logits(
             pred_pawns / self.wdl_scale_pawns, target_wdl, reduction="mean"
@@ -841,7 +1097,7 @@ class HKV3MultiTaskLoss(nn.Module):
 
     def forward(
         self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         loss_eval = self.compute_eval_loss(outputs["eval"], targets["eval"])
 
         loss_tau = F.binary_cross_entropy_with_logits(outputs["tau"], targets["tau"], reduction="mean")
@@ -851,19 +1107,21 @@ class HKV3MultiTaskLoss(nn.Module):
         total_loss = loss_eval + 0.15 * (loss_tau + loss_rho + loss_rs)
 
         with torch.no_grad():
-            mae_cp = torch.mean(torch.abs(outputs["eval"] - targets["eval"])).item() * 100.0
-            pred_wdl = torch.sigmoid(outputs["eval"] / self.wdl_scale_pawns)
-            tgt_wdl = torch.sigmoid(targets["eval"] / self.wdl_scale_pawns)
-            wdl_err = torch.mean(torch.abs(pred_wdl - tgt_wdl) ** 2.5).item()
+            eval_out = outputs["eval"].float()
+            eval_tgt = targets["eval"].float()
+            mae_cp = torch.mean(torch.abs(eval_out - eval_tgt)) * 100.0
+            pred_wdl = torch.sigmoid(eval_out / self.wdl_scale_pawns)
+            tgt_wdl = torch.sigmoid(eval_tgt / self.wdl_scale_pawns)
+            wdl_err = torch.mean(torch.abs(pred_wdl - tgt_wdl) ** 2.5)
 
         metrics = {
-            "total": float(total_loss.item()),
-            "eval": float(loss_eval.item()),
-            "tau": float(loss_tau.item()),
-            "rho": float(loss_rho.item()),
-            "rs": float(loss_rs.item()),
-            "mae_cp": mae_cp,
-            "wdl_err": wdl_err,
+            "total": total_loss.detach().float(),
+            "eval": loss_eval.detach().float(),
+            "tau": loss_tau.detach().float(),
+            "rho": loss_rho.detach().float(),
+            "rs": loss_rs.detach().float(),
+            "mae_cp": mae_cp.detach(),
+            "wdl_err": wdl_err.detach(),
         }
         return total_loss, metrics
 
@@ -985,12 +1243,14 @@ def verify_integer_avx2_parity_and_accuracy(
     quant_tensors: dict,
     us_sample: np.ndarray,
     them_sample: np.ndarray,
+    model: Optional[HalfKPv3Network] = None,
 ):
     """
     Mô phỏng chính xác 100% đường đi số nguyên C++ AVX2 (_mm256_maddubs_epi16) trên tập mẫu để:
       1. Kiểm chứng không có tràn số bão hòa int16_t trong maddubs (u_prod, v_prod in [0, 127]).
       2. Kiểm chứng định lý Phản đối xứng BIT-EXACT: E_int(us, them) + E_int(them, us) == 0.
       3. Kiểm chứng định lý Đối xứng BIT-EXACT: [tau, rho, rs]_int(us, them) == [tau, rho, rs]_int(them, us).
+      4. Đo sai số lượng tử hóa thực tế (MAE & MaxDiff tính bằng centipawn) giữa mạng PyTorch QAT và C++ AVX2 Integer.
     """
     fc1_w = quant_tensors["fc1_w"]
     fc1_b = quant_tensors["fc1_b"]
@@ -1052,13 +1312,247 @@ def verify_integer_avx2_parity_and_accuracy(
     print(f"[Verify AVX2] Kiểm chứng bit-exact trên {len(us_sample)} thế cờ thực tế: "
           f"Eval Parity Error = {max_eval_asym} (0.0000 cp) | Tactical Parity Error = {max_tac_asym} (0.0000) -> PASS 100%!", flush=True)
 
+    if model is not None:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            us_t = torch.from_numpy(us_sample.astype(np.int64)).to(model.dev0)
+            them_t = torch.from_numpy(them_sample.astype(np.int64)).to(model.dev0)
+            out = model(us_t, them_t)
+            eval_float_cp = out["eval"].detach().cpu().numpy().astype(np.float64) * 100.0
+            tac_float = np.stack([
+                out["tau"].detach().cpu().numpy(),
+                out["rho"].detach().cpu().numpy(),
+                out["rs"].detach().cpu().numpy(),
+            ], axis=1).astype(np.float64)
+        if was_training:
+            model.train()
+
+        eval_int_cp = (eval_fwd.astype(np.float64) / OUTPUT_SCALE) * 100.0
+        tac_int = tac_fwd.astype(np.float64) / OUTPUT_SCALE
+        eval_diff = np.abs(eval_float_cp - eval_int_cp)
+        tac_diff = np.abs(tac_float - tac_int)
+        print(
+            f"[Verify QAT vs C++ AVX2] Sai số lượng tử hóa PyTorch <-> C++ Integer: "
+            f"Eval MAE = {np.mean(eval_diff):.5f} cp (MaxDiff = {np.max(eval_diff):.5f} cp) | "
+            f"Tactical Logit MAE = {np.mean(tac_diff):.6f}",
+            flush=True,
+        )
+
+
+def _decompose_triscale_table(
+    flat_w: torch.Tensor,
+    rel_map: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Phân rã trực giao ngược bảng trọng số phẳng [22528, D] về 3 tầng của Tri-Scale Virtual Factorizer:
+      1. W_piece [704, D]   = Trung bình cộng qua 32 ô Vua (giữ tri thức giá trị vật chất & PSQT toàn cục).
+      2. W_rel   [2475, D]  = Trung bình cộng phần dư theo từng khoảng cách tương đối với Vua (c, dx, dy).
+      3. W_full  [22528, D] = Phần dư đặc thù riêng của từng ô Vua.
+    Đảm bảo: W_full + W_piece[piece_map] + W_rel[rel_map] == flat_w chính xác tuyệt đối,
+    giúp khi resume từ file .harenn không bị weight_decay của W_full xóa mất tri thức vật chất.
+    """
+    d = flat_w.shape[1]
+    w_3d = flat_w.view(HKV3_KING_BUCKETS, HKV3_NUM_PIECE_FEATURES, d)
+    w_piece = w_3d.mean(dim=0)  # [704, D]
+    res1 = flat_w - w_piece.repeat(HKV3_KING_BUCKETS, 1)  # [22528, D]
+
+    rel_idx = rel_map.to(flat_w.device)
+    rel_sum = torch.zeros((HKV3_NUM_REL_FEATURES, d), dtype=flat_w.dtype, device=flat_w.device)
+    rel_cnt = torch.zeros((HKV3_NUM_REL_FEATURES, 1), dtype=flat_w.dtype, device=flat_w.device)
+    rel_sum.index_add_(0, rel_idx, res1)
+    ones = torch.ones((HKV3_NUM_FEATURES, 1), dtype=flat_w.dtype, device=flat_w.device)
+    rel_cnt.index_add_(0, rel_idx, ones)
+    w_rel = rel_sum / torch.clamp(rel_cnt, min=1.0)  # [2475, D]
+
+    w_full = res1 - w_rel[rel_idx]  # [22528, D]
+    return w_full, w_piece, w_rel
+
+
+def load_hkv3_weights_or_checkpoint(
+    model: HalfKPv3Network,
+    filepath: str,
+    dev0: torch.device,
+    dev1: torch.device,
+) -> Tuple[dict, int]:
+    """
+    Nạp trọng số từ checkpoint .pt hoặc file nhị phân .harenn cũ.
+    Hỗ trợ 2 kịch bản:
+      1. Checkpoint PyTorch (.pt): Khôi phục nguyên vẹn weights, optimizer, scaler, scheduler.
+      2. File nhị phân (.harenn): Khôi phục weights bit-exact 100% đồng thời phân rã ngược về
+         3 bảng (W_full, W_piece, W_rel), cho phép resume/finetune ngay cả khi không giữ file .pt.
+    Trả về: (checkpoint_dict, loaded_epoch)
+    """
+    p = Path(filepath)
+    if not p.exists():
+        raise FileNotFoundError(f"Không tìm thấy file checkpoint/model: {filepath}")
+
+    with open(p, "rb") as f:
+        header = f.read(4)
+
+    if header == HKV3_MAGIC:
+        print(f"[Resume] Phát hiện file nhị phân HKV3 (.harenn): {filepath}", flush=True)
+        with open(p, "rb") as f:
+            magic = f.read(4)
+            arch_id = struct.unpack("<I", f.read(4))[0]
+            if magic != HKV3_MAGIC or arch_id != HKV3_ARCH_ID:
+                raise ValueError(f"File {filepath} không đúng định dạng HKV3 (magic={magic}, arch={arch_id})")
+
+            fc1_w = np.frombuffer(f.read(HKV3_NUM_FEATURES * HKV3_L1_SIZE * 2), dtype=np.int16).reshape(HKV3_NUM_FEATURES, HKV3_L1_SIZE)
+            fc1_b = np.frombuffer(f.read(HKV3_L1_SIZE * 2), dtype=np.int16)
+            psqt = np.frombuffer(f.read(HKV3_NUM_FEATURES * HKV3_PSQT_BUCKETS * 4), dtype=np.int32).reshape(HKV3_NUM_FEATURES, HKV3_PSQT_BUCKETS)
+            w_self = np.frombuffer(f.read(HKV3_L2_SIZE * HKV3_L1_PAIR_SIZE), dtype=np.int8).reshape(HKV3_L2_SIZE, HKV3_L1_PAIR_SIZE)
+            w_opp = np.frombuffer(f.read(HKV3_L2_SIZE * HKV3_L1_PAIR_SIZE), dtype=np.int8).reshape(HKV3_L2_SIZE, HKV3_L1_PAIR_SIZE)
+            b_fc2 = np.frombuffer(f.read(HKV3_L2_SIZE * 4), dtype=np.int32)
+            eval_w = np.frombuffer(f.read(HKV3_L2_SIZE * 2), dtype=np.int16)
+            tac_w = np.frombuffer(f.read(3 * HKV3_L2_SIZE * 2), dtype=np.int16).reshape(3, HKV3_L2_SIZE)
+            tac_b = np.frombuffer(f.read(3 * 4), dtype=np.int32)
+
+        with torch.no_grad():
+            # Phân rã ngược L1 về 3 tầng (W_full, W_piece, W_rel) trên CPU (tránh biên dịch XLA one-off) rồi nạp lên dev0/dev1
+            rel_map_cpu = model.left_branch.rel_map_pad[:HKV3_NUM_FEATURES].cpu()
+            left_flat = torch.from_numpy(fc1_w[:, :HKV3_L1_PAIR_SIZE].astype(np.float32) / QA_SCALE)
+            l_full, l_piece, l_rel = _decompose_triscale_table(left_flat, rel_map_cpu)
+            model.left_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = l_full.to(dev0)
+            model.left_branch.emb_full.weight.data[HKV3_NUM_FEATURES:].zero_()
+            model.left_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = l_piece.to(dev0)
+            model.left_branch.emb_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
+            model.left_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = l_rel.to(dev0)
+            model.left_branch.emb_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
+            model.left_branch.bias.data = torch.from_numpy(fc1_b[:HKV3_L1_PAIR_SIZE].astype(np.float32) / QA_SCALE).to(dev0)
+
+            right_flat = torch.from_numpy(fc1_w[:, HKV3_L1_PAIR_SIZE:].astype(np.float32) / QA_SCALE)
+            r_full, r_piece, r_rel = _decompose_triscale_table(right_flat, rel_map_cpu)
+            model.right_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = r_full.to(dev1)
+            model.right_branch.emb_full.weight.data[HKV3_NUM_FEATURES:].zero_()
+            model.right_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = r_piece.to(dev1)
+            model.right_branch.emb_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
+            model.right_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = r_rel.to(dev1)
+            model.right_branch.emb_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
+            model.right_branch.bias.data = torch.from_numpy(fc1_b[HKV3_L1_PAIR_SIZE:].astype(np.float32) / QA_SCALE).to(dev1)
+
+            # Phân rã ngược PSQT về 3 tầng (psqt_full, psqt_piece, psqt_rel)
+            psqt_flat = torch.from_numpy(psqt.astype(np.float32) / OUTPUT_SCALE)
+            p_full, p_piece, p_rel = _decompose_triscale_table(psqt_flat, rel_map_cpu)
+            model.psqt_full.weight.data[:HKV3_NUM_FEATURES] = p_full.to(dev0)
+            model.psqt_full.weight.data[HKV3_NUM_FEATURES:].zero_()
+            model.psqt_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = p_piece.to(dev0)
+            model.psqt_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
+            model.psqt_rel.weight.data[:HKV3_NUM_REL_FEATURES] = p_rel.to(dev0)
+            model.psqt_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
+
+            # Nạp FC2
+            model.fc2_self.weight.data = torch.from_numpy(w_self.astype(np.float32) / QW_FC2_SCALE).to(dev0)
+            model.fc2_opp.weight.data = torch.from_numpy(w_opp.astype(np.float32) / QW_FC2_SCALE).to(dev0)
+            model.fc2_self.bias.data = torch.from_numpy(b_fc2.astype(np.float32) / (QA_SCALE * QW_FC2_SCALE)).to(dev0)
+
+            # Nạp Heads
+            model.eval_head.weight.data = torch.from_numpy(eval_w.astype(np.float32) / Q_HEAD_SCALE).unsqueeze(0).to(dev0)
+            model.tac_head.weight.data = torch.from_numpy(tac_w.astype(np.float32) / Q_HEAD_SCALE).to(dev0)
+            model.tac_head.bias.data = torch.from_numpy(tac_b.astype(np.float32) / OUTPUT_SCALE).to(dev0)
+
+            model.clamp_quantizable_weights()
+
+        print(f"[Resume] Nạp & phân rã Tri-Scale (W_full + W_piece + W_rel) bit-exact từ {filepath} thành công!", flush=True)
+
+        # Tự động trích xuất số epoch nếu có trong tên file .harenn (vd: nextfish_epoch4.harenn, net_ep08.harenn)
+        match = re.search(r'(?:epoch|ep)[_-]?(\d+)', p.name, re.IGNORECASE)
+        inferred_epoch = int(match.group(1)) if match else 0
+        if inferred_epoch > 0:
+            print(f"[Resume] Đã tự động nhận diện Epoch {inferred_epoch} từ tên file: {p.name}", flush=True)
+
+        return {"type": "harenn", "epoch": inferred_epoch}, inferred_epoch
+
+    # Ngược lại: file checkpoint PyTorch (.pt / .pth)
+    print(f"[Resume] Đang nạp checkpoint PyTorch từ {filepath}...", flush=True)
+    ckpt = torch.load(p, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state = ckpt["model_state_dict"]
+        loaded_epoch = int(ckpt.get("epoch", 0))
+    else:
+        state = ckpt
+        loaded_epoch = 0
+
+    model.load_state_dict(state, strict=False)
+    model.left_branch.to(dev0)
+    model.right_branch.to(dev1)
+    model.clamp_quantizable_weights()
+    print(f"[Resume] Nạp checkpoint PyTorch thành công! (Checkpoint Epoch: {loaded_epoch})", flush=True)
+    return (ckpt if isinstance(ckpt, dict) else {}), loaded_epoch
+
+
+def _to_cpu_recursive(obj):
+    """Chuyển đệ quy mọi Tensor (bao gồm cả XLA/TPU tensor hoặc CUDA tensor) về CPU trước khi lưu .pt."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_recursive(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_recursive(v) for v in obj)
+    return obj
+
+
+def save_portable_checkpoint(data: dict, path: Path, is_tpu: bool = False):
+    """Lưu checkpoint .pt tương thích 100% giữa TPU v5e-1, GPU CUDA và CPU."""
+    if is_tpu and HAS_XLA:
+        xm.mark_step()
+    torch.save(_to_cpu_recursive(data), path)
+
+
+def get_autocast_ctx(device_type: str, enabled: bool):
+    """Ngữ cảnh Mixed Precision: Native bfloat16 trên TPU v5e-1 (MXU) và float16 trên GPU CUDA (Tensor Cores)."""
+    if not enabled:
+        return contextlib.nullcontext()
+    if device_type == "xla":
+        return torch.autocast("xla", dtype=torch.bfloat16, enabled=True)
+    if device_type == "cuda":
+        return torch.amp.autocast("cuda", dtype=torch.float16, enabled=True)
+    return contextlib.nullcontext()
+
+
+def step_optimizer(
+    loss: torch.Tensor,
+    optimizer: optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    clip_params=None,
+    max_norm: Optional[float] = None,
+    base_model: Optional[HalfKPv3Network] = None,
+    is_tpu: bool = False,
+):
+    """
+    Thực hiện backward + gradient clipping + optimizer step + weight clamping:
+      - Trên TPU v5e-1 (XLA bfloat16): Không cần GradScaler (tránh đồng bộ found_inf.item() mỗi step!),
+        gọi xm.mark_step() ngay cuối bước để kích hoạt thực thi bất đồng bộ đồ thị HLO trên MXU.
+      - Trên CUDA (FP16): Sử dụng GradScaler tiêu chuẩn.
+    """
+    if is_tpu:
+        loss.backward()
+        if clip_params is not None and max_norm is not None:
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=max_norm)
+        optimizer.step()
+        if base_model is not None:
+            base_model.clamp_quantizable_weights()
+        if HAS_XLA:
+            xm.mark_step()
+    else:
+        scaler.scale(loss).backward()
+        if clip_params is not None and max_norm is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=max_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        if base_model is not None:
+            base_model.clamp_quantizable_weights()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 8. VÒNG LẶP HUẤN LUYỆN CHÍNH (HỖ TRỢ ĐA GPU KAGGLE T4x2 + AMP FP16)
+# 8. VÒNG LẶP HUẤN LUYỆN CHÍNH (HỖ TRỢ TPU v5e-1 BF16 & ĐA GPU KAGGLE T4x2)
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(
-        description="HalfKPv3 (HKV3) + HARENN Training Pipeline (Kaggle T4x2 Ready)"
+        description="HalfKPv3 (HKV3) + HARENN Training Pipeline (TPU v5e-1 & Kaggle T4x2 Ready)"
     )
     parser.add_argument("--data", type=str, default="Neuron Network/data", help="Thư mục chứa các file .jsonl/.json")
     parser.add_argument("--cache", type=str, default="", help="Đường dẫn file cache .npz (tùy chọn)")
@@ -1066,15 +1560,21 @@ def main():
     parser.add_argument("--hf-bucket", type=str, default="australia1/myrandombucket", help="ID của Hugging Face Bucket")
     parser.add_argument("--epochs", type=int, default=16, help="Số epoch huấn luyện đa nhiệm Giai đoạn 1")
     parser.add_argument("--finetune-eval-epochs", type=int, default=4, help="Số epoch tinh chỉnh chuyên sâu Eval ở Giai đoạn 2")
-    parser.add_argument("--batch-size", type=int, default=16384, help="Kích thước batch (khuyến nghị 16384 cho T4x2)")
-    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate cơ sở cho AdamW")
+    parser.add_argument("--batch-size", type=int, default=16384, help="Kích thước batch (khuyến nghị 32768 cho TPU v5e-1, 16384 cho T4x2)")
+    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate cơ sở cho AdamW (khuyến nghị 2.5e-3 khi batch=32768)")
     parser.add_argument("--wdl-weight", type=float, default=0.75, help="Tỷ trọng WDL BCE Loss so với Huber Loss (mặc định: 0.75)")
-    parser.add_argument("--symmetry", type=int, default=2, choices=[1, 2], help="Chế độ đối xứng lật màu dọc (mặc định: 2x)")
-    parser.add_argument("--feature-dropout", type=float, default=0.03, help="Tỷ lệ nhiễu ẩn quân cờ để chống overfit W_full")
+    parser.add_argument("--symmetry", type=int, default=1, choices=[1, 2], help="Chế độ đối xứng lật màu dọc (mặc định: 1x do kiến trúc đã đối xứng đại số tuyệt đối)")
+    parser.add_argument("--feature-dropout", type=float, default=0.0, help="Tỷ lệ dropout chỉ riêng trên bảng W_full ở Stage 1 (mặc định: 0.0 - tắt hoàn toàn)")
     parser.add_argument("--val-split", type=float, default=0.03, help="Tỷ lệ tập validation")
+    parser.add_argument("--tpu", action="store_true", help="Bắt buộc sử dụng thiết bị Google Cloud / Colab TPU (torch_xla)")
     parser.add_argument("--no-qat", action="store_true", help="Tắt Quantization-Aware Training")
-    parser.add_argument("--no-amp", action="store_true", help="Tắt Mixed Precision (FP16 Tensor Cores)")
-    parser.add_argument("--resume", type=str, default="", help="Đường dẫn checkpoint .pt để tiếp tục train")
+    parser.add_argument("--no-amp", action="store_true", help="Tắt Mixed Precision (BF16 trên TPU / FP16 trên GPU)")
+    parser.add_argument("--resume", type=str, default="", help="Đường dẫn checkpoint (.pt) hoặc file nhị phân (.harenn) để tiếp tục train")
+    parser.add_argument("--resume-epoch", type=int, default=None, help="Chỉ định epoch bắt đầu (mặc định: tự động nhận diện từ checkpoint + 1)")
+    parser.add_argument("--reset-optimizer", action="store_true", help="Khởi tạo lại optimizer & LR schedule, chỉ dùng weights của model cũ")
+    parser.add_argument("--skip-stage1", action="store_true", help="Bỏ qua Giai đoạn 1 và chuyển thẳng sang Stage 2 Fine-tune")
+    parser.add_argument("--finetune-tactical", action="store_true", help="Chỉ finetune 3 đầu chiến thuật (tau, rho, rs), đóng băng toàn bộ backbone và eval_head")
+    parser.add_argument("--tactical-epochs", type=int, default=2, help="Số epochs finetune đầu chiến thuật (mặc định: 2)")
     parser.add_argument("--output", type=str, default="Neuron Network/nextfish_hkv3.harenn", help="Đường dẫn xuất file .harenn")
     args = parser.parse_args()
 
@@ -1082,22 +1582,44 @@ def main():
     np.random.seed(42)
     random.seed(42)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_tpu = False
+    if args.tpu or (HAS_XLA and not torch.cuda.is_available()):
+        if not HAS_XLA:
+            raise RuntimeError("Cờ --tpu được bật nhưng chưa cài đặt thư viện torch_xla!")
+        os.environ.setdefault("PJRT_DEVICE", "TPU")
+        try:
+            device = xm.xla_device()
+            is_tpu = True
+        except Exception as e:
+            if args.tpu:
+                raise RuntimeError(f"Không thể khởi tạo thiết bị TPU (torch_xla): {e}") from e
+            device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    use_amp = (is_tpu or device.type == "cuda") and (not args.no_amp)
+    dev_type = "xla" if is_tpu else device.type
 
     print("=" * 76)
     print("  HALFKPV3 (HKV3) + HARENN TRAINING PIPELINE (SINGLE BIG NET ~88.85 MB)")
     print("=" * 76)
-    if num_gpus > 0:
+    if is_tpu:
+        print(f"  Thiết bị TPU:            Google Cloud / Colab TPU ({device}) | Native MXU BF16: {'ON' if use_amp else 'OFF'}")
+        print("  Tối ưu hóa XLA:          Static Batch Graph + Zero .item() Sync + Native Gather-Sum")
+    elif num_gpus > 0:
         gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
-        print(f"  Thiết bị GPU:            {num_gpus}x GPU ({', '.join(gpu_names)})")
+        print(f"  Thiết bị GPU:            {num_gpus}x GPU ({', '.join(gpu_names)}) | AMP FP16: {'ON' if use_amp else 'OFF'}")
     else:
         print("  Thiết bị:                CPU")
     print(f"  Không gian đặc trưng:    {HKV3_NUM_FEATURES:,} (32 Mirrored King Buckets x 11 Channels x 64)")
     print(f"  Virtual Factorizer:      W_full({HKV3_NUM_FEATURES:,}) + W_piece({HKV3_NUM_PIECE_FEATURES}) + W_rel({HKV3_NUM_REL_FEATURES:,})")
     print(f"  Cấu trúc tầng ẩn:        {HKV3_L1_SIZE} -> PairwiseGating({HKV3_L1_PAIR_SIZE}) -> SiameseTwinFC2({HKV3_L2_SIZE}) -> 4 Heads")
-    print(f"  Đối xứng dữ liệu:        {args.symmetry}x Vertical Color-Flip + Exact Architectural Parity")
+    print(f"  Đối xứng dữ liệu:        {args.symmetry}x Data Loader + Bit-Exact Algebraic Parity")
+    print(f"  W_full Dropout:          {args.feature_dropout:.2%} (Chỉ áp dụng lên emb_full ở Stage 1, bảo toàn vật chất)")
     print(f"  Batch Size:              {args.batch_size:,} | LR: {args.lr:.2e} | Epochs: {args.epochs} + {args.finetune_eval_epochs} FT")
+    if args.resume:
+        print(f"  Resume Model:            {args.resume}")
     print(f"  File xuất nhị phân:      {args.output}")
     print("=" * 76, flush=True)
 
@@ -1111,7 +1633,14 @@ def main():
     )
 
     n_total = len(eval_data)
-    val_count = min(100000, max(1000, int(n_total * args.val_split)))
+    raw_val_count = min(100000, max(1000, int(n_total * args.val_split)))
+    if is_tpu and n_total > args.batch_size * 2:
+        # Căn chỉnh tập Val thành bội số nguyên của batch_size trên TPU để dùng chung 100% đồ thị HLO tĩnh với tập Train
+        val_batches = max(1, round(raw_val_count / args.batch_size))
+        val_count = min(n_total // 2, val_batches * args.batch_size)
+    else:
+        val_count = raw_val_count
+
     perm = np.random.permutation(n_total)
     val_indices = perm[:val_count]
     train_indices = perm[val_count:]
@@ -1122,31 +1651,36 @@ def main():
     train_loader = FastHKV3BatchLoader(
         us_data, them_data, eval_data, tau_data, rho_data, rs_data,
         train_indices, batch_size=args.batch_size, shuffle=True,
-        symmetry=args.symmetry, feature_dropout=args.feature_dropout, device=device
+        symmetry=args.symmetry, device=device, static_shape=is_tpu
     )
     val_loader = FastHKV3BatchLoader(
         us_data, them_data, eval_data, tau_data, rho_data, rs_data,
         val_indices, batch_size=args.batch_size, shuffle=False,
-        symmetry=1, feature_dropout=0.0, device=device
+        symmetry=1, device=device, static_shape=is_tpu
     )
 
-    # 3. Khởi tạo mạng HalfKPv3 với Tensor-Parallel tự nhiên trên 2 GPU (ví dụ Kaggle T4x2)
-    dev0 = torch.device("cuda:0") if num_gpus >= 1 else torch.device("cpu")
-    dev1 = torch.device("cuda:1") if num_gpus >= 2 else dev0
-    if num_gpus >= 2:
-        print(f"[T4x2 Tensor-Parallel] Nhánh Left (1024) -> {dev0} || Nhánh Right (1024) -> {dev1} (Zero PCIe Weight Copy!)", flush=True)
+    # 3. Khởi tạo mạng HalfKPv3 trên TPU v5e-1 hoặc Tensor-Parallel trên 2 GPU (Kaggle T4x2)
+    if is_tpu:
+        dev0 = device
+        dev1 = device
+        print(f"[TPU v5e-1 Unified HBM] Toàn bộ mô hình + Shared Factorizer Maps đặt trên {dev0}", flush=True)
+    else:
+        dev0 = torch.device("cuda:0") if num_gpus >= 1 else torch.device("cpu")
+        dev1 = torch.device("cuda:1") if num_gpus >= 2 else dev0
+        if num_gpus >= 2:
+            print(f"[T4x2 Tensor-Parallel] Nhánh Left (1024) -> {dev0} || Nhánh Right (1024) -> {dev1} (Zero PCIe Weight Copy!)", flush=True)
 
-    base_model = HalfKPv3Network(qat=not args.no_qat, dev0=dev0, dev1=dev1)
-    if args.resume and Path(args.resume).exists():
-        print(f"[Resume] Đang nạp trọng số từ checkpoint {args.resume}...", flush=True)
-        ckpt = torch.load(args.resume, map_location="cpu")
-        state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-        base_model.load_state_dict(state, strict=False)
+    base_model = HalfKPv3Network(
+        qat=not args.no_qat,
+        dev0=dev0,
+        dev1=dev1,
+        full_dropout=args.feature_dropout,
+        use_amp=use_amp,
+    )
 
     model: nn.Module = base_model
     criterion = HKV3MultiTaskLoss(wdl_weight=args.wdl_weight).to(dev0)
-    use_amp = (device.type == "cuda") and (not args.no_amp)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not is_tpu))
 
     # Phân nhóm tham số tối ưu:
     # - W_full chịu weight_decay cao hơn (5e-5) để ép các ô Vua hiếm dựa vào W_piece & W_rel
@@ -1165,79 +1699,242 @@ def main():
     ])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=2e-5)
 
+    start_epoch = 1
+    best_val_loss = float("inf")
+    best_val_mae = float("inf")
+    best_pt_path = Path(args.output).with_suffix(".best.pt")
+
+    # 4. Nạp checkpoint / mô hình cũ nếu có tham số --resume
+    if args.resume:
+        ckpt_dict, loaded_epoch = load_hkv3_weights_or_checkpoint(base_model, args.resume, dev0, dev1)
+        if args.resume_epoch is not None:
+            start_epoch = args.resume_epoch
+            print(f"[Resume] Ghi đè epoch bắt đầu: {start_epoch}", flush=True)
+        elif loaded_epoch > 0:
+            start_epoch = loaded_epoch + 1
+            print(f"[Resume] Tự động tiếp tục từ epoch: {start_epoch}", flush=True)
+        elif ckpt_dict.get("type") == "harenn":
+            print(
+                "[Resume Cảnh Báo] File .harenn không lưu số epoch trong header và tên file không có số epoch. "
+                "Mặc định start_epoch = 1 (sẽ train từ đầu). "
+                "Nếu muốn tiếp tục từ epoch cụ thể, hãy thêm tham số: --resume-epoch <N> hoặc --skip-stage1.",
+                flush=True,
+            )
+
+        if not args.reset_optimizer:
+            if "optimizer_state_dict" in ckpt_dict:
+                try:
+                    optimizer.load_state_dict(ckpt_dict["optimizer_state_dict"])
+                    print("[Resume] Đã khôi phục trạng thái AdamW optimizer thành công!", flush=True)
+                except Exception as e:
+                    print(f"[Resume Warning] Không thể khôi phục optimizer: {e}", flush=True)
+            if "scaler_state_dict" in ckpt_dict and use_amp and not is_tpu:
+                try:
+                    scaler.load_state_dict(ckpt_dict["scaler_state_dict"])
+                    print("[Resume] Đã khôi phục trạng thái AMP GradScaler thành công!", flush=True)
+                except Exception as e:
+                    print(f"[Resume Warning] Không thể khôi phục scaler: {e}", flush=True)
+            if "scheduler_state_dict" in ckpt_dict:
+                try:
+                    scheduler.load_state_dict(ckpt_dict["scheduler_state_dict"])
+                    print("[Resume] Đã khôi phục trạng thái CosineAnnealingLR scheduler thành công!", flush=True)
+                except Exception as e:
+                    print(f"[Resume Warning] Không thể khôi phục scheduler: {e}", flush=True)
+            elif start_epoch > 1:
+                # Đồng bộ scheduler đến epoch hiện tại
+                for _ in range(min(start_epoch - 1, args.epochs)):
+                    scheduler.step()
+                print(f"[Resume] Đã đồng bộ scheduler tới epoch {start_epoch} (LR: {scheduler.get_last_lr()[0]:.2e})", flush=True)
+
+            if "best_val_loss" in ckpt_dict:
+                best_val_loss = float(ckpt_dict["best_val_loss"])
+            if "best_val_mae" in ckpt_dict:
+                best_val_mae = float(ckpt_dict["best_val_mae"])
+                print(f"[Resume] Điểm Val trước đó: Loss={best_val_loss:.4f}, MAE={best_val_mae:.2f} cp", flush=True)
+        else:
+            print("[Resume] Cờ --reset-optimizer được bật: Khởi tạo lại optimizer và LR schedule mới.", flush=True)
+
+    metric_keys = ("total", "eval", "tau", "rho", "rs", "mae_cp", "wdl_err")
+
     def evaluate_validation() -> Dict[str, float]:
         model.eval()
-        totals = {"total": 0.0, "eval": 0.0, "tau": 0.0, "rho": 0.0, "rs": 0.0, "mae_cp": 0.0, "wdl_err": 0.0}
+        totals_t = {k: torch.zeros((), dtype=torch.float32, device=dev0) for k in metric_keys}
         steps = 0
         with torch.no_grad():
             for us_b, them_b, targets_b in val_loader:
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with get_autocast_ctx(dev_type, use_amp):
                     outputs_b = model(us_b, them_b)
                     _, m = criterion(outputs_b, targets_b)
-                for k in totals:
-                    totals[k] += m[k]
+                for k in metric_keys:
+                    totals_t[k] = totals_t[k] + m[k]
                 steps += 1
-        for k in totals:
-            totals[k] /= max(1, steps)
-        return totals
+                if is_tpu and HAS_XLA:
+                    xm.mark_step()
+        denom = float(max(1, steps))
+        return {k: float(totals_t[k].item()) / denom for k in metric_keys}
 
-    best_val_loss = float("inf")
-    best_val_mae = float("inf")
+    # ─── GIAI ĐOẠN ĐẶC BIỆT: CHUYÊN SÂU FINETUNE ĐẦU CHIẾN THUẬT (TAU, RHO, RS) ───
+    if args.finetune_tactical:
+        print("\n" + "=" * 76)
+        print("  [Stage Tactical] CHUYÊN SÂU FINETUNE ĐẦU CHIẾN THUẬT (TAU, RHO, RS)")
+        print("  Đóng băng toàn bộ Feature Extractor Backbone và Eval Head!")
+        print("  Chỉ huấn luyện 3 Linear Heads: tau, rho, rs với lr=2.0e-3")
+        print("=" * 76, flush=True)
+
+        base_model.set_full_dropout(0.0)
+        for p in base_model.parameters():
+            p.requires_grad = False
+        for p in base_model.tac_head.parameters():
+            p.requires_grad = True
+
+        tac_opt = optim.AdamW(base_model.tac_head.parameters(), lr=2.0e-3, weight_decay=1e-4)
+        tac_sched = optim.lr_scheduler.CosineAnnealingLR(tac_opt, T_max=args.tactical_epochs, eta_min=1e-4)
+
+        for ep in range(1, args.tactical_epochs + 1):
+            model.train()
+            t0 = time.time()
+            tac_loss_sum_t = torch.zeros((), dtype=torch.float32, device=dev0)
+            steps = 0
+            for us_b, them_b, targets_b in train_loader:
+                tac_opt.zero_grad(set_to_none=True)
+                with get_autocast_ctx(dev_type, use_amp):
+                    outputs_b = model(us_b, them_b)
+                    loss_tau = F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
+                    loss_rho = F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
+                    loss_rs = F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
+                    loss = loss_tau + loss_rho + loss_rs
+
+                tac_loss_sum_t = tac_loss_sum_t + loss.detach().float()
+                step_optimizer(
+                    loss, tac_opt, scaler,
+                    clip_params=base_model.tac_head.parameters(),
+                    max_norm=1.0,
+                    base_model=None,
+                    is_tpu=is_tpu,
+                )
+                steps += 1
+
+            tac_sched.step()
+            tac_loss_avg = float(tac_loss_sum_t.item()) / max(1, steps)
+            dt = time.time() - t0
+            val_m = evaluate_validation()
+            print(
+                f"[Tactical Ep {ep:02d}/{args.tactical_epochs:02d} ({dt:5.1f}s)] "
+                f"Train BCE Loss: {tac_loss_avg:.4f} | "
+                f"Val: [tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | Val MAE: {val_m['mae_cp']:.2f}cp",
+                flush=True,
+            )
+
+        print(f"\n[Export] Xuất nhị phân cập nhật Tactical Heads: {args.output}...", flush=True)
+        export_hkv3_binary(base_model, args.output)
+        for p in base_model.parameters():
+            p.requires_grad = True
+
+        print(f"[Done] Tactical heads finetune hoàn tất! -> {args.output}", flush=True)
+        return
 
     # ─── GIAI ĐOẠN 1: HUẤN LUYỆN ĐA NHIỆM ĐỒNG THỜI (EVAL + TAU + RHO + RS) ───
-    print(f"\n[Stage 1] Bắt đầu huấn luyện Đa nhiệm HalfKPv3 ({args.epochs} epochs)...", flush=True)
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        t0 = time.time()
-        train_totals = {"total": 0.0, "eval": 0.0, "tau": 0.0, "rho": 0.0, "rs": 0.0, "mae_cp": 0.0}
-        steps = 0
-
-        for us_b, them_b, targets_b in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                outputs_b = model(us_b, them_b)
-                loss, m = criterion(outputs_b, targets_b)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            base_model.clamp_quantizable_weights()
-
-            for k in train_totals:
-                train_totals[k] += m[k]
-            steps += 1
-
-        scheduler.step()
-        dt = time.time() - t0
-        for k in train_totals:
-            train_totals[k] /= max(1, steps)
-
-        val_m = evaluate_validation()
-        cur_lr = scheduler.get_last_lr()[0]
-
+    if args.skip_stage1:
+        print("\n[Stage 1] Bỏ qua Giai đoạn 1 do cờ --skip-stage1 được kích hoạt.", flush=True)
+    elif start_epoch > args.epochs:
         print(
-            f"Epoch {epoch:02d}/{args.epochs:02d} ({dt:5.1f}s) | "
-            f"Train Loss: {train_totals['total']:.4f} (MAE: {train_totals['mae_cp']:.1f}cp) | "
-            f"Val Loss: {val_m['total']:.4f} (MAE: {val_m['mae_cp']:.1f}cp, WDL^2.5: {val_m['wdl_err']:.5f}) | "
-            f"[tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | LR: {cur_lr:.2e}",
+            f"\n[Stage 1] Checkpoint đã hoàn thành {start_epoch - 1}/{args.epochs} epochs. "
+            f"Bỏ qua Stage 1 để chuyển tiếp sang Stage 2 (hoặc chỉ định --epochs lớn hơn để train tiếp).",
             flush=True,
         )
+    else:
+        print(f"\n[Stage 1] Bắt đầu huấn luyện Đa nhiệm HalfKPv3 (Epoch {start_epoch:02d} -> {args.epochs:02d})...", flush=True)
+        if is_tpu:
+            print("[TPU Warmup] Batch đầu tiên của Epoch 1 sẽ biên dịch đồ thị XLA HLO tĩnh (~30-45s), sau đó chạy tốc độ tối đa!", flush=True)
+        train_keys = ("total", "eval", "tau", "rho", "rs", "mae_cp")
+        for epoch in range(start_epoch, args.epochs + 1):
+            model.train()
+            t0 = time.time()
+            train_totals_t = {k: torch.zeros((), dtype=torch.float32, device=dev0) for k in train_keys}
+            steps = 0
 
-        ckpt_path = Path(args.output).with_suffix(f".epoch{epoch}.pt")
-        torch.save({"epoch": epoch, "model_state_dict": base_model.state_dict()}, ckpt_path)
+            for us_b, them_b, targets_b in train_loader:
+                optimizer.zero_grad(set_to_none=True)
+                with get_autocast_ctx(dev_type, use_amp):
+                    outputs_b = model(us_b, them_b)
+                    loss, m = criterion(outputs_b, targets_b)
 
-        if val_m["total"] < best_val_loss:
-            best_val_loss = val_m["total"]
-            best_val_mae = val_m["mae_cp"]
-            export_hkv3_binary(base_model, args.output)
+                for k in train_keys:
+                    train_totals_t[k] = train_totals_t[k] + m[k]
+
+                step_optimizer(
+                    loss, optimizer, scaler,
+                    clip_params=base_model.parameters(),
+                    max_norm=1.0,
+                    base_model=base_model,
+                    is_tpu=is_tpu,
+                )
+                steps += 1
+
+            scheduler.step()
+            denom = float(max(1, steps))
+            train_totals = {k: float(train_totals_t[k].item()) / denom for k in train_keys}
+            dt = time.time() - t0
+
+            val_m = evaluate_validation()
+            cur_lr = scheduler.get_last_lr()[0]
+            pos_per_sec = int((steps * args.batch_size) / max(1e-3, dt))
+
+            print(
+                f"Epoch {epoch:02d}/{args.epochs:02d} ({dt:5.1f}s | {pos_per_sec:,} pos/s) | "
+                f"Train Loss: {train_totals['total']:.4f} (MAE: {train_totals['mae_cp']:.1f}cp) | "
+                f"Val Loss: {val_m['total']:.4f} (MAE: {val_m['mae_cp']:.1f}cp, WDL^2.5: {val_m['wdl_err']:.5f}) | "
+                f"[tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | LR: {cur_lr:.2e}",
+                flush=True,
+            )
+
+            # Cập nhật best_val_loss / best_val_mae TRƯỚC khi đóng gói ckpt_data để lưu đúng kỷ lục mới nhất
+            is_new_best = val_m["total"] < best_val_loss
+            if is_new_best:
+                best_val_loss = val_m["total"]
+                best_val_mae = val_m["mae_cp"]
+
+            ckpt_data = {
+                "epoch": epoch,
+                "model_state_dict": base_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "best_val_loss": best_val_loss,
+                "best_val_mae": best_val_mae,
+            }
+            ckpt_path = Path(args.output).with_suffix(f".epoch{epoch}.pt")
+            latest_path = Path(args.output).with_suffix(".latest.pt")
+            save_portable_checkpoint(ckpt_data, ckpt_path, is_tpu=is_tpu)
+            save_portable_checkpoint(ckpt_data, latest_path, is_tpu=is_tpu)
+
+            if is_new_best:
+                save_portable_checkpoint(ckpt_data, best_pt_path, is_tpu=is_tpu)
+                export_hkv3_binary(base_model, args.output)
 
     # ─── GIAI ĐOẠN 2: TINH CHỈNH CHUYÊN SÂU ĐẦU ĐỌC EVAL (2A: JOINT REFINEMENT + 2B: LOCKED HEAD) ───
     if args.finetune_eval_epochs > 0:
         phase_a = max(1, args.finetune_eval_epochs // 2)
         phase_b = max(1, args.finetune_eval_epochs - phase_a)
         print(f"\n[Stage 2] Tinh chỉnh chuyên sâu Eval ({phase_a} epochs Phase 2A + {phase_b} epochs Phase 2B)...", flush=True)
+
+        # Tắt hoàn toàn W_full dropout ở Stage 2 để mạng hội tụ chính xác từng centipawn
+        base_model.set_full_dropout(0.0)
+
+        # Khôi phục Best Model từ Stage 1 trước khi bước vào Stage 2A (tránh bắt đầu từ epoch cuối bị overfit)
+        if best_pt_path.exists():
+            print(f"[Stage 2A] Nạp lại Best Checkpoint từ Stage 1 ({best_pt_path})...", flush=True)
+            _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
+        elif Path(args.output).exists():
+            print(f"[Stage 2A] Nạp lại Best Binary từ Stage 1 ({args.output})...", flush=True)
+            _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
+
+        # Nếu chưa có mốc best_val_mae (ví dụ khi chạy --skip-stage1 từ file .harenn), đo ngay trên tập Val
+        if not math.isfinite(best_val_mae):
+            init_val = evaluate_validation()
+            best_val_loss = init_val["total"]
+            best_val_mae = init_val["mae_cp"]
+            print(f"[Stage 2A] Baseline Val MAE trước khi fine-tune: {best_val_mae:.2f} cp", flush=True)
 
         # Phase 2A: Ưu tiên Eval gấp 4 lần nhưng vẫn giữ neo tau/rho/rs
         ft_opt_a = optim.AdamW([
@@ -1260,7 +1957,7 @@ def main():
             t0 = time.time()
             for us_b, them_b, targets_b in train_loader:
                 ft_opt_a.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with get_autocast_ctx(dev_type, use_amp):
                     outputs_b = model(us_b, them_b)
                     loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
                     loss_aux = (
@@ -1269,16 +1966,17 @@ def main():
                         + F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
                     )
                     loss = 4.0 * loss_ev + 0.15 * loss_aux
-                scaler.scale(loss).backward()
-                scaler.unscale_(ft_opt_a)
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=0.5)
-                scaler.step(ft_opt_a)
-                scaler.update()
-                base_model.clamp_quantizable_weights()
+                step_optimizer(
+                    loss, ft_opt_a, scaler,
+                    clip_params=base_model.parameters(),
+                    max_norm=0.5,
+                    base_model=base_model,
+                    is_tpu=is_tpu,
+                )
 
             ft_sched_a.step()
-            dt = time.time() - t0
             val_m = evaluate_validation()
+            dt = time.time() - t0
             print(
                 f"[Phase 2A {ep:02d}/{phase_a:02d} ({dt:5.1f}s)] "
                 f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
@@ -1286,7 +1984,28 @@ def main():
             )
             if val_m["mae_cp"] < best_val_mae:
                 best_val_mae = val_m["mae_cp"]
+                save_portable_checkpoint({
+                    "stage": "2A_best",
+                    "model_state_dict": base_model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_val_mae": best_val_mae,
+                }, best_pt_path, is_tpu=is_tpu)
                 export_hkv3_binary(base_model, args.output)
+
+        ckpt_2a_path = Path(args.output).with_suffix(".phase2a.pt")
+        save_portable_checkpoint({
+            "stage": "2A",
+            "model_state_dict": base_model.state_dict(),
+            "best_val_mae": best_val_mae,
+        }, ckpt_2a_path, is_tpu=is_tpu)
+
+        # Khôi phục Best Model sau Phase 2A trước khi đóng băng Backbone sang Phase 2B
+        if best_pt_path.exists():
+            print(f"[Stage 2B] Nạp lại Best Checkpoint ({best_pt_path}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
+            _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
+        elif Path(args.output).exists():
+            print(f"[Stage 2B] Nạp lại Best Binary ({args.output}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
+            _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
 
         # Phase 2B: Đóng băng toàn bộ Backbone & tac_head, chỉ hiệu chỉnh eval_head (0.00% drift trên tau/rho/rs)
         for p in base_model.parameters():
@@ -1302,18 +2021,20 @@ def main():
             t0 = time.time()
             for us_b, them_b, targets_b in train_loader:
                 ft_opt_b.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with get_autocast_ctx(dev_type, use_amp):
                     outputs_b = model(us_b, them_b)
                     loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
-                scaler.scale(loss_ev).backward()
-                scaler.unscale_(ft_opt_b)
-                scaler.step(ft_opt_b)
-                scaler.update()
-                base_model.clamp_quantizable_weights()
+                step_optimizer(
+                    loss_ev, ft_opt_b, scaler,
+                    clip_params=None,
+                    max_norm=None,
+                    base_model=base_model,
+                    is_tpu=is_tpu,
+                )
 
             ft_sched_b.step()
-            dt = time.time() - t0
             val_m = evaluate_validation()
+            dt = time.time() - t0
             print(
                 f"[Phase 2B {ep:02d}/{phase_b:02d} ({dt:5.1f}s)] "
                 f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
@@ -1321,18 +2042,45 @@ def main():
             )
             if val_m["mae_cp"] < best_val_mae:
                 best_val_mae = val_m["mae_cp"]
+                save_portable_checkpoint({
+                    "stage": "2B_best",
+                    "model_state_dict": base_model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_val_mae": best_val_mae,
+                }, best_pt_path, is_tpu=is_tpu)
                 export_hkv3_binary(base_model, args.output)
+
+        ckpt_2b_path = Path(args.output).with_suffix(".phase2b.pt")
+        save_portable_checkpoint({
+            "stage": "2B",
+            "model_state_dict": base_model.state_dict(),
+            "best_val_mae": best_val_mae,
+        }, ckpt_2b_path, is_tpu=is_tpu)
 
         for p in base_model.parameters():
             p.requires_grad = True
 
     # ─── KIỂM CHỨNG ĐỐI XỨNG SỐ NGUYÊN C++ AVX2 SAU KHI XUẤT FILE ───
+    # Nạp lại chính xác Best Model đã lưu để tránh model ở epoch cuối ghi đè làm mất best model!
+    if best_pt_path.exists():
+        print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {best_pt_path} để kiểm chứng...", flush=True)
+        _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
+    elif Path(args.output).exists():
+        print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {args.output} để kiểm chứng...", flush=True)
+        _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
     quant_tensors = export_hkv3_binary(base_model, args.output)
+
+    # Chuyển model về CPU cho bước kiểm chứng 64 thế cờ cuối cùng (tránh XLA biên dịch lại đồ thị cho batch=64)
+    base_model.to("cpu")
+    base_model.dev0 = torch.device("cpu")
+    base_model.dev1 = torch.device("cpu")
+
     sample_n = min(64, len(val_indices))
     verify_integer_avx2_parity_and_accuracy(
         quant_tensors,
         us_data[val_indices[:sample_n]],
         them_data[val_indices[:sample_n]],
+        model=base_model,
     )
     print(f"\n[Done] Huấn luyện hoàn tất! Best Validation MAE: {best_val_mae:.2f} cp -> {args.output}", flush=True)
 
