@@ -11,10 +11,17 @@ D:/nextfish/data - Loại bỏ mọi bộ lọc, phân tích 100% nước đi
 
 
 import argparse
-
 import os
-
 import sys
+
+# Ensure UTF-8 output encoding across all platforms
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import json
 
@@ -275,162 +282,179 @@ class ParallelGenerator:
         except Exception:
             return None
 
-    def worker_task(self, game_id):
-
-        p_name = multiprocessing.current_process().name
-
-        worker_id = p_name.split('-')[-1] if '-' in p_name else "0"
-
-        engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
-        try:
-            engine.configure({"Threads": 1, "Hash": self.hash_mb, "Move Overhead": 0})
-        except Exception:
-            pass
-
+    def play_one_game(self, engine, game_id, proc_idx):
         game_positions, board = [], chess.Board()
 
         try:
+            engine.send_ucinewgame()
+        except Exception:
+            pass
+
+        for move_num in range(1, 100):
             if self.time_budget and (time.time() - self.start_time) > self.time_budget:
-                print(f"  [W{worker_id} | G{game_id}] Time budget exceeded, stopping", flush=True)
-                return 0
+                break
 
-            for move_num in range(1, 100):
-                if self.time_budget and (time.time() - self.start_time) > self.time_budget:
-                    print(f"  [W{worker_id} | G{game_id}] Time budget reached mid-game, finishing game", flush=True)
-                    break
+            if board.is_game_over():
+                break
 
-                if board.is_game_over():
-                    break
+            if move_num <= 6:
+                # Giai đoạn mở cờ nhanh (nước 1-6):
+                # MultiPV=5 ở nodes_shallow: siêu nhanh (~2ms), có sẵn top 5 nước hợp lệ an toàn
+                try:
+                    move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, len(list(board.legal_moves))))
+                    if not isinstance(move_info, list):
+                        move_info = [move_info]
 
-                if move_num <= 6:
-                    # Giai đoạn mở cờ nhanh (nước 1-6):
-                    # MultiPV=5 ở nodes_shallow: vừa siêu nhanh (~2ms), vừa có sẵn top 5 nước hợp lệ an toàn
-                    try:
-                        move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, len(list(board.legal_moves))))
-                        if not isinstance(move_info, list):
-                            move_info = [move_info]
+                    best_m = move_info[0]["pv"][0]
+                    best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
 
-                        best_m = move_info[0]["pv"][0]
-                        best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-
-                        # 8% chọn một nước hợp lệ KHÔNG THUA NGAY (eval >= -250 cp) để chống trùng FEN 100%
-                        if random.random() < 0.08:
-                            safe_cands = [
-                                line["pv"][0] for line in move_info
-                                if line.get("pv") and (line["score"].relative.score(mate_score=10000) or 0) >= -250
-                            ]
-                            move = random.choice(safe_cands) if safe_cands else best_m
-                        else:
-                            # 92% còn lại: Chọn giữa 2 nước tốt nhất (50/50 nếu gap <= 250cp và |sec_cp| <= 500cp)
-                            if len(move_info) >= 2 and move_info[1].get("pv"):
-                                sec_m = move_info[1]["pv"][0]
-                                sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
-                                eval_gap = abs(best_cp - sec_cp)
-                                if eval_gap <= 250 and abs(sec_cp) <= 500:
-                                    move = random.choice([best_m, sec_m])
-                                else:
-                                    move = best_m
-                            else:
-                                move = best_m
-                    except Exception:
-                        move = engine.play(board, chess.engine.Limit(nodes=self.nodes_shallow)).move
-
-                    board.push(move)
-                else:
-                    # Giai đoạn thu thập dữ liệu (nước > 6):
-                    # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn chuẩn 3 tầng lẫn đi cờ ở 16,384 nodes!
-                    data = self.analyze_full(board, engine)
-                    if not data or not data["best_m"]:
-                        break
-
-                    chosen_best = data["m24"][0] if data["m24"] else "0000"
-                    chosen_best_obj = data["best_m"]
-                    pos = TrainingPosition(
-                        fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
-                        eval_score=data["cp"], depth=data.get("depth", 20),
-                        best_move=chosen_best,
-                        best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
-                        best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
-                        best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-                        game_result=1, wdl=0.5,
-                        material=self.count_material(board), piece_count=len(board.piece_map()),
-                        tau=data["tau"], rho=data["rho"], rs=data["rs"]
-                    )
-                    game_positions.append(asdict(pos))
-
-                    # Chọn nước đi tiếp theo trực tiếp từ kết quả 16,384 nodes (không tốn thêm lệnh engine nào!)
-                    best_m = data["best_m"]
-                    sec_m = data["sec_m"]
-                    best_cp = data["cp"]
-                    sec_cp = data["cp_second"]
-
-                    if sec_m:
-                        eval_gap = abs(best_cp - sec_cp)
-                        if move_num <= 8:
-                            # 8 nước đầu: 50/50 giữa 2 nước nếu chênh lệch <= 250cp và |eval| <= 500cp
+                    # 8% chọn một nước hợp lệ KHÔNG THUA NGAY (eval >= -250 cp) để chống trùng FEN 100%
+                    if random.random() < 0.08:
+                        safe_cands = [
+                            line["pv"][0] for line in move_info
+                            if line.get("pv") and (line["score"].relative.score(mate_score=10000) or 0) >= -250
+                        ]
+                        move = random.choice(safe_cands) if safe_cands else best_m
+                    else:
+                        # 92% còn lại: Chọn giữa 2 nước tốt nhất (50/50 nếu gap <= 250cp và |sec_cp| <= 500cp)
+                        if len(move_info) >= 2 and move_info[1].get("pv"):
+                            sec_m = move_info[1]["pv"][0]
+                            sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
+                            eval_gap = abs(best_cp - sec_cp)
                             if eval_gap <= 250 and abs(sec_cp) <= 500:
                                 move = random.choice([best_m, sec_m])
                             else:
                                 move = best_m
                         else:
-                            # Sau nước 8: 25% chọn nước thứ 2 nếu chênh lệch <= 250cp
-                            if eval_gap <= 250 and random.random() < 0.25:
-                                move = sec_m
-                            else:
-                                move = best_m
-                    else:
-                        move = best_m
-
-                    board.push(move)
-
-            # Xác định kết quả chung cuộc chuẩn xác (Ground-truth Game Result & WDL)
-            # white_outcome: 1.0 (Trắng thắng), 0.5 (Hòa), 0.0 (Đen thắng)
-            if board.is_checkmate():
-                white_outcome = 0.0 if board.turn == chess.WHITE else 1.0
-            elif (
-                board.is_stalemate()
-                or board.is_insufficient_material()
-                or board.can_claim_draw()
-                or board.is_fivefold_repetition()
-                or board.is_seventyfive_moves()
-            ):
-                white_outcome = 0.5
-            else:
-                # Trọng tài phán quyết ở nước cuối (Adjudication by Stockfish 19)
-                try:
-                    final_info = engine.analyse(board, chess.engine.Limit(nodes=4096))
-                    final_cp = final_info["score"].white().score(mate_score=10000) or 0
-                    if final_cp >= 200:
-                        white_outcome = 1.0
-                    elif final_cp <= -200:
-                        white_outcome = 0.0
-                    else:
-                        white_outcome = 0.5
+                            move = best_m
                 except Exception:
+                    move = engine.play(board, chess.engine.Limit(nodes=self.nodes_shallow)).move
+
+                board.push(move)
+            else:
+                # Giai đoạn thu thập dữ liệu (nước > 6):
+                # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn lẫn đi cờ ở 16,384 nodes!
+                data = self.analyze_full(board, engine)
+                if not data or not data["best_m"]:
+                    break
+
+                chosen_best = data["m24"][0] if data["m24"] else "0000"
+                chosen_best_obj = data["best_m"]
+                pos = TrainingPosition(
+                    fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
+                    eval_score=data["cp"], depth=data.get("depth", 20),
+                    best_move=chosen_best,
+                    best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
+                    best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
+                    best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
+                    game_result=1, wdl=0.5,
+                    material=self.count_material(board), piece_count=len(board.piece_map()),
+                    tau=data["tau"], rho=data["rho"], rs=data["rs"]
+                )
+                game_positions.append(asdict(pos))
+
+                best_m = data["best_m"]
+                sec_m = data["sec_m"]
+                best_cp = data["cp"]
+                sec_cp = data["cp_second"]
+
+                if sec_m:
+                    eval_gap = abs(best_cp - sec_cp)
+                    if move_num <= 8:
+                        if eval_gap <= 250 and abs(sec_cp) <= 500:
+                            move = random.choice([best_m, sec_m])
+                        else:
+                            move = best_m
+                    else:
+                        if eval_gap <= 250 and random.random() < 0.25:
+                            move = sec_m
+                        else:
+                            move = best_m
+                else:
+                    move = best_m
+
+                board.push(move)
+
+        # Ground-truth Game Result & WDL
+        if board.is_checkmate():
+            white_outcome = 0.0 if board.turn == chess.WHITE else 1.0
+        elif (
+            board.is_stalemate()
+            or board.is_insufficient_material()
+            or board.can_claim_draw()
+            or board.is_fivefold_repetition()
+            or board.is_seventyfive_moves()
+        ):
+            white_outcome = 0.5
+        else:
+            try:
+                final_info = engine.analyse(board, chess.engine.Limit(nodes=4096))
+                final_cp = final_info["score"].white().score(mate_score=10000) or 0
+                if final_cp >= 200:
+                    white_outcome = 1.0
+                elif final_cp <= -200:
+                    white_outcome = 0.0
+                else:
                     white_outcome = 0.5
+            except Exception:
+                white_outcome = 0.5
 
-            # Cập nhật nhãn game_result và wdl theo góc nhìn của bên đi (side to move - stm)
-            # stm: 0 (White), 1 (Black)
-            for p in game_positions:
-                stm = p["stm"]
-                stm_win = white_outcome if stm == 0 else (1.0 - white_outcome)
-                p["wdl"] = round(stm_win, 2)
-                p["game_result"] = 2 if stm_win == 1.0 else (0 if stm_win == 0.0 else 1)
+        for p in game_positions:
+            stm = p["stm"]
+            stm_win = white_outcome if stm == 0 else (1.0 - white_outcome)
+            p["wdl"] = round(stm_win, 2)
+            p["game_result"] = 2 if stm_win == 1.0 else (0 if stm_win == 0.0 else 1)
 
-            total_game_pos = len(game_positions)
-            if game_positions:
-                ts = time.strftime("%H%M%S")
-                worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
-                rand_id = uuid.uuid4().hex[:6]
-                with open(self.output_dir / f"hnn_{worker_tag}g{game_id}_{ts}_{rand_id}.json", 'w') as f:
-                    json.dump({"positions": game_positions}, f, separators=(",", ":"))
+        outcome_str = "White win" if white_outcome == 1.0 else ("Black win" if white_outcome == 0.0 else "Draw")
+        return game_positions, outcome_str
 
-            outcome_str = "White win" if white_outcome == 1.0 else ("Black win" if white_outcome == 0.0 else "Draw")
-            print(f"  [W{worker_id} | G{game_id}] Game finished ({outcome_str}): {total_game_pos} positions collected with Ground-truth WDL", flush=True)
-            return total_game_pos
+    def worker_loop(self, proc_idx, max_games_per_proc, shared_pos):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
+        jsonl_filename = f"hnn_{worker_tag}p{proc_idx}_{ts}.jsonl"
+        jsonl_path = self.output_dir / jsonl_filename
 
-        finally: engine.quit()
+        print(f"  [W{self.worker_id}-P{proc_idx}] Booting persistent Stockfish (Hash={self.hash_mb}MB)...", flush=True)
+        engine = chess.engine.SimpleEngine.popen_uci(self.engine_path, timeout=60)
+        try:
+            engine.configure({"Threads": 1, "Hash": self.hash_mb, "Move Overhead": 0})
+        except Exception:
+            pass
 
+        games_played = 0
+        total_proc_pos = 0
+
+        try:
+            with open(jsonl_path, "a", encoding="utf-8") as out_f:
+                while games_played < max_games_per_proc:
+                    if self.time_budget and (time.time() - self.start_time) >= self.time_budget:
+                        print(f"  [W{self.worker_id}-P{proc_idx}] Time budget reached, stopping gracefully.", flush=True)
+                        break
+
+                    games_played += 1
+                    game_positions, outcome_str = self.play_one_game(engine, games_played, proc_idx)
+
+                    # Ghi trực tiếp nối đuôi vào duy nhất 1 file JSONL (0 file rác, crash-safe)
+                    if game_positions:
+                        for p in game_positions:
+                            out_f.write(json.dumps(p) + "\n")
+                        out_f.flush()
+
+                    pos_count = len(game_positions)
+                    total_proc_pos += pos_count
+                    with shared_pos.get_lock():
+                        shared_pos.value += pos_count
+                        cur_total = shared_pos.value
+
+                    elapsed = time.time() - self.start_time
+                    print(f"[{time.strftime('%H:%M:%S')}] [W{self.worker_id}-P{proc_idx} | G{games_played}] ({outcome_str}) +{pos_count} pos -> {jsonl_filename} | Total: {cur_total:,} Pos ({cur_total/elapsed:.2f} pos/s)", flush=True)
+
+        finally:
+            print(f"  [W{self.worker_id}-P{proc_idx}] Shutting down persistent engine after {games_played} games.", flush=True)
+            try:
+                engine.quit()
+            except Exception:
+                pass
 
 
 def main():
@@ -452,7 +476,7 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"=== HARENN Turbo Generator V8 (Raw Data - Budget: {args.nodes:,} Nodes | Hash: {args.hash}MB | Concurrency: {args.concurrency}) ===")
+    print(f"=== HARENN Turbo Generator V9 (Persistent Engines + Direct JSONL Streaming | Budget: {args.nodes:,} Nodes | Hash: {args.hash}MB | Concurrency: {args.concurrency}) ===")
 
     gen = ParallelGenerator(
         args.engine,
@@ -464,33 +488,23 @@ def main():
         batch_size=args.batch_size
     )
 
-    total_pos, start_time = 0, time.time()
+    shared_pos = multiprocessing.Value('i', 0)
+    games_per_proc = max(1, args.games // args.concurrency)
 
-    with ProcessPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = set()
-        game_id = 0
+    processes = []
+    for proc_idx in range(args.concurrency):
+        p = multiprocessing.Process(
+            target=gen.worker_loop,
+            args=(proc_idx, games_per_proc, shared_pos)
+        )
+        processes.append(p)
+        p.start()
 
-        # Prime the executor pool
-        initial_tasks = min(args.concurrency * 2, args.games)
-        for _ in range(initial_tasks):
-            futures.add(executor.submit(gen.worker_task, game_id))
-            game_id += 1
+    for p in processes:
+        p.join()
 
-        while futures:
-            time_up = args.time_budget and (time.time() - start_time) >= args.time_budget
-
-            done, futures = wait(futures, return_when=FIRST_COMPLETED)
-            for f in done:
-                res = f.result()
-                total_pos += res
-                elapsed = time.time() - start_time
-                print(f"[{time.strftime('%H:%M:%S')}] Total Progress: {total_pos} Pos | Speed: {total_pos/elapsed:.2f} pos/s", flush=True)
-
-            # Keep feeding tasks if time is not up and more games remain
-            while not time_up and len(futures) < args.concurrency * 2 and game_id < args.games:
-                futures.add(executor.submit(gen.worker_task, game_id))
-                game_id += 1
-
+    total_time = time.time() - gen.start_time
+    print(f"=== Generation Run Completed! Total: {shared_pos.value:,} positions in {total_time:.1f}s ({shared_pos.value/total_time:.2f} pos/s) ===")
 
 
 if __name__ == "__main__": main()
