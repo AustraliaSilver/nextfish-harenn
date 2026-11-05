@@ -183,101 +183,73 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
+            # Call 1: Shallow search (nodes_shallow = 1024) for horizon check & fast intuition
             res_shallow = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow))
-            res_mid_multi = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_mid), multipv=2)
-            res_deep = engine.analyse(board, chess.engine.Limit(nodes=self.nodes))
-
-            if not isinstance(res_mid_multi, list):
-                res_mid_multi = [res_mid_multi]
-
             m_shallow = res_shallow.get("pv", [None])[0]
-            m_mid = res_mid_multi[0].get("pv", [None])[0]
-            m_deep = res_deep.get("pv", [None])[0]
-
-            cp_deep = res_deep["score"].relative.score(mate_score=10000) or 0
-            cp_mid = res_mid_multi[0]["score"].relative.score(mate_score=10000) or 0
             cp_shallow = res_shallow["score"].relative.score(mate_score=10000) or 0
+
+            # Call 2: Deep MultiPV=2 search at full nodes (16,384 nodes!)
+            # Gives exact GM ground-truth eval, best move, and 2nd best move
+            res_deep = engine.analyse(board, chess.engine.Limit(nodes=self.nodes), multipv=2)
+            if not isinstance(res_deep, list):
+                res_deep = [res_deep]
+
+            m_deep = res_deep[0].get("pv", [None])[0]
+            cp_deep = res_deep[0]["score"].relative.score(mate_score=10000) or 0
             cp = cp_deep
 
-            # Eval swing between node budgets (absolute, in centipawns)
-            swing_shallow_mid = abs(cp_shallow - cp_mid)
-            swing_mid_deep = abs(cp_mid - cp_deep)
-            max_swing = max(swing_shallow_mid, swing_mid_deep)
+            if len(res_deep) >= 2 and res_deep[1].get("pv"):
+                m_second = res_deep[1]["pv"][0]
+                cp_second = res_deep[1]["score"].relative.score(mate_score=10000) or 0
+            else:
+                m_second = None
+                cp_second = cp_deep
 
-            # RHO (horizon risk): how much the eval moves between node budgets.
-            # Normalized so that 200 cp of swing maps to 1.0.
-            rho = min(max_swing / 200.0, 1.0)
+            # 1. RHO (Horizon Risk): eval swing between shallow intuition and deep calculation
+            eval_swing = abs(cp_shallow - cp_deep)
+            rho = min(eval_swing / 200.0, 1.0)
 
-            # TAU (tactical complexity): how often the best move changes between node budgets.
-            transitions = 0
-            changes = 0
-            if m_shallow is not None and m_mid is not None:
-                transitions += 1
-                if m_shallow != m_mid:
-                    changes += 1
-            if m_mid is not None and m_deep is not None:
-                transitions += 1
-                if m_mid != m_deep:
-                    changes += 1
-            tau = (changes / transitions) if transitions > 0 else 0.0
+            # 2. TAU (Tactical Complexity): Did best move flip between shallow and deep?
+            tau = 1.0 if (m_shallow is not None and m_deep is not None and m_shallow != m_deep) else 0.0
 
-            # Bonus for near-zero eval (positions where the outcome is unclear)
+            # Bonus for unclear positions and checks
             if abs(cp) < 30:
                 rho = min(rho + 0.15, 1.0)
                 tau = min(tau + 0.15, 1.0)
             elif abs(cp) < 80:
                 rho = min(rho + 0.05, 1.0)
 
-            # Bonus for check (tactical positions)
             if board.is_check():
                 rho = min(rho + 0.10, 1.0)
                 tau = min(tau + 0.10, 1.0)
 
-            # RS (Confidence Score / Resolution): Measures how confident the
-            # engine is in its evaluation and move choice compared to potential error/deviation.
-            # 1. Budget Stability: Eval deviation across shallow, mid, and deep node budgets
-            max_eval_dev = max(abs(cp_shallow - cp_mid), abs(cp_mid - cp_deep), abs(cp_shallow - cp_deep))
-            s_stability = max(0.0, 1.0 - (max_eval_dev / 150.0))
+            # 3. RS (Confidence Score / Resolution)
+            s_stability = max(0.0, 1.0 - (eval_swing / 150.0))
+            s_agreement = 1.0 if (m_shallow == m_deep) else 0.40
+            margin = max(0, cp_deep - cp_second)
+            s_margin = min(1.0, margin / 80.0) if m_second else 0.50
 
-            # 2. Move Consistency: Agreement of best move across node budgets
-            if m_shallow is not None and m_mid is not None and m_deep is not None:
-                if m_shallow == m_mid == m_deep:
-                    s_agreement = 1.0
-                elif m_mid == m_deep:
-                    s_agreement = 0.75
-                elif m_shallow == m_deep:
-                    s_agreement = 0.50
-                else:
-                    s_agreement = 0.25
-            else:
-                s_agreement = 0.50
-
-            # 3. Decision Margin: Dominance of best move over second best move in MultiPV
-            if len(res_mid_multi) >= 2 and 'score' in res_mid_multi[1] and res_mid_multi[1].get('pv'):
-                cp_second = res_mid_multi[1]['score'].relative.score(mate_score=10000) or 0
-                margin = max(0, cp_mid - cp_second)
-                s_margin = min(1.0, margin / 80.0)
-            else:
-                s_margin = 0.50
-
-            # Composite confidence score
             rs = 0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin
             rs = max(0.05, min(0.99, rs))
 
-            m_mid_uci = [r["pv"][0].uci() for r in res_mid_multi if r.get("pv")]
-            l_mid_lbl = [self.move_to_label(board, r["pv"][0]) for r in res_mid_multi if r.get("pv")]
             m_deep_uci = [m_deep.uci()] if m_deep else []
             l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
-            achieved_depth = int(res_deep.get("depth", 24))
+            m_sec_uci = [m_second.uci()] if m_second else m_deep_uci
+            l_sec_lbl = [self.move_to_label(board, m_second)] if m_second else l_deep_lbl
+
+            achieved_depth = int(res_deep[0].get("depth", 20))
 
             return {
                 "cp": cp,
                 "depth": achieved_depth,
+                "best_m": m_deep,
+                "sec_m": m_second,
+                "cp_second": cp_second,
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
-                "m16": m_mid_uci,
-                "l16": l_mid_lbl,
+                "m16": m_sec_uci,
+                "l16": l_sec_lbl,
                 "m20": m_deep_uci,
                 "l20": l_deep_lbl,
                 "m24": m_deep_uci,
@@ -314,55 +286,74 @@ class ParallelGenerator:
                 if board.is_game_over():
                     break
 
-                # Stockfish 19 Intelligent Exploration:
-                # Lọc 2 nước tốt nhất (multipv=2, nodes=4096) để tối ưu tốc độ tối đa:
-                # 8 nước đầu: Nếu nước thứ 2 có gap <= 250cp và |eval| <= 500cp -> chọn ngẫu nhiên giữa 2 nước tốt nhất (50/50)
-                # Sau nước 8: 75% nước tốt nhất, 25% nước thứ hai (nếu gap <= 250cp)
-                try:
-                    move_info = engine.analyse(board, chess.engine.Limit(nodes=4096), multipv=2)
-                    if not isinstance(move_info, list):
-                        move_info = [move_info]
-                    best_m = move_info[0]["pv"][0]
-                    best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-                    if len(move_info) >= 2 and move_info[1].get("pv"):
-                        sec_m = move_info[1]["pv"][0]
-                        sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
-                        eval_gap = abs(best_cp - sec_cp)
-                        if move_num <= 8:
+                if move_num <= 6:
+                    # Giai đoạn mở cờ nhanh (nước 1-6): chọn nước hợp lệ chất lượng cao
+                    try:
+                        move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=2)
+                        if not isinstance(move_info, list):
+                            move_info = [move_info]
+                        best_m = move_info[0]["pv"][0]
+                        best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
+                        if len(move_info) >= 2 and move_info[1].get("pv"):
+                            sec_m = move_info[1]["pv"][0]
+                            sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
+                            eval_gap = abs(best_cp - sec_cp)
                             if eval_gap <= 250 and abs(sec_cp) <= 500:
                                 move = random.choice([best_m, sec_m])
                             else:
                                 move = best_m
                         else:
+                            move = best_m
+                    except Exception:
+                        move = engine.play(board, chess.engine.Limit(nodes=self.nodes_shallow)).move
+
+                    board.push(move)
+                else:
+                    # Giai đoạn thu thập dữ liệu (nước > 6):
+                    # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn lẫn đi cờ ở 16,384 nodes!
+                    data = self.analyze_full(board, engine)
+                    if not data or not data["best_m"]:
+                        break
+
+                    chosen_best = data["m20"][0] if data["m20"] else "0000"
+                    chosen_best_obj = data["best_m"]
+                    pos = TrainingPosition(
+                        fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
+                        eval_score=data["cp"], depth=data.get("depth", 20),
+                        best_move=chosen_best,
+                        best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
+                        best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
+                        best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
+                        game_result=1, wdl=0.5,
+                        material=self.count_material(board), piece_count=len(board.piece_map()),
+                        tau=data["tau"], rho=data["rho"], rs=data["rs"]
+                    )
+                    game_positions.append(asdict(pos))
+
+                    # Chọn nước đi tiếp theo trực tiếp từ kết quả 16,384 nodes (không tốn thêm lệnh engine nào!)
+                    best_m = data["best_m"]
+                    sec_m = data["sec_m"]
+                    best_cp = data["cp"]
+                    sec_cp = data["cp_second"]
+
+                    if sec_m:
+                        eval_gap = abs(best_cp - sec_cp)
+                        if move_num <= 8:
+                            # 8 nước đầu: 50/50 giữa 2 nước nếu chênh lệch <= 250cp và |eval| <= 500cp
+                            if eval_gap <= 250 and abs(sec_cp) <= 500:
+                                move = random.choice([best_m, sec_m])
+                            else:
+                                move = best_m
+                        else:
+                            # Sau nước 8: 25% chọn nước thứ 2 nếu chênh lệch <= 250cp
                             if eval_gap <= 250 and random.random() < 0.25:
                                 move = sec_m
                             else:
                                 move = best_m
                     else:
                         move = best_m
-                except Exception:
-                    move = engine.play(board, chess.engine.Limit(nodes=4096)).move
 
-                board.push(move)
-
-                # Thu thập dữ liệu sau nước 6
-                if move_num > 6:
-                    data = self.analyze_full(board, engine)
-                    if data:
-                        chosen_best = data["m20"][0] if data["m20"] else (data["m16"][0] if data["m16"] else "0000")
-                        chosen_best_obj = chess.Move.from_uci(chosen_best) if chosen_best != "0000" else None
-                        pos = TrainingPosition(
-                            fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
-                            eval_score=data["cp"], depth=data.get("depth", 24),
-                            best_move=chosen_best,
-                            best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
-                            best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
-                            best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-                            game_result=1, wdl=0.5,
-                            material=self.count_material(board), piece_count=len(board.piece_map()),
-                            tau=data["tau"], rho=data["rho"], rs=data["rs"]
-                        )
-                        game_positions.append(asdict(pos))
+                    board.push(move)
 
             # Xác định kết quả chung cuộc chuẩn xác (Ground-truth Game Result & WDL)
             # white_outcome: 1.0 (Trắng thắng), 0.5 (Hòa), 0.0 (Đen thắng)
