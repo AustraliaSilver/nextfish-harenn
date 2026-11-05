@@ -129,7 +129,7 @@ jobs:
   auto-retrigger:
     needs: data-generation
     runs-on: ubuntu-latest
-    if: always()
+    if: success()
     steps:
       - name: Cool down 30 minutes before next run
         run: |
