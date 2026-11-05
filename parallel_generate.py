@@ -315,46 +315,31 @@ class ParallelGenerator:
                     break
 
                 # Stockfish 19 Intelligent Exploration:
-                # 8 nước đầu: Mở rộng MultiPV = 10 (chênh lệch <= 250cp và |eval| <= 500cp) để phủ 100% mọi khai cuộc
-                # Sau nước 8: 75% best move, 25% second-best move (nếu chênh lệch eval <= 250cp)
+                # Lọc 2 nước tốt nhất (multipv=2, nodes=4096) để tối ưu tốc độ tối đa:
+                # 8 nước đầu: Nếu nước thứ 2 có gap <= 250cp và |eval| <= 500cp -> chọn ngẫu nhiên giữa 2 nước tốt nhất (50/50)
+                # Sau nước 8: 75% nước tốt nhất, 25% nước thứ hai (nếu gap <= 250cp)
                 try:
-                    if move_num <= 8:
-                        legal_count = len(list(board.legal_moves))
-                        pv_count = min(10, legal_count)
-                        move_info = engine.analyse(board, chess.engine.Limit(nodes=4096), multipv=pv_count)
-                        if not isinstance(move_info, list):
-                            move_info = [move_info]
-                        best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-                        valid_candidates = []
-                        for line in move_info:
-                            if not line.get("pv"):
-                                continue
-                            cand_m = line["pv"][0]
-                            cand_cp = line["score"].relative.score(mate_score=10000) or 0
-                            eval_gap = abs(best_cp - cand_cp)
-                            # Điều kiện: Chênh lệch so với nước tốt nhất <= 250cp VÀ |eval| <= 500cp
-                            if eval_gap <= 250 and abs(cand_cp) <= 500:
-                                valid_candidates.append(cand_m)
-                        if valid_candidates:
-                            move = random.choice(valid_candidates)
+                    move_info = engine.analyse(board, chess.engine.Limit(nodes=4096), multipv=2)
+                    if not isinstance(move_info, list):
+                        move_info = [move_info]
+                    best_m = move_info[0]["pv"][0]
+                    best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
+                    if len(move_info) >= 2 and move_info[1].get("pv"):
+                        sec_m = move_info[1]["pv"][0]
+                        sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
+                        eval_gap = abs(best_cp - sec_cp)
+                        if move_num <= 8:
+                            if eval_gap <= 250 and abs(sec_cp) <= 500:
+                                move = random.choice([best_m, sec_m])
+                            else:
+                                move = best_m
                         else:
-                            move = move_info[0]["pv"][0]
-                    else:
-                        move_info = engine.analyse(board, chess.engine.Limit(nodes=4096), multipv=2)
-                        if not isinstance(move_info, list):
-                            move_info = [move_info]
-                        best_m = move_info[0]["pv"][0]
-                        best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-                        if len(move_info) >= 2 and move_info[1].get("pv"):
-                            sec_m = move_info[1]["pv"][0]
-                            sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
-                            eval_gap = abs(best_cp - sec_cp)
                             if eval_gap <= 250 and random.random() < 0.25:
                                 move = sec_m
                             else:
                                 move = best_m
-                        else:
-                            move = best_m
+                    else:
+                        move = best_m
                 except Exception:
                     move = engine.play(board, chess.engine.Limit(nodes=4096)).move
 
