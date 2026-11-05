@@ -61,6 +61,13 @@ print("=== Packing data files into single JSONL ===")
 from huggingface_hub import HfApi
 
 hf_token = "{hf_token}"
+if not hf_token:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        hf_token = user_secrets.get_secret("HF_TOKEN")
+    except Exception:
+        pass
 files = glob.glob("data/*.json") + glob.glob("data/*.jsonl")
 print(f"Total raw files generated: {{len(files)}}")
 if files and hf_token:
@@ -103,6 +110,9 @@ if files and hf_token:
 
 def manage_5_kaggle_workers():
     print("=== Checking & Managing 5 Kaggle CPU Workers ===")
+    force = "--force" in sys.argv
+    if force:
+        print("  [Note] --force flag detected: Restarting all 5 workers with latest code")
     token = os.environ.get("KAGGLE_API_TOKEN") or "KGAT_b42d4a8ff82836dd870f04137475c469"
     os.environ["KAGGLE_API_TOKEN"] = token
 
@@ -117,15 +127,16 @@ def manage_5_kaggle_workers():
         print(f"\n[Worker {worker_num}] Checking {kernel_ref}...")
 
         is_running = False
-        try:
-            status_obj = api.kernels_status(kernel_ref)
-            cur_status = status_obj.get("status", "").upper() if isinstance(status_obj, dict) else str(status_obj).upper()
-            print(f"  Current status: {cur_status}")
-            if "RUNNING" in cur_status or "QUEUED" in cur_status:
-                print(f"  Worker {worker_num} is actively running ({cur_status}). No action needed.")
-                is_running = True
-        except Exception as e:
-            print(f"  Status check: {e} (Will create/push fresh kernel)")
+        if not force:
+            try:
+                status_obj = api.kernels_status(kernel_ref)
+                cur_status = status_obj.get("status", "").upper() if isinstance(status_obj, dict) else str(status_obj).upper()
+                print(f"  Current status: {cur_status}")
+                if "RUNNING" in cur_status or "QUEUED" in cur_status:
+                    print(f"  Worker {worker_num} is actively running ({cur_status}). No action needed.")
+                    is_running = True
+            except Exception as e:
+                print(f"  Status check: {e} (Will create/push fresh kernel)")
 
         if not is_running:
             print(f"  Pushing fresh Kaggle kernel for Worker {worker_num}...")
