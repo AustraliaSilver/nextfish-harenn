@@ -69,11 +69,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    HAS_XLA = True
-except ImportError:
-    HAS_XLA = False
+    import torch_tpu  # noqa: F401
+except Exception:
+    pass
+
+HAS_NATIVE_TPU = hasattr(torch, "tpu")
+
+HAS_XLA = False
+if not HAS_NATIVE_TPU:
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        HAS_XLA = True
+    except Exception:
+        HAS_XLA = False
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -616,7 +625,7 @@ class FastHKV3BatchLoader:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.device = device
-        self.is_xla = (self.device.type == "xla")
+        self.is_xla = (self.device.type in ("tpu", "xla"))
         self.pin_memory = (self.device.type == "cuda")
         self.static_shape = self.is_xla if static_shape is None else static_shape
 
@@ -714,10 +723,10 @@ class FastHKV3BatchLoader:
 def _bag_sum(emb: nn.EmbeddingBag, idx: torch.Tensor) -> torch.Tensor:
     """
     Thực thi phép cộng nhúng thưa (EmbeddingBag mode='sum'):
-      - Trên TPU/XLA: Hạ trực tiếp xuống F.embedding(...).sum(dim=1) (native XLA Gather + ReduceSum trên HBM2e 819 GB/s).
+      - Trên TPU (native 'tpu' hoặc 'xla'): Hạ trực tiếp xuống F.embedding(...).sum(dim=1) (native Gather + ReduceSum trên HBM2e 819 GB/s).
       - Trên CUDA/CPU: Gọi kernel C++/CUDA nn.EmbeddingBag nguyên bản.
     """
-    if idx.device.type == "xla":
+    if idx.device.type in ("tpu", "xla"):
         return F.embedding(idx, emb.weight, padding_idx=emb.padding_idx).sum(dim=1)
     return emb(idx)
 
@@ -1494,10 +1503,19 @@ def _to_cpu_recursive(obj):
     return obj
 
 
+def tpu_mark_step():
+    """Kích hoạt thực thi bước tính toán bất đồng bộ trên TPU (hỗ trợ cả torch_tpu native và torch_xla)."""
+    if HAS_NATIVE_TPU and hasattr(torch, "tpu"):
+        if hasattr(torch.tpu, "mark_step"):
+            torch.tpu.mark_step()
+    elif HAS_XLA:
+        xm.mark_step()
+
+
 def save_portable_checkpoint(data: dict, path: Path, is_tpu: bool = False):
     """Lưu checkpoint .pt tương thích 100% giữa TPU v5e-1, GPU CUDA và CPU."""
-    if is_tpu and HAS_XLA:
-        xm.mark_step()
+    if is_tpu:
+        tpu_mark_step()
     torch.save(_to_cpu_recursive(data), path)
 
 
@@ -1505,8 +1523,11 @@ def get_autocast_ctx(device_type: str, enabled: bool):
     """Ngữ cảnh Mixed Precision: Native bfloat16 trên TPU v5e-1 (MXU) và float16 trên GPU CUDA (Tensor Cores)."""
     if not enabled:
         return contextlib.nullcontext()
-    if device_type == "xla":
-        return torch.autocast("xla", dtype=torch.bfloat16, enabled=True)
+    if device_type in ("tpu", "xla"):
+        try:
+            return torch.autocast(device_type, dtype=torch.bfloat16, enabled=True)
+        except Exception:
+            return contextlib.nullcontext()
     if device_type == "cuda":
         return torch.amp.autocast("cuda", dtype=torch.float16, enabled=True)
     return contextlib.nullcontext()
@@ -1523,8 +1544,8 @@ def step_optimizer(
 ):
     """
     Thực hiện backward + gradient clipping + optimizer step + weight clamping:
-      - Trên TPU v5e-1 (XLA bfloat16): Không cần GradScaler (tránh đồng bộ found_inf.item() mỗi step!),
-        gọi xm.mark_step() ngay cuối bước để kích hoạt thực thi bất đồng bộ đồ thị HLO trên MXU.
+      - Trên TPU v5e-1 (Native torch_tpu / XLA bfloat16): Không cần GradScaler (tránh đồng bộ found_inf.item() mỗi step!),
+        gọi tpu_mark_step() ngay cuối bước để kích hoạt thực thi bất đồng bộ đồ thị HLO trên MXU.
       - Trên CUDA (FP16): Sử dụng GradScaler tiêu chuẩn.
     """
     if is_tpu:
@@ -1534,8 +1555,7 @@ def step_optimizer(
         optimizer.step()
         if base_model is not None:
             base_model.clamp_quantizable_weights()
-        if HAS_XLA:
-            xm.mark_step()
+        tpu_mark_step()
     else:
         scaler.scale(loss).backward()
         if clip_params is not None and max_norm is not None:
@@ -1566,7 +1586,7 @@ def main():
     parser.add_argument("--symmetry", type=int, default=1, choices=[1, 2], help="Chế độ đối xứng lật màu dọc (mặc định: 1x do kiến trúc đã đối xứng đại số tuyệt đối)")
     parser.add_argument("--feature-dropout", type=float, default=0.0, help="Tỷ lệ dropout chỉ riêng trên bảng W_full ở Stage 1 (mặc định: 0.0 - tắt hoàn toàn)")
     parser.add_argument("--val-split", type=float, default=0.03, help="Tỷ lệ tập validation")
-    parser.add_argument("--tpu", action="store_true", help="Bắt buộc sử dụng thiết bị Google Cloud / Colab TPU (torch_xla)")
+    parser.add_argument("--tpu", action="store_true", help="Bắt buộc sử dụng thiết bị Google Cloud / Colab TPU (torch_tpu hoặc torch_xla)")
     parser.add_argument("--no-qat", action="store_true", help="Tắt Quantization-Aware Training")
     parser.add_argument("--no-amp", action="store_true", help="Tắt Mixed Precision (BF16 trên TPU / FP16 trên GPU)")
     parser.add_argument("--resume", type=str, default="", help="Đường dẫn checkpoint (.pt) hoặc file nhị phân (.harenn) để tiếp tục train")
@@ -1583,23 +1603,34 @@ def main():
     random.seed(42)
 
     is_tpu = False
-    if args.tpu or (HAS_XLA and not torch.cuda.is_available()):
-        if not HAS_XLA:
-            raise RuntimeError("Cờ --tpu được bật nhưng chưa cài đặt thư viện torch_xla!")
-        os.environ.setdefault("PJRT_DEVICE", "TPU")
-        try:
-            device = xm.xla_device()
-            is_tpu = True
-        except Exception as e:
+    if args.tpu or HAS_NATIVE_TPU or (HAS_XLA and not torch.cuda.is_available()):
+        if HAS_NATIVE_TPU:
+            try:
+                device = torch.device("tpu")
+                _ = torch.zeros(1, device=device)
+                is_tpu = True
+            except Exception as e:
+                if args.tpu and not HAS_XLA:
+                    raise RuntimeError(f"Không thể khởi tạo thiết bị Native TPU (torch_tpu): {e}") from e
+        if not is_tpu and HAS_XLA:
+            os.environ.setdefault("PJRT_DEVICE", "TPU")
+            try:
+                device = xm.xla_device()
+                is_tpu = True
+            except Exception as e:
+                if args.tpu:
+                    raise RuntimeError(f"Không thể khởi tạo thiết bị TPU (torch_xla): {e}") from e
+                device = torch.device("cpu")
+        if not is_tpu:
             if args.tpu:
-                raise RuntimeError(f"Không thể khởi tạo thiết bị TPU (torch_xla): {e}") from e
-            device = torch.device("cpu")
+                raise RuntimeError("Cờ --tpu được bật nhưng không tìm thấy torch_tpu hoặc torch_xla khả dụng!")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
     use_amp = (is_tpu or device.type == "cuda") and (not args.no_amp)
-    dev_type = "xla" if is_tpu else device.type
+    dev_type = device.type
 
     print("=" * 76)
     print("  HALFKPV3 (HKV3) + HARENN TRAINING PIPELINE (SINGLE BIG NET ~88.85 MB)")
@@ -1768,8 +1799,8 @@ def main():
                 for k in metric_keys:
                     totals_t[k] = totals_t[k] + m[k]
                 steps += 1
-                if is_tpu and HAS_XLA:
-                    xm.mark_step()
+                if is_tpu:
+                    tpu_mark_step()
         denom = float(max(1, steps))
         return {k: float(totals_t[k].item()) / denom for k in metric_keys}
 
