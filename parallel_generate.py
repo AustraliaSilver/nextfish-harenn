@@ -114,58 +114,33 @@ class ParallelGenerator:
 
 
 
-    def move_to_label(self, board, move):
-
+    @staticmethod
+    def move_to_label(board, move):
         if not move or move == chess.Move.null(): return 0
-
-        from_sq = move.from_square
-
-        to_sq = move.to_square
-
-        piece = board.piece_at(from_sq)
-
+        piece = board.piece_at(move.from_square)
         if piece is None: return 0
-
-        fen_sq = to_sq ^ 56
-
-        piece_map = {chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5}
-
-        p_idx = piece_map[piece.piece_type]
-
-        if piece.color == chess.BLACK: p_idx += 6
-
-        return min(fen_sq * 12 + p_idx, 767)
+        p_idx = piece.piece_type - 1 + (6 if piece.color == chess.BLACK else 0)
+        return min((move.to_square ^ 56) * 12 + p_idx, 767)
 
 
 
     def count_material(self, board):
-
-        vals = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
-
-        total = 0
-
-        for pt, val in vals.items():
-
-            total += len(board.pieces(pt, chess.WHITE)) * val
-
-            total -= len(board.pieces(pt, chess.BLACK)) * val
-
-        return total
-
-
+        w = board.occupied_co[chess.WHITE]
+        b = board.occupied_co[chess.BLACK]
+        return (
+            (chess.popcount(w & board.pawns) - chess.popcount(b & board.pawns)) * 1 +
+            (chess.popcount(w & board.knights) - chess.popcount(b & board.knights)) * 3 +
+            (chess.popcount(w & board.bishops) - chess.popcount(b & board.bishops)) * 3 +
+            (chess.popcount(w & board.rooks) - chess.popcount(b & board.rooks)) * 5 +
+            (chess.popcount(w & board.queens) - chess.popcount(b & board.queens)) * 9
+        )
 
     def calculate_rs(self, board, eval_score):
-
-        piece_count = len(board.piece_map())
-
+        piece_count = chess.popcount(board.occupied)
         if piece_count < 10: return 1.0
-
         if piece_count < 16: return 0.7
-
         if not board.is_check() and abs(eval_score) < 30:
-
             return min(0.8, 0.4 + (30 - abs(eval_score)) / 100.0)
-
         return 0.1
 
 
@@ -257,8 +232,6 @@ class ParallelGenerator:
             l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
             m_sec_uci = [sec_deep.uci()] if sec_deep else m_deep_uci
             l_sec_lbl = [self.move_to_label(board, sec_deep)] if sec_deep else l_deep_lbl
-            m_shallow_uci = [m_shallow.uci()] if m_shallow else m_deep_uci
-            l_shallow_lbl = [self.move_to_label(board, m_shallow)] if m_shallow else l_deep_lbl
 
             achieved_depth = int(res_deep[0].get("depth", 20))
 
@@ -301,7 +274,7 @@ class ParallelGenerator:
                 # Giai đoạn mở cờ nhanh (nước 1-6):
                 # MultiPV=5 ở nodes_shallow: siêu nhanh (~2ms), có sẵn top 5 nước hợp lệ an toàn
                 try:
-                    move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, len(list(board.legal_moves))))
+                    move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, board.legal_moves.count()))
                     if not isinstance(move_info, list):
                         move_info = [move_info]
 
@@ -339,19 +312,29 @@ class ParallelGenerator:
                     break
 
                 chosen_best = data["m24"][0] if data["m24"] else "0000"
-                chosen_best_obj = data["best_m"]
-                pos = TrainingPosition(
-                    fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
-                    eval_score=data["cp"], depth=data.get("depth", 20),
-                    best_move=chosen_best,
-                    best_move_label=self.move_to_label(board, chosen_best_obj) if chosen_best_obj else 0,
-                    best_moves_d16=data["m16"], best_moves_d20=data["m20"], best_moves_d24=data["m24"],
-                    best_move_labels_d16=data["l16"], best_move_labels_d20=data["l20"], best_move_labels_d24=data["l24"],
-                    game_result=1, wdl=0.5,
-                    material=self.count_material(board), piece_count=len(board.piece_map()),
-                    tau=data["tau"], rho=data["rho"], rs=data["rs"]
-                )
-                game_positions.append(asdict(pos))
+                chosen_best_lbl = data["l24"][0] if data["l24"] else 0
+                pos = {
+                    "fen": board.fen(),
+                    "stm": 0 if board.turn == chess.WHITE else 1,
+                    "eval_score": data["cp"],
+                    "depth": data.get("depth", 20),
+                    "best_move": chosen_best,
+                    "best_move_label": chosen_best_lbl,
+                    "best_moves_d16": data["m16"],
+                    "best_moves_d20": data["m20"],
+                    "best_moves_d24": data["m24"],
+                    "best_move_labels_d16": data["l16"],
+                    "best_move_labels_d20": data["l20"],
+                    "best_move_labels_d24": data["l24"],
+                    "game_result": 1,
+                    "wdl": 0.5,
+                    "material": self.count_material(board),
+                    "piece_count": chess.popcount(board.occupied),
+                    "tau": data["tau"],
+                    "rho": data["rho"],
+                    "rs": data["rs"]
+                }
+                game_positions.append(pos)
 
                 best_m = data["best_m"]
                 sec_m = data["sec_m"]
@@ -386,6 +369,16 @@ class ParallelGenerator:
             or board.is_seventyfive_moves()
         ):
             white_outcome = 0.5
+        elif game_positions:
+            # Tái sử dụng điểm đánh giá 16k nodes của nước đi cuối cùng (tránh search lặp lại)
+            last_p = game_positions[-1]
+            last_white_cp = last_p["eval_score"] if last_p["stm"] == 0 else -last_p["eval_score"]
+            if last_white_cp >= 200:
+                white_outcome = 1.0
+            elif last_white_cp <= -200:
+                white_outcome = 0.0
+            else:
+                white_outcome = 0.5
         else:
             try:
                 final_info = engine.analyse(board, chess.engine.Limit(nodes=4096))
@@ -409,6 +402,14 @@ class ParallelGenerator:
         return game_positions, outcome_str
 
     def worker_loop(self, proc_idx, max_games_per_proc, shared_pos):
+        # Ghim chặt worker vào CPU core riêng biệt trên Linux/Cloud runner
+        try:
+            if hasattr(os, "sched_setaffinity") and hasattr(os, "cpu_count"):
+                cpu_total = os.cpu_count() or 4
+                os.sched_setaffinity(0, {proc_idx % cpu_total})
+        except Exception:
+            pass
+
         ts = time.strftime("%Y%m%d_%H%M%S")
         worker_tag = f"w{self.worker_id}_" if self.worker_id else ""
         jsonl_filename = f"hnn_{worker_tag}p{proc_idx}_{ts}.jsonl"
