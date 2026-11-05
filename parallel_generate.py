@@ -183,13 +183,17 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
-            # Call 1: Shallow search (nodes_shallow = 1024) for horizon check & fast intuition
+            # 1. Shallow tier: nodes_shallow = 1024 (Horizon anchor)
             res_shallow = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow))
             m_shallow = res_shallow.get("pv", [None])[0]
             cp_shallow = res_shallow["score"].relative.score(mate_score=10000) or 0
 
-            # Call 2: Deep MultiPV=2 search at full nodes (16,384 nodes!)
-            # Gives exact GM ground-truth eval, best move, and 2nd best move
+            # 2. Mid tier: nodes_mid = 4096 (Bridge anchor)
+            res_mid = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_mid))
+            m_mid = res_mid.get("pv", [None])[0]
+            cp_mid = res_mid["score"].relative.score(mate_score=10000) or 0
+
+            # 3. Deep tier: nodes = 16384 (MultiPV=2, Exact GM Ground-truth + Move Selection)
             res_deep = engine.analyse(board, chess.engine.Limit(nodes=self.nodes), multipv=2)
             if not isinstance(res_deep, list):
                 res_deep = [res_deep]
@@ -205,14 +209,26 @@ class ParallelGenerator:
                 m_second = None
                 cp_second = cp_deep
 
-            # 1. RHO (Horizon Risk): eval swing between shallow intuition and deep calculation
-            eval_swing = abs(cp_shallow - cp_deep)
-            rho = min(eval_swing / 200.0, 1.0)
+            # 1. RHO (Horizon Risk): Khôi phục 100% công thức gốc max(|1k-4k|, |4k-16k|) / 200 (Zero Drift)
+            swing_shallow_mid = abs(cp_shallow - cp_mid)
+            swing_mid_deep = abs(cp_mid - cp_deep)
+            max_swing = max(swing_shallow_mid, swing_mid_deep)
+            rho = min(max_swing / 200.0, 1.0)
 
-            # 2. TAU (Tactical Complexity): Did best move flip between shallow and deep?
-            tau = 1.0 if (m_shallow is not None and m_deep is not None and m_shallow != m_deep) else 0.0
+            # 2. TAU (Tactical Complexity): Khôi phục 100% 3 mức chuẩn {0.0, 0.5, 1.0} trên 2 bước nhảy
+            transitions = 0
+            changes = 0
+            if m_shallow is not None and m_mid is not None:
+                transitions += 1
+                if m_shallow != m_mid:
+                    changes += 1
+            if m_mid is not None and m_deep is not None:
+                transitions += 1
+                if m_mid != m_deep:
+                    changes += 1
+            tau = (changes / transitions) if transitions > 0 else 0.0
 
-            # Bonus for unclear positions and checks
+            # Bonus cho thế cờ chưa rõ ràng và chiếu vua (chuẩn gốc)
             if abs(cp) < 30:
                 rho = min(rho + 0.15, 1.0)
                 tau = min(tau + 0.15, 1.0)
@@ -223,9 +239,22 @@ class ParallelGenerator:
                 rho = min(rho + 0.10, 1.0)
                 tau = min(tau + 0.10, 1.0)
 
-            # 3. RS (Confidence Score / Resolution)
-            s_stability = max(0.0, 1.0 - (eval_swing / 150.0))
-            s_agreement = 1.0 if (m_shallow == m_deep) else 0.40
+            # 3. RS (Confidence Score): Khôi phục 100% 4 phân bậc agreement {1.0, 0.75, 0.50, 0.25}
+            max_eval_dev = max(abs(cp_shallow - cp_mid), abs(cp_mid - cp_deep), abs(cp_shallow - cp_deep))
+            s_stability = max(0.0, 1.0 - (max_eval_dev / 150.0))
+
+            if m_shallow is not None and m_mid is not None and m_deep is not None:
+                if m_shallow == m_mid == m_deep:
+                    s_agreement = 1.0
+                elif m_mid == m_deep:
+                    s_agreement = 0.75
+                elif m_shallow == m_deep:
+                    s_agreement = 0.50
+                else:
+                    s_agreement = 0.25
+            else:
+                s_agreement = 0.50
+
             margin = max(0, cp_deep - cp_second)
             s_margin = min(1.0, margin / 80.0) if m_second else 0.50
 
@@ -236,6 +265,8 @@ class ParallelGenerator:
             l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
             m_sec_uci = [m_second.uci()] if m_second else m_deep_uci
             l_sec_lbl = [self.move_to_label(board, m_second)] if m_second else l_deep_lbl
+            m_mid_uci = [m_mid.uci()] if m_mid else m_deep_uci
+            l_mid_lbl = [self.move_to_label(board, m_mid)] if m_mid else l_deep_lbl
 
             achieved_depth = int(res_deep[0].get("depth", 20))
 
@@ -248,10 +279,10 @@ class ParallelGenerator:
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
-                "m16": m_sec_uci,
-                "l16": l_sec_lbl,
-                "m20": m_deep_uci,
-                "l20": l_deep_lbl,
+                "m16": m_mid_uci,
+                "l16": l_mid_lbl,
+                "m20": m_sec_uci,
+                "l20": l_sec_lbl,
                 "m24": m_deep_uci,
                 "l24": l_deep_lbl,
             }
@@ -287,35 +318,47 @@ class ParallelGenerator:
                     break
 
                 if move_num <= 6:
-                    # Giai đoạn mở cờ nhanh (nước 1-6): chọn nước hợp lệ chất lượng cao
+                    # Giai đoạn mở cờ nhanh (nước 1-6):
+                    # MultiPV=5 ở nodes_shallow: vừa siêu nhanh (~2ms), vừa có sẵn top 5 nước hợp lệ an toàn
                     try:
-                        move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=2)
+                        move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, len(list(board.legal_moves))))
                         if not isinstance(move_info, list):
                             move_info = [move_info]
+
                         best_m = move_info[0]["pv"][0]
                         best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-                        if len(move_info) >= 2 and move_info[1].get("pv"):
-                            sec_m = move_info[1]["pv"][0]
-                            sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
-                            eval_gap = abs(best_cp - sec_cp)
-                            if eval_gap <= 250 and abs(sec_cp) <= 500:
-                                move = random.choice([best_m, sec_m])
+
+                        # 8% chọn một nước hợp lệ KHÔNG THUA NGAY (eval >= -250 cp) để chống trùng FEN 100%
+                        if random.random() < 0.08:
+                            safe_cands = [
+                                line["pv"][0] for line in move_info
+                                if line.get("pv") and (line["score"].relative.score(mate_score=10000) or 0) >= -250
+                            ]
+                            move = random.choice(safe_cands) if safe_cands else best_m
+                        else:
+                            # 92% còn lại: Chọn giữa 2 nước tốt nhất (50/50 nếu gap <= 250cp và |sec_cp| <= 500cp)
+                            if len(move_info) >= 2 and move_info[1].get("pv"):
+                                sec_m = move_info[1]["pv"][0]
+                                sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
+                                eval_gap = abs(best_cp - sec_cp)
+                                if eval_gap <= 250 and abs(sec_cp) <= 500:
+                                    move = random.choice([best_m, sec_m])
+                                else:
+                                    move = best_m
                             else:
                                 move = best_m
-                        else:
-                            move = best_m
                     except Exception:
                         move = engine.play(board, chess.engine.Limit(nodes=self.nodes_shallow)).move
 
                     board.push(move)
                 else:
                     # Giai đoạn thu thập dữ liệu (nước > 6):
-                    # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn lẫn đi cờ ở 16,384 nodes!
+                    # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn chuẩn 3 tầng lẫn đi cờ ở 16,384 nodes!
                     data = self.analyze_full(board, engine)
                     if not data or not data["best_m"]:
                         break
 
-                    chosen_best = data["m20"][0] if data["m20"] else "0000"
+                    chosen_best = data["m24"][0] if data["m24"] else "0000"
                     chosen_best_obj = data["best_m"]
                     pos = TrainingPosition(
                         fen=board.fen(), stm=0 if board.turn == chess.WHITE else 1,
