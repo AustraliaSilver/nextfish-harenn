@@ -1591,7 +1591,12 @@ def save_portable_checkpoint(data: dict, path: Path, is_tpu: bool = False, is_ma
 
 
 def get_autocast_ctx(device_type: str, enabled: bool):
-    """Ngữ cảnh Mixed Precision: Native bfloat16 trên TPU v5e (MXU) / Ampere+ GPU và float16 trên GPU T4x2."""
+    """
+    Ngữ cảnh Mixed Precision tối ưu phần cứng:
+      - TPU v5e (MXU): Native bfloat16.
+      - GPU Ampere/Hopper (A100, H100, RTX 3090/4090): Native bfloat16.
+      - GPU Turing (Tesla T4): Native float16 (T4 không có phần cứng BF16, chạy BF16 sẽ bị giả lập chậm gấp 4 lần!).
+    """
     if not enabled:
         return contextlib.nullcontext()
     if device_type in ("tpu", "xla"):
@@ -1600,7 +1605,9 @@ def get_autocast_ctx(device_type: str, enabled: bool):
         except Exception:
             return contextlib.nullcontext()
     if device_type == "cuda":
-        amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+        # Kiểm tra Compute Capability: >= 8.0 (Ampere+) mới dùng BF16, còn < 8.0 (Tesla T4 là 7.5) bắt buộc dùng FP16!
+        cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+        amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
         return torch.amp.autocast("cuda", dtype=amp_dtype, enabled=True)
     return contextlib.nullcontext()
 
@@ -1806,7 +1813,8 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
             print("  Tối ưu hóa TPU:          Static Batch Graph + Zero .item() Sync + Native Gather-Sum + Native Huber")
         elif num_gpus > 0:
             gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
-            amp_str = "BF16" if torch.cuda.is_bf16_supported() else "FP16"
+            cap = torch.cuda.get_device_capability(0)
+            amp_str = "BF16" if cap[0] >= 8 else "FP16 (Tensor Cores)"
             print(f"  Thiết bị GPU:            {num_gpus}x GPU ({', '.join(gpu_names)}) | AMP {amp_str}: {'ON' if use_amp else 'OFF'}")
         else:
             print("  Thiết bị:                CPU")
