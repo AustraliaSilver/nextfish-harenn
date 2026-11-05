@@ -468,12 +468,12 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
         print(f"[Cache] Đang nạp cache nhị phân HKV3 từ {cpath}...", flush=True)
         try:
             data = np.load(str(cpath), allow_pickle=False)
-            us_indices = data["us_indices"]
-            them_indices = data["them_indices"]
-            labels_eval = data["labels_eval"]
-            labels_tau = data["labels_tau"]
-            labels_rho = data["labels_rho"]
-            labels_rs = data["labels_rs"]
+            us_indices = data["us"] if "us" in data else data["us_indices"]
+            them_indices = data["them"] if "them" in data else data["them_indices"]
+            labels_eval = data["eval"] if "eval" in data else data["labels_eval"]
+            labels_tau = data["tau"] if "tau" in data else data["labels_tau"]
+            labels_rho = data["rho"] if "rho" in data else data["labels_rho"]
+            labels_rs = data["rs"] if "rs" in data else data["labels_rs"]
 
             # Tự động phát hiện và chuẩn hóa nếu file cache được sinh ở không gian 64-King cũ
             max_feat = max(int(us_indices.max()), int(them_indices.max()))
