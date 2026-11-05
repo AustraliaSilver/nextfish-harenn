@@ -183,52 +183,39 @@ class ParallelGenerator:
 
     def analyze_full(self, board, engine):
         try:
-            # 1. Shallow tier: nodes_shallow = 1024 (Horizon anchor)
-            res_shallow = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow))
-            m_shallow = res_shallow.get("pv", [None])[0]
-            cp_shallow = res_shallow["score"].relative.score(mate_score=10000) or 0
+            # 1. Shallow tier: nodes_shallow = 1024 (MultiPV=2: m_shallow & sec_shallow)
+            res_shallow = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=2)
+            if not isinstance(res_shallow, list):
+                res_shallow = [res_shallow]
 
-            # 2. Mid tier: nodes_mid = 4096 (Bridge anchor)
-            res_mid = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_mid))
-            m_mid = res_mid.get("pv", [None])[0]
-            cp_mid = res_mid["score"].relative.score(mate_score=10000) or 0
+            m_shallow = res_shallow[0].get("pv", [None])[0]
+            sec_shallow = res_shallow[1].get("pv", [None])[0] if len(res_shallow) >= 2 and res_shallow[1].get("pv") else None
+            cp_shallow = res_shallow[0]["score"].relative.score(mate_score=10000) or 0
 
-            # 3. Deep tier: nodes = 16384 (MultiPV=2, Exact GM Ground-truth + Move Selection)
+            # 2. Deep tier: nodes = 16384 (MultiPV=2: m_deep & sec_deep, GM Ground-truth + Move Selection)
             res_deep = engine.analyse(board, chess.engine.Limit(nodes=self.nodes), multipv=2)
             if not isinstance(res_deep, list):
                 res_deep = [res_deep]
 
             m_deep = res_deep[0].get("pv", [None])[0]
+            sec_deep = res_deep[1].get("pv", [None])[0] if len(res_deep) >= 2 and res_deep[1].get("pv") else None
             cp_deep = res_deep[0]["score"].relative.score(mate_score=10000) or 0
             cp = cp_deep
+            cp_second = res_deep[1]["score"].relative.score(mate_score=10000) or 0 if sec_deep else cp_deep
 
-            if len(res_deep) >= 2 and res_deep[1].get("pv"):
-                m_second = res_deep[1]["pv"][0]
-                cp_second = res_deep[1]["score"].relative.score(mate_score=10000) or 0
-            else:
-                m_second = None
-                cp_second = cp_deep
+            # 1. RHO (Horizon Risk): |1k - 16k| / 200 (True horizon definition between intuition and deep calculation)
+            eval_swing = abs(cp_shallow - cp_deep)
+            rho = min(eval_swing / 200.0, 1.0)
 
-            # 1. RHO (Horizon Risk): Khôi phục 100% công thức gốc max(|1k-4k|, |4k-16k|) / 200 (Zero Drift)
-            swing_shallow_mid = abs(cp_shallow - cp_mid)
-            swing_mid_deep = abs(cp_mid - cp_deep)
-            max_swing = max(swing_shallow_mid, swing_mid_deep)
-            rho = min(max_swing / 200.0, 1.0)
+            # 2. TAU (Tactical Complexity): 3 levels {0.0, 0.5, 1.0} comparing both best and second-best move pairs
+            tau_score = 0.0
+            if m_shallow != m_deep:
+                tau_score += 0.5
+            if sec_shallow is not None and sec_deep is not None and sec_shallow != sec_deep:
+                tau_score += 0.5
+            tau = tau_score
 
-            # 2. TAU (Tactical Complexity): Khôi phục 100% 3 mức chuẩn {0.0, 0.5, 1.0} trên 2 bước nhảy
-            transitions = 0
-            changes = 0
-            if m_shallow is not None and m_mid is not None:
-                transitions += 1
-                if m_shallow != m_mid:
-                    changes += 1
-            if m_mid is not None and m_deep is not None:
-                transitions += 1
-                if m_mid != m_deep:
-                    changes += 1
-            tau = (changes / transitions) if transitions > 0 else 0.0
-
-            # Bonus cho thế cờ chưa rõ ràng và chiếu vua (chuẩn gốc)
+            # Tactical bonuses for unclear positions and checks
             if abs(cp) < 30:
                 rho = min(rho + 0.15, 1.0)
                 tau = min(tau + 0.15, 1.0)
@@ -239,34 +226,32 @@ class ParallelGenerator:
                 rho = min(rho + 0.10, 1.0)
                 tau = min(tau + 0.10, 1.0)
 
-            # 3. RS (Confidence Score): Khôi phục 100% 4 phân bậc agreement {1.0, 0.75, 0.50, 0.25}
-            max_eval_dev = max(abs(cp_shallow - cp_mid), abs(cp_mid - cp_deep), abs(cp_shallow - cp_deep))
-            s_stability = max(0.0, 1.0 - (max_eval_dev / 150.0))
+            # 3. RS (Confidence Score): 4 levels agreement {1.0, 0.75, 0.50, 0.25}
+            best_same = (m_shallow == m_deep)
+            sec_same = (sec_shallow is not None and sec_deep is not None and sec_shallow == sec_deep)
 
-            if m_shallow is not None and m_mid is not None and m_deep is not None:
-                if m_shallow == m_mid == m_deep:
-                    s_agreement = 1.0
-                elif m_mid == m_deep:
-                    s_agreement = 0.75
-                elif m_shallow == m_deep:
-                    s_agreement = 0.50
-                else:
-                    s_agreement = 0.25
-            else:
+            if best_same and sec_same:
+                s_agreement = 1.0
+            elif best_same:
+                s_agreement = 0.75
+            elif sec_same:
                 s_agreement = 0.50
+            else:
+                s_agreement = 0.25
 
+            s_stability = max(0.0, 1.0 - (eval_swing / 150.0))
             margin = max(0, cp_deep - cp_second)
-            s_margin = min(1.0, margin / 80.0) if m_second else 0.50
+            s_margin = min(1.0, margin / 80.0) if sec_deep else 0.50
 
             rs = 0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin
             rs = max(0.05, min(0.99, rs))
 
             m_deep_uci = [m_deep.uci()] if m_deep else []
             l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
-            m_sec_uci = [m_second.uci()] if m_second else m_deep_uci
-            l_sec_lbl = [self.move_to_label(board, m_second)] if m_second else l_deep_lbl
-            m_mid_uci = [m_mid.uci()] if m_mid else m_deep_uci
-            l_mid_lbl = [self.move_to_label(board, m_mid)] if m_mid else l_deep_lbl
+            m_sec_uci = [sec_deep.uci()] if sec_deep else m_deep_uci
+            l_sec_lbl = [self.move_to_label(board, sec_deep)] if sec_deep else l_deep_lbl
+            m_shallow_uci = [m_shallow.uci()] if m_shallow else m_deep_uci
+            l_shallow_lbl = [self.move_to_label(board, m_shallow)] if m_shallow else l_deep_lbl
 
             achieved_depth = int(res_deep[0].get("depth", 20))
 
@@ -274,15 +259,15 @@ class ParallelGenerator:
                 "cp": cp,
                 "depth": achieved_depth,
                 "best_m": m_deep,
-                "sec_m": m_second,
+                "sec_m": sec_deep,
                 "cp_second": cp_second,
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
-                "m16": m_mid_uci,
-                "l16": l_mid_lbl,
-                "m20": m_sec_uci,
-                "l20": l_sec_lbl,
+                "m16": m_sec_uci,
+                "l16": l_sec_lbl,
+                "m20": m_deep_uci,
+                "l20": l_deep_lbl,
                 "m24": m_deep_uci,
                 "l24": l_deep_lbl,
             }
