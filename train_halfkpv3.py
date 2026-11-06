@@ -1682,7 +1682,7 @@ def main():
     parser.add_argument("--data", type=str, default="Neuron Network/data", help="Thư mục chứa các file .jsonl/.json")
     parser.add_argument("--cache", type=str, default="", help="Đường dẫn file cache .npz (tùy chọn)")
     parser.add_argument("--sync-hf", action="store_true", help="Tự động tải toàn bộ .jsonl từ Hugging Face Bucket trước khi train")
-    parser.add_argument("--hf-bucket", type=str, default="australia1/myrandombucket", help="ID của Hugging Face Bucket")
+    parser.add_argument("--hf-bucket", type=str, default="australia1/harenn-high-quality-data", help="ID của Hugging Face Bucket")
     parser.add_argument("--epochs", type=int, default=16, help="Số epoch huấn luyện đa nhiệm Giai đoạn 1")
     parser.add_argument("--finetune-eval-epochs", type=int, default=4, help="Số epoch tinh chỉnh chuyên sâu Eval ở Giai đoạn 2")
     parser.add_argument("--batch-size", type=int, default=0, help="Kích thước batch (0 = Tự động theo phần cứng: 16384 cho T4x2, 32768 cho v5e-1, 65536 cho v5e-8)")

@@ -118,7 +118,7 @@ jobs:
 
           # Upload single packed file to Hugging Face Bucket
           api = HfApi(token=token)
-          bucket_id = "australia1/myrandombucket"
+          bucket_id = "australia1/harenn-high-quality-data"
           print(f"Uploading {packed_filename} to bucket '{bucket_id}'...")
           t0 = time.time()
           api.batch_bucket_files(bucket_id, add=[(packed_path, packed_filename)])

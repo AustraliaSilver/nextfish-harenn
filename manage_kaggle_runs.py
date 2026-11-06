@@ -102,7 +102,7 @@ if files and hf_token:
     size_mb = os.path.getsize(packed_path) / (1024 * 1024)
     print(f"Packed {{total_positions:,}} positions into {{packed_filename}} ({{size_mb:.2f}} MB)")
     api = HfApi(token=hf_token)
-    bucket_id = "australia1/myrandombucket"
+    bucket_id = "australia1/harenn-high-quality-data"
     print(f"Uploading {{packed_filename}} to Hugging Face {{bucket_id}}...")
     api.batch_bucket_files(bucket_id, add=[(packed_path, packed_filename)])
     print("Upload completed successfully!")

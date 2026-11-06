@@ -122,6 +122,51 @@ class ParallelGenerator:
         p_idx = piece.piece_type - 1 + (6 if piece.color == chess.BLACK else 0)
         return min((move.to_square ^ 56) * 12 + p_idx, 767)
 
+    @staticmethod
+    def generate_frc_rank():
+        squares = [None] * 8
+        # 1. Hai Tượng khác màu ô
+        b1 = random.choice([0, 2, 4, 6])
+        b2 = random.choice([1, 3, 5, 7])
+        squares[b1] = chess.BISHOP
+        squares[b2] = chess.BISHOP
+        # 2. Đặt Hậu vào 1 ô trống ngẫu nhiên
+        empty = [i for i in range(8) if squares[i] is None]
+        squares[random.choice(empty)] = chess.QUEEN
+        # 3. Đặt 2 Mã vào 2 ô trống ngẫu nhiên
+        empty = [i for i in range(8) if squares[i] is None]
+        k1, k2 = random.sample(empty, 2)
+        squares[k1] = chess.KNIGHT
+        squares[k2] = chess.KNIGHT
+        # 4. Ba ô còn lại theo thứ tự: Xe, Vua, Xe (Vua luôn ở giữa 2 Xe để đảm bảo nhập thành hợp lệ)
+        empty = [i for i in range(8) if squares[i] is None]
+        squares[empty[0]] = chess.ROOK
+        squares[empty[1]] = chess.KING
+        squares[empty[2]] = chess.ROOK
+        return squares
+
+    @classmethod
+    def generate_dfrc_board(cls):
+        """Khởi tạo bàn cờ Double Fischer Random Chess (DFRC - 921,600 thế cờ khởi đầu độc lập)."""
+        white_rank = cls.generate_frc_rank()
+        black_rank = cls.generate_frc_rank()
+        board = chess.Board(None, chess960=True)
+        for f in range(8):
+            board.set_piece_at(chess.square(f, 0), chess.Piece(white_rank[f], chess.WHITE))
+            board.set_piece_at(chess.square(f, 1), chess.Piece(chess.PAWN, chess.WHITE))
+            board.set_piece_at(chess.square(f, 6), chess.Piece(chess.PAWN, chess.BLACK))
+            board.set_piece_at(chess.square(f, 7), chess.Piece(black_rank[f], chess.BLACK))
+        board.turn = chess.WHITE
+        w_rooks = [f for f in range(8) if white_rank[f] == chess.ROOK]
+        b_rooks = [f for f in range(8) if black_rank[f] == chess.ROOK]
+        castling_chars = []
+        for r in w_rooks:
+            castling_chars.append(chess.FILE_NAMES[r].upper())
+        for r in b_rooks:
+            castling_chars.append(chess.FILE_NAMES[r].lower())
+        board.set_castling_fen(''.join(castling_chars))
+        return board
+
 
 
     def count_material(self, board):
@@ -241,6 +286,7 @@ class ParallelGenerator:
                 "best_m": m_deep,
                 "sec_m": sec_deep,
                 "cp_second": cp_second,
+                "cp_shallow": cp_shallow,
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
@@ -256,7 +302,9 @@ class ParallelGenerator:
             return None
 
     def play_one_game(self, engine, game_id, proc_idx):
-        game_positions, board = [], chess.Board()
+        game_positions = []
+        board = self.generate_dfrc_board()
+        last_eval_white = None
 
         try:
             engine.send_ucinewgame()
@@ -270,93 +318,90 @@ class ParallelGenerator:
             if board.is_game_over():
                 break
 
-            if move_num <= 6:
-                # Giai đoạn mở cờ nhanh (nước 1-6):
-                # MultiPV=5 ở nodes_shallow: siêu nhanh (~2ms), có sẵn top 5 nước hợp lệ an toàn
-                try:
-                    move_info = engine.analyse(board, chess.engine.Limit(nodes=self.nodes_shallow), multipv=min(5, board.legal_moves.count()))
-                    if not isinstance(move_info, list):
-                        move_info = [move_info]
-
-                    best_m = move_info[0]["pv"][0]
-                    best_cp = move_info[0]["score"].relative.score(mate_score=10000) or 0
-
-                    # 8% chọn một nước hợp lệ KHÔNG THUA NGAY (eval >= -250 cp) để chống trùng FEN 100%
-                    if random.random() < 0.08:
-                        safe_cands = [
-                            line["pv"][0] for line in move_info
-                            if line.get("pv") and (line["score"].relative.score(mate_score=10000) or 0) >= -250
-                        ]
-                        move = random.choice(safe_cands) if safe_cands else best_m
-                    else:
-                        # 92% còn lại: Chọn giữa 2 nước tốt nhất (50/50 nếu gap <= 250cp và |sec_cp| <= 500cp)
-                        if len(move_info) >= 2 and move_info[1].get("pv"):
-                            sec_m = move_info[1]["pv"][0]
-                            sec_cp = move_info[1]["score"].relative.score(mate_score=10000) or 0
-                            eval_gap = abs(best_cp - sec_cp)
-                            if eval_gap <= 250 and abs(sec_cp) <= 500:
-                                move = random.choice([best_m, sec_m])
-                            else:
-                                move = best_m
-                        else:
-                            move = best_m
-                except Exception:
-                    move = engine.play(board, chess.engine.Limit(nodes=self.nodes_shallow)).move
-
+            if move_num <= 8:
+                # Giai đoạn mở cờ DFRC (nước 1-8):
+                # Đi các nước hoàn toàn ngẫu nhiên để xóa bỏ 100% định kiến khai cuộc và tối đa hóa độ đa dạng
+                legal_moves = list(board.legal_moves)
+                if not legal_moves:
+                    break
+                move = random.choice(legal_moves)
                 board.push(move)
             else:
-                # Giai đoạn thu thập dữ liệu (nước > 6):
-                # Tích hợp Analyze-Then-Play: 1 lượt phân tích phục vụ cả gán nhãn lẫn đi cờ ở 16,384 nodes!
+                # Giai đoạn thu thập dữ liệu (nước > 8):
+                # Phân tích 16,384 nodes MultiPV=2
                 data = self.analyze_full(board, engine)
                 if not data or not data["best_m"]:
                     break
 
-                chosen_best = data["m24"][0] if data["m24"] else "0000"
-                chosen_best_lbl = data["l24"][0] if data["l24"] else 0
-                pos = {
-                    "fen": board.fen(),
-                    "stm": 0 if board.turn == chess.WHITE else 1,
-                    "eval_score": data["cp"],
-                    "depth": data.get("depth", 20),
-                    "best_move": chosen_best,
-                    "best_move_label": chosen_best_lbl,
-                    "best_moves_d16": data["m16"],
-                    "best_moves_d20": data["m20"],
-                    "best_moves_d24": data["m24"],
-                    "best_move_labels_d16": data["l16"],
-                    "best_move_labels_d20": data["l20"],
-                    "best_move_labels_d24": data["l24"],
-                    "game_result": 1,
-                    "wdl": 0.5,
-                    "material": self.count_material(board),
-                    "piece_count": chess.popcount(board.occupied),
-                    "tau": data["tau"],
-                    "rho": data["rho"],
-                    "rs": data["rs"]
-                }
-                game_positions.append(pos)
-
                 best_m = data["best_m"]
                 sec_m = data["sec_m"]
-                best_cp = data["cp"]
-                sec_cp = data["cp_second"]
+                cp_deep = data["cp"]
+                cp_shallow = data.get("cp_shallow", cp_deep)
+                last_eval_white = cp_deep if board.turn == chess.WHITE else -cp_deep
 
-                if sec_m:
-                    eval_gap = abs(best_cp - sec_cp)
-                    if move_num <= 8:
-                        if eval_gap <= 250 and abs(sec_cp) <= 500:
-                            move = random.choice([best_m, sec_m])
-                        else:
-                            move = best_m
-                    else:
-                        if eval_gap <= 250 and random.random() < 0.25:
-                            move = sec_m
-                        else:
-                            move = best_m
-                else:
-                    move = best_m
+                # =========================================================================
+                # BỘ LỌC THẾ CỜ TĨNH CHUẨN FINETUNE (QUIET POSITIONS ONLY)
+                # =========================================================================
+                is_quiet = True
 
-                board.push(move)
+                # 1. Bỏ qua nếu đang bị chiếu hoặc nước đi tốt nhất chiếu tướng đối phương
+                if board.is_check() or board.gives_check(best_m):
+                    is_quiet = False
+
+                # 2. Bỏ qua nếu nước đi tốt nhất là nước ăn quân (capture)
+                if is_quiet and board.is_capture(best_m):
+                    is_quiet = False
+
+                # 3. Bỏ qua nếu nước đi tốt nhất là nước phong cấp (promotion)
+                if is_quiet and best_m.promotion is not None:
+                    is_quiet = False
+
+                # 4. Lọc chênh lệch điểm (Eval-diff filtering):
+                # Loại bỏ thế cờ có sự chênh lệch quá lớn giữa đánh giá nông (1k nodes) và sâu (16k nodes)
+                # Hoặc biến động tính toán lớn (|cp_shallow - cp_deep| > 150 cp)
+                eval_swing = abs(cp_shallow - cp_deep)
+                if is_quiet and eval_swing > 150:
+                    is_quiet = False
+
+                # 5. Loại bỏ các thế cờ đã ngã ngũ (điểm tuyệt đối >= 1000 centipawns hoặc mate score)
+                if is_quiet and abs(cp_deep) >= 1000:
+                    is_quiet = False
+
+                # Chỉ lưu lại các thế cờ tĩnh hoàn hảo cho finetuning
+                if is_quiet:
+                    chosen_best = best_m.uci()
+                    chosen_best_lbl = self.move_to_label(board, best_m)
+                    sec_best = sec_m.uci() if sec_m else ""
+                    sec_best_lbl = self.move_to_label(board, sec_m) if sec_m else 0
+
+                    pos = {
+                        "fen": board.fen(),
+                        "stm": 0 if board.turn == chess.WHITE else 1,
+                        "eval_score": cp_deep,
+                        "depth": data.get("depth", 20),
+                        "best_move": chosen_best,
+                        "best_move_label": chosen_best_lbl,
+                        "sec_move": sec_best,
+                        "sec_move_label": sec_best_lbl,
+                        "best_moves_d16": data["m16"],
+                        "best_moves_d20": data["m20"],
+                        "best_moves_d24": data["m24"],
+                        "best_move_labels_d16": data["l16"],
+                        "best_move_labels_d20": data["l20"],
+                        "best_move_labels_d24": data["l24"],
+                        "game_result": 1,
+                        "wdl": 0.5,
+                        "material": self.count_material(board),
+                        "piece_count": chess.popcount(board.occupied),
+                        "tau": data["tau"],
+                        "rho": data["rho"],
+                        "rs": data["rs"],
+                        "is_quiet": True
+                    }
+                    game_positions.append(pos)
+
+                # Sau nước thứ 8: LUÔN ĐI NƯỚC ĐI TỐT NHẤT (BEST MOVE)
+                board.push(best_m)
 
         # Ground-truth Game Result & WDL
         if board.is_checkmate():
@@ -369,28 +414,15 @@ class ParallelGenerator:
             or board.is_seventyfive_moves()
         ):
             white_outcome = 0.5
-        elif game_positions:
-            # Tái sử dụng điểm đánh giá 16k nodes của nước đi cuối cùng (tránh search lặp lại)
-            last_p = game_positions[-1]
-            last_white_cp = last_p["eval_score"] if last_p["stm"] == 0 else -last_p["eval_score"]
-            if last_white_cp >= 200:
+        elif last_eval_white is not None:
+            if last_eval_white >= 200:
                 white_outcome = 1.0
-            elif last_white_cp <= -200:
+            elif last_eval_white <= -200:
                 white_outcome = 0.0
             else:
                 white_outcome = 0.5
         else:
-            try:
-                final_info = engine.analyse(board, chess.engine.Limit(nodes=4096))
-                final_cp = final_info["score"].white().score(mate_score=10000) or 0
-                if final_cp >= 200:
-                    white_outcome = 1.0
-                elif final_cp <= -200:
-                    white_outcome = 0.0
-                else:
-                    white_outcome = 0.5
-            except Exception:
-                white_outcome = 0.5
+            white_outcome = 0.5
 
         for p in game_positions:
             stm = p["stm"]
