@@ -46,7 +46,7 @@ gen_cmd = [
     sys.executable, "parallel_generate.py",
     "--engine", "./harenn_engine",
     "--output", "./data",
-    "--games", "10000",
+    "--games", "0",
     "--batch-size", "100",
     "--concurrency", "4",
     "--hash", "4096",

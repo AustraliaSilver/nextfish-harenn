@@ -490,7 +490,10 @@ def main():
     )
 
     shared_pos = multiprocessing.Value('i', 0)
-    games_per_proc = max(1, args.games // args.concurrency)
+    if args.games <= 0:
+        games_per_proc = float('inf')
+    else:
+        games_per_proc = max(1, args.games // args.concurrency)
 
     processes = []
     for proc_idx in range(args.concurrency):
