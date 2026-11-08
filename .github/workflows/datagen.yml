@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install python-chess huggingface_hub kaggle six
 
-      - name: Manage 5 Kaggle Workers (Worker 1 only)
+      - name: Manage 3 Kaggle Workers (Worker 1 only)
         if: matrix.worker_id == 1
         continue-on-error: true
         env:

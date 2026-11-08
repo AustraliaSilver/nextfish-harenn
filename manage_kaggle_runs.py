@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Nextfish HARENN - Kaggle 5x CPU Worker Manager
-Tự động giám sát, kích hoạt và duy trì 5 phiên chạy CPU độc lập trên Kaggle (4 vCPU, 30GB RAM, Hash 4096MB)
+Nextfish HARENN - Kaggle 3x CPU Worker Manager
+Tự động giám sát, kích hoạt và duy trì 3 phiên chạy CPU độc lập trên Kaggle (4 vCPU, 30GB RAM, Hash 4096MB)
 để cùng đồng hành với cụm GitHub Actions sinh dữ liệu lên Hugging Face.
 """
 
@@ -108,11 +108,11 @@ if files and hf_token:
     print("Upload completed successfully!")
 '''
 
-def manage_5_kaggle_workers():
-    print("=== Checking & Managing 5 Kaggle CPU Workers ===")
+def manage_3_kaggle_workers():
+    print("=== Checking & Managing 3 Kaggle CPU Workers ===")
     force = "--force" in sys.argv
     if force:
-        print("  [Note] --force flag detected: Restarting all 5 workers with latest code")
+        print("  [Note] --force flag detected: Restarting 3 workers with latest code")
     token = os.environ.get("KAGGLE_API_TOKEN") or "KGAT_b42d4a8ff82836dd870f04137475c469"
     os.environ["KAGGLE_API_TOKEN"] = token
 
@@ -121,7 +121,7 @@ def manage_5_kaggle_workers():
 
     hf_token = os.environ.get("HF_TOKEN", "")
 
-    for worker_num in range(1, 6):
+    for worker_num in range(1, 4):
         kernel_slug = f"nextfish-harenn-datagen-k{worker_num}"
         kernel_ref = f"{KAGGLE_USERNAME}/{kernel_slug}"
         print(f"\n[Worker {worker_num}] Checking {kernel_ref}...")
@@ -166,7 +166,7 @@ def manage_5_kaggle_workers():
             except Exception as e:
                 print(f"  [Error] Failed to push Worker {worker_num}: {e}")
 
-    print("\n=== Kaggle 5x Manager execution complete! ===")
+    print("\n=== Kaggle 3x Manager execution complete! ===")
 
 if __name__ == "__main__":
-    manage_5_kaggle_workers()
+    manage_3_kaggle_workers()
