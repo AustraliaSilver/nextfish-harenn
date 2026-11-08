@@ -54,7 +54,7 @@ jobs:
       - name: Generate Data (time-budgeted)
         run: |
           mkdir -p data
-          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 25000 --batch-size 100 --concurrency 4 --hash 2048 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 16384
+          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 25000 --batch-size 100 --concurrency 2 --hash 1024 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 8192
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
@@ -118,7 +118,7 @@ jobs:
 
           # Upload single packed file to Hugging Face Bucket
           api = HfApi(token=token)
-          bucket_id = "australia1/harenn-high-quality-data"
+          bucket_id = "australia1/myrandombucket"
           print(f"Uploading {packed_filename} to bucket '{bucket_id}'...")
           t0 = time.time()
           api.batch_bucket_files(bucket_id, add=[(packed_path, packed_filename)])
