@@ -345,17 +345,6 @@ class ParallelGenerator:
                 board.push(move)
             else:
                 # Giai đoạn thu thập dữ liệu (nước > 8):
-                # TỐI ƯU PRE-FILTER: Nếu đang bị chiếu, thế cờ là thế cờ động và chắc chắn bị loại bỏ bởi quiet filter.
-                # Giải chiếu nhanh bằng lệnh shallow 512 nodes để đi tiếp ván cờ, tiết kiệm 97% nodes vô ích!
-                if board.is_check():
-                    res_quick = engine.analyse(board, chess.engine.Limit(nodes=512))
-                    m_evasion = res_quick.get("pv", [None])[0]
-                    if m_evasion:
-                        board.push(m_evasion)
-                        continue
-                    else:
-                        break
-
                 # Phân tích 16,384 nodes MultiPV=2 (1-Pass Streaming Snapshot)
                 data = self.analyze_full(board, engine)
                 if not data or not data["best_m"]:
@@ -368,65 +357,63 @@ class ParallelGenerator:
                 last_eval_white = cp_deep if board.turn == chess.WHITE else -cp_deep
 
                 # =========================================================================
-                # BỘ LỌC THẾ CỜ TĨNH CHUẨN FINETUNE (QUIET POSITIONS ONLY)
+                # ĐÁNH DẤU THẾ CỜ TĨNH (QUIET POSITIONS) ĐỂ PHỤC VỤ LOSS/WEIGHT TRONG TRAINING
+                # GIỮ 100% MỌI THẾ CỜ (KHÔNG LOẠI BỎ THẾ CỜ NÀO)
                 # =========================================================================
                 is_quiet = True
 
-                # 1. Bỏ qua nếu đang bị chiếu hoặc nước đi tốt nhất chiếu tướng đối phương
+                # 1. Kiểm tra nếu đang bị chiếu hoặc nước đi tốt nhất chiếu tướng đối phương
                 if board.is_check() or board.gives_check(best_m):
                     is_quiet = False
 
-                # 2. Bỏ qua nếu nước đi tốt nhất là nước ăn quân (capture)
+                # 2. Kiểm tra nếu nước đi tốt nhất là nước ăn quân (capture)
                 if is_quiet and board.is_capture(best_m):
                     is_quiet = False
 
-                # 3. Bỏ qua nếu nước đi tốt nhất là nước phong cấp (promotion)
+                # 3. Kiểm tra nếu nước đi tốt nhất là nước phong cấp (promotion)
                 if is_quiet and best_m.promotion is not None:
                     is_quiet = False
 
-                # 4. Lọc chênh lệch điểm (Eval-diff filtering):
-                # Loại bỏ thế cờ có sự chênh lệch quá lớn giữa đánh giá nông (1k nodes) và sâu (16k nodes)
-                # Hoặc biến động tính toán lớn (|cp_shallow - cp_deep| > 150 cp)
+                # 4. Kiểm tra chênh lệch điểm (Eval-diff):
                 eval_swing = abs(cp_shallow - cp_deep)
                 if is_quiet and eval_swing > 150:
                     is_quiet = False
 
-                # 5. Loại bỏ các thế cờ đã ngã ngũ (điểm tuyệt đối >= 1000 centipawns hoặc mate score)
+                # 5. Kiểm tra các thế cờ đã ngã ngũ (|eval| >= 1000 centipawns hoặc mate score)
                 if is_quiet and abs(cp_deep) >= 1000:
                     is_quiet = False
 
-                # Chỉ lưu lại các thế cờ tĩnh hoàn hảo cho finetuning
-                if is_quiet:
-                    chosen_best = best_m.uci()
-                    chosen_best_lbl = self.move_to_label(board, best_m)
-                    sec_best = sec_m.uci() if sec_m else ""
-                    sec_best_lbl = self.move_to_label(board, sec_m) if sec_m else 0
+                # LƯU 100% MỌI THẾ CỜ VÀO TẬP DỮ LIỆU
+                chosen_best = best_m.uci()
+                chosen_best_lbl = self.move_to_label(board, best_m)
+                sec_best = sec_m.uci() if sec_m else ""
+                sec_best_lbl = self.move_to_label(board, sec_m) if sec_m else 0
 
-                    pos = {
-                        "fen": board.fen(),
-                        "stm": 0 if board.turn == chess.WHITE else 1,
-                        "eval_score": cp_deep,
-                        "depth": data.get("depth", 20),
-                        "best_move": chosen_best,
-                        "best_move_label": chosen_best_lbl,
-                        "sec_move": sec_best,
-                        "sec_move_label": sec_best_lbl,
-                        "best_moves_d16": data["m16"],
-                        "best_moves_d20": data["m20"],
-                        "best_moves_d24": data["m24"],
-                        "best_move_labels_d16": data["l16"],
-                        "best_move_labels_d20": data["l20"],
-                        "best_move_labels_d24": data["l24"],
-                        "game_result": 1,
-                        "wdl": 0.5,
-                        "material": self.count_material(board),
-                        "piece_count": chess.popcount(board.occupied),
-                        "tau": data["tau"],
-                        "rho": data["rho"],
-                        "rs": data["rs"],
-                        "is_quiet": True
-                    }
-                    game_positions.append(pos)
+                pos = {
+                    "fen": board.fen(),
+                    "stm": 0 if board.turn == chess.WHITE else 1,
+                    "eval_score": cp_deep,
+                    "depth": data.get("depth", 20),
+                    "best_move": chosen_best,
+                    "best_move_label": chosen_best_lbl,
+                    "sec_move": sec_best,
+                    "sec_move_label": sec_best_lbl,
+                    "best_moves_d16": data["m16"],
+                    "best_moves_d20": data["m20"],
+                    "best_moves_d24": data["m24"],
+                    "best_move_labels_d16": data["l16"],
+                    "best_move_labels_d20": data["l20"],
+                    "best_move_labels_d24": data["l24"],
+                    "game_result": 1,
+                    "wdl": 0.5,
+                    "material": self.count_material(board),
+                    "piece_count": chess.popcount(board.occupied),
+                    "tau": data["tau"],
+                    "rho": data["rho"],
+                    "rs": data["rs"],
+                    "is_quiet": is_quiet
+                }
+                game_positions.append(pos)
 
                 # Sau nước thứ 8: LUÔN ĐI NƯỚC ĐI TỐT NHẤT (BEST MOVE)
                 board.push(best_m)
