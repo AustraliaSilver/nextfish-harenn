@@ -39,8 +39,8 @@ subprocess.check_call(cmd, shell=True)
 print("[3/4] Installing python-chess & huggingface_hub...")
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "python-chess", "huggingface_hub"])
 
-# 4. Run data generation (11.5 hours budget, 4096MB Hash/proc = 16GB total on 30GB RAM, 16384 nodes, 4 vCPUs)
-print("[4/4] Starting Turbo Parallel Generator...")
+# 4. Run data generation (11.5 hours budget, 32MB Hash/proc for optimal L3 cache locality, 16384 nodes, 4 vCPUs)
+print("[4/4] Starting Turbo Parallel Generator (1-Pass Streaming + Pre-filter + 32MB L3 Cache)...")
 os.makedirs("data", exist_ok=True)
 gen_cmd = [
     sys.executable, "parallel_generate.py",
@@ -49,7 +49,7 @@ gen_cmd = [
     "--games", "0",
     "--batch-size", "100",
     "--concurrency", "4",
-    "--hash", "4096",
+    "--hash", "32",
     "--time-budget", "41400",
     "--worker-id", "k{worker_num}",
     "--nodes", "16384"
