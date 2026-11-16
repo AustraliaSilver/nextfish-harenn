@@ -320,24 +320,27 @@ class ParallelGenerator:
 
     def play_one_game(self, engine, game_id, proc_idx):
         game_positions = []
-        board = self.generate_dfrc_board()
+        is_standard = (random.random() < 0.70)
+        board = chess.Board() if is_standard else self.generate_dfrc_board()
         last_eval_white = None
+        random_plies = 3 if is_standard else 8
 
         try:
             engine.send_ucinewgame()
         except Exception:
             pass
 
-        for move_num in range(1, 100):
+        move_num = 0
+        while True:
+            move_num += 1
             if self.time_budget and (time.time() - self.start_time) > self.time_budget:
                 break
 
-            if board.is_game_over():
+            if board.is_game_over(claim_draw=True):
                 break
 
-            if move_num <= 8:
-                # Giai đoạn mở cờ DFRC (nước 1-8):
-                # Đi các nước hoàn toàn ngẫu nhiên để xóa bỏ 100% định kiến khai cuộc và tối đa hóa độ đa dạng
+            if move_num <= random_plies:
+                # Giai đoạn mở cờ: 70% cờ vua chuẩn (3 ply đầu đa dạng hóa) / 30% DFRC (8 ply đầu)
                 legal_moves = list(board.legal_moves)
                 if not legal_moves:
                     break
