@@ -119,7 +119,8 @@ class ParallelGenerator:
         if not move or move == chess.Move.null(): return 0
         piece = board.piece_at(move.from_square)
         if piece is None: return 0
-        p_idx = piece.piece_type - 1 + (6 if piece.color == chess.BLACK else 0)
+        pt = move.promotion if move.promotion else piece.piece_type
+        p_idx = pt - 1 + (6 if piece.color == chess.BLACK else 0)
         return min((move.to_square ^ 56) * 12 + p_idx, 767)
 
     @staticmethod

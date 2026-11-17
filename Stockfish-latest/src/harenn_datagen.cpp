@@ -105,7 +105,8 @@ int move_to_label(const Position& pos, Move m) {
     if (m == Move::none() || m == Move::null()) return 0;
     Piece pc = pos.piece_on(m.from_sq());
     if (pc == NO_PIECE) return 0;
-    int pt = static_cast<int>(type_of(pc)) - 1;
+    PieceType moved_pt = (m.type_of() == PROMOTION) ? m.promotion_type() : type_of(pc);
+    int pt = static_cast<int>(moved_pt) - 1;
     int c = (color_of(pc) == BLACK) ? 6 : 0;
     int p_idx = pt + c;
     int sq = static_cast<int>(m.to_sq()) ^ 56;
@@ -265,20 +266,21 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         }
 
         games_played++;
-        bool is_standard = true;
+        bool is_standard = (u01(rng) < 0.70);
         std::string start_fen;
         int random_plies = 2;
-        if (!book_fens.empty()) {
-            std::uniform_int_distribution<size_t> bdist(0, book_fens.size() - 1);
-            start_fen = book_fens[bdist(rng)];
-            is_standard = true;
-            random_plies = cfg.book_random_plies;
+        if (is_standard) {
+            if (!book_fens.empty()) {
+                std::uniform_int_distribution<size_t> bdist(0, book_fens.size() - 1);
+                start_fen = book_fens[bdist(rng)];
+                random_plies = cfg.book_random_plies;
+            } else {
+                start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+                random_plies = 3;
+            }
         } else {
-            is_standard = (u01(rng) < 0.70);
-            start_fen = is_standard
-                ? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-                : generate_dfrc_fen(rng);
-            random_plies = is_standard ? 3 : std::uniform_int_distribution<int>(4, 6)(rng);
+            start_fen = generate_dfrc_fen(rng);
+            random_plies = std::uniform_int_distribution<int>(4, 6)(rng);
         }
 
         set_opt("UCI_Chess960", is_standard ? "false" : "true");
@@ -345,6 +347,10 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                 m_shallow_str = m_deep_str.empty() ? best_move_uci : m_deep_str;
             }
             if (m_deep_str.empty()) m_deep_str = best_move_uci;
+            if (sec_deep_str == best_move_uci || sec_deep_str == m_deep_str) {
+                sec_deep_str.clear();
+                cp_second = cp_deep;
+            }
             if (sec_shallow_str.empty()) sec_shallow_str = sec_deep_str;
             if (cur_multipv == 1) cp_second = cp_deep;
 
