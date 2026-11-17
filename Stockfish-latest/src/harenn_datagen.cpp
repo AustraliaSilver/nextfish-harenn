@@ -292,11 +292,6 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         int move_num = 0;
         while (true) {
             move_num++;
-            if (cfg.time_budget_sec > 0) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - start_tp).count();
-                if (elapsed >= cfg.time_budget_sec) break;
-            }
 
             engine.set_position(anchor_fen, played_moves);
             const Position& pos = engine.position();
