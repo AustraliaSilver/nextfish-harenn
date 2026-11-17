@@ -24,5 +24,24 @@ __pycache__/
 tests/syzygy
 tests/bench_tmp.epd
 
-# HARENN model files (tracked separately)
-!nextfish-harenn/
+# Legacy / local-only scripts & snapshots
+nextfish-dev/
+nextfish-harenn/
+simple_generate.py
+generate_training_data.py
+collect_data_cutechess.py
+relabel_batch.py
+preprocess_pgn.py
+eval_quick.py
+eval_server.py
+analyzer.py
+autotune.py
+test_engines.py
+build_stockfish.py
+export_model.py
+kaggle_solo_battle.py
+kaggle_nextfish_master.py
+train_harenn.py
+Nextfish_v2_Kaggle_Setup.ipynb
+*.epd
+*.zip

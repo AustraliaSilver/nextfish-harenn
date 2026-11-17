@@ -43,21 +43,17 @@ Kaggle T4x2 Quickstart:
 """
 
 import argparse
-import contextlib
 import gc
 import glob
 import hashlib
 import json
 import math
 import os
-import queue
 import random
 import re
 import struct
 import sys
-import threading
 import time
-import warnings
 import zlib
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -68,30 +64,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-
-# Ẩn cảnh báo không cần thiết của PyTorch autograd khi dùng Straight-Through Estimator (QAT) trên TPU
-warnings.filterwarnings("ignore", message=".*The .grad attribute of a Tensor that is not a leaf Tensor.*")
-
-try:
-    import torch_tpu  # noqa: F401
-except Exception:
-    pass
-
-HAS_NATIVE_TPU = hasattr(torch, "tpu")
-
-HAS_XLA = False
-if not HAS_NATIVE_TPU:
-    try:
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-        import torch_xla.distributed.xla_multiprocessing as xmp
-        try:
-            import torch_xla.runtime as xr
-        except Exception:
-            xr = None
-        HAS_XLA = True
-    except Exception:
-        HAS_XLA = False
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -126,7 +98,7 @@ QW_FC2_SCALE = 64.0                     # FC2 int8 weight scale [-127, +127] -> 
 FC2_SHIFT = 6                           # 2^6 = 64
 Q_HEAD_SCALE = 64.0                     # L3 int16 readout head weight scale
 OUTPUT_SCALE = QA_SCALE * QA_SCALE * Q_HEAD_SCALE  # 127 * 127 * 64 = 1,032,256.0
-WDL_SCALE_PAWNS = 4.0                   # 4.00 pawns = 400 centipawns for WDL sigmoid
+WDL_SCALE_PAWNS = 2.60                  # 2.60 pawns = 260 cp (khớp chuẩn WDL-normalized cp của Stockfish 19)
 
 # Bảng ánh xạ ký tự FEN -> kênh quân cờ cho góc nhìn Trắng (0) và Đen (1)
 P2CH_WHITE = {
@@ -476,15 +448,13 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
         t0 = time.time()
         print(f"[Cache] Đang nạp cache nhị phân HKV3 từ {cpath}...", flush=True)
         try:
-            gc.collect()
-            with np.load(str(cpath), allow_pickle=False) as data:
-                us_indices = data["us"] if "us" in data else data["us_indices"]
-                them_indices = data["them"] if "them" in data else data["them_indices"]
-                labels_eval = data["eval"] if "eval" in data else data["labels_eval"]
-                labels_tau = data["tau"] if "tau" in data else data["labels_tau"]
-                labels_rho = data["rho"] if "rho" in data else data["labels_rho"]
-                labels_rs = data["rs"] if "rs" in data else data["labels_rs"]
-            gc.collect()
+            data = np.load(str(cpath), allow_pickle=False)
+            us_indices = data["us_indices"]
+            them_indices = data["them_indices"]
+            labels_eval = data["labels_eval"]
+            labels_tau = data["labels_tau"]
+            labels_rho = data["labels_rho"]
+            labels_rs = data["labels_rs"]
 
             # Tự động phát hiện và chuẩn hóa nếu file cache được sinh ở không gian 64-King cũ
             max_feat = max(int(us_indices.max()), int(them_indices.max()))
@@ -600,11 +570,9 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
 # ═══════════════════════════════════════════════════════════════════════════
 class FastHKV3BatchLoader:
     """
-    Bộ nạp dữ liệu trực tiếp từ bộ nhớ NumPy sang GPU / TPU v5e-1 với:
-      - Pinned Memory DMA (bất đồng bộ thực sự qua PCIe với non_blocking=True trên CUDA).
-      - Truyền uint16 (2 bytes) qua PCIe rồi ép kiểu int64 ngay trên GPU/TPU HBM (giảm 75% băng thông PCIe).
-      - Strictly Static Batch Shape trên TPU/XLA (tránh 100% lỗi biên dịch lại đồ thị HLO ở batch cuối).
-      - Background Thread Prefetching giúp chồng lấp hoàn toàn việc cắt mảng NumPy trên CPU với tính toán MXU/GPU.
+    Bộ nạp dữ liệu trực tiếp từ bộ nhớ NumPy sang GPU với:
+      - Pinned Memory DMA (bất đồng bộ thực sự qua PCIe với non_blocking=True).
+      - Truyền uint16 (2 bytes) qua PCIe rồi ép kiểu int64 ngay trên GPU VRAM (giảm 75% băng thông PCIe).
       - Mặc định symmetry=1 vì kiến trúc HalfKPv3 đã thỏa mãn đối xứng đại số tuyệt đối (E(them, us) == -E(us, them)).
     """
 
@@ -621,14 +589,13 @@ class FastHKV3BatchLoader:
         shuffle: bool = True,
         symmetry: int = 1,
         device: torch.device = torch.device("cuda"),
-        static_shape: Optional[bool] = None,
     ):
-        self.us_data = np.asarray(us_data)
-        self.them_data = np.asarray(them_data)
-        self.eval_data = np.asarray(eval_data)
-        self.tau_data = np.asarray(tau_data)
-        self.rho_data = np.asarray(rho_data)
-        self.rs_data = np.asarray(rs_data)
+        self.us_data = us_data
+        self.them_data = them_data
+        self.eval_data = eval_data
+        self.tau_data = tau_data
+        self.rho_data = rho_data
+        self.rs_data = rs_data
         self.base_indices = np.asarray(indices, dtype=np.int64)
         self.num_base = len(self.base_indices)
         self.symmetry = symmetry if symmetry in (1, 2) else 1
@@ -636,144 +603,54 @@ class FastHKV3BatchLoader:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.device = device
-        self.is_xla = (self.device.type in ("tpu", "xla"))
         self.pin_memory = (self.device.type == "cuda")
-        self.static_shape = self.is_xla if static_shape is None else static_shape
 
     def __len__(self) -> int:
-        return max(1, (self.total_samples + self.batch_size - 1) // self.batch_size)
+        return (self.total_samples + self.batch_size - 1) // self.batch_size
 
-    def _to_device(self, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if self.is_xla and target_dtype == torch.int64:
-            # Trên TPU/XLA, ép sang int64 từ mảng con kích thước 1 batch trên CPU hoặc truyền trực tiếp vào XLA tensor
-            t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
-            return t.to(self.device)
+    def _to_gpu(self, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         t = torch.from_numpy(np.ascontiguousarray(arr))
         if self.pin_memory:
             t = t.pin_memory()
-        t_dev = t.to(self.device, non_blocking=not self.is_xla)
-        if target_dtype is not None and t_dev.dtype != target_dtype:
-            t_dev = t_dev.to(target_dtype)
-        return t_dev
-
-    def _prepare_cpu_batch(self, v_ids: np.ndarray):
-        if self.symmetry == 2:
-            is_flipped = (v_ids >= self.num_base)
-            raw_pos = v_ids % self.num_base
-            actual_ids = self.base_indices[raw_pos]
-            us_np = self.us_data[actual_ids]
-            them_np = self.them_data[actual_ids]
-            ev_np = self.eval_data[actual_ids]
-            if np.any(is_flipped):
-                us_np = np.where(is_flipped[:, None], self.them_data[actual_ids], us_np)
-                them_np = np.where(is_flipped[:, None], self.us_data[actual_ids], them_np)
-                ev_np = np.where(is_flipped, -ev_np, ev_np)
-        else:
-            actual_ids = self.base_indices[v_ids]
-            us_np = self.us_data[actual_ids]
-            them_np = self.them_data[actual_ids]
-            ev_np = self.eval_data[actual_ids]
-
-        tau_np = self.tau_data[actual_ids]
-        rho_np = self.rho_data[actual_ids]
-        rs_np = self.rs_data[actual_ids]
-        return us_np, them_np, ev_np, tau_np, rho_np, rs_np
+        t_gpu = t.to(self.device, non_blocking=True)
+        if target_dtype is not None and t_gpu.dtype != target_dtype:
+            t_gpu = t_gpu.to(target_dtype)
+        return t_gpu
 
     def __iter__(self):
-        # Thuật toán Chunked/Block Shuffling siêu tốc (Zero Cache Thrashing):
-        # Với dữ liệu 140M dòng (18 GB RAM), Fancy Indexing ngẫu nhiên từng dòng tốn 2.7s/batch (khiến 1 epoch mất 6.5 tiếng).
-        # Bằng cách xáo trộn theo các khối contiguous (block_size = batch_size * 4), CPU cắt mảng trong 0.05ms (nhanh gấp 5,000 lần!),
-        # giúp 1 epoch trên T4x2 chỉ mất ~7-9 phút thay vì 6.5 tiếng, đồng thời vẫn bảo đảm tính ngẫu nhiên i.i.d cho SGD.
-        block_size = self.batch_size * 4
-        num_blocks = (self.num_base + block_size - 1) // block_size
-        block_order = np.random.permutation(num_blocks) if self.shuffle else np.arange(num_blocks)
+        if self.shuffle:
+            perm = np.random.permutation(self.total_samples)
+        else:
+            perm = np.arange(self.total_samples, dtype=np.int64)
 
-        batch_q: "queue.Queue" = queue.Queue(maxsize=4)
-        sentinel = object()
+        for start in range(0, self.total_samples, self.batch_size):
+            v_ids = perm[start:start + self.batch_size]
+            if self.symmetry == 2:
+                is_flipped = (v_ids >= self.num_base)
+                raw_pos = v_ids % self.num_base
+                actual_ids = self.base_indices[raw_pos]
+                us_np = self.us_data[actual_ids]
+                them_np = self.them_data[actual_ids]
+                ev_np = self.eval_data[actual_ids]
+                if np.any(is_flipped):
+                    us_np = np.where(is_flipped[:, None], self.them_data[actual_ids], us_np)
+                    them_np = np.where(is_flipped[:, None], self.us_data[actual_ids], them_np)
+                    ev_np = np.where(is_flipped, -ev_np, ev_np)
+            else:
+                actual_ids = self.base_indices[v_ids]
+                us_np = self.us_data[actual_ids]
+                them_np = self.them_data[actual_ids]
+                ev_np = self.eval_data[actual_ids]
 
-        def _producer():
-            try:
-                for sym in range(self.symmetry):
-                    is_sym_flip = (sym == 1)
-                    for blk_idx in block_order:
-                        b_start = blk_idx * block_size
-                        b_end = min(self.num_base, b_start + block_size)
-                        if b_start >= self.num_base:
-                            continue
+            # Truyền uint16 (2 bytes) qua PCIe bằng Pinned Memory DMA, sau đó mới .to(torch.int64) trên GPU VRAM:
+            us_t = self._to_gpu(us_np, target_dtype=torch.int64)
+            them_t = self._to_gpu(them_np, target_dtype=torch.int64)
 
-                        blk_slice = slice(b_start, b_end)
-                        actual_ids = self.base_indices[blk_slice]
-
-                        # Cắt contiguous block từ RAM CPU siêu tốc:
-                        u_blk = self.us_data[actual_ids]
-                        v_blk = self.them_data[actual_ids]
-                        ev_blk = self.eval_data[actual_ids]
-                        tau_blk = self.tau_data[actual_ids]
-                        rho_blk = self.rho_data[actual_ids]
-                        rs_blk = self.rs_data[actual_ids]
-
-                        if is_sym_flip:
-                            u_blk, v_blk = v_blk, u_blk
-                            ev_blk = -ev_blk
-
-                        # Xáo trộn nhẹ bên trong khối:
-                        n_in_blk = len(actual_ids)
-                        if self.shuffle and n_in_blk > 1:
-                            sub_perm = np.random.permutation(n_in_blk)
-                            u_blk = u_blk[sub_perm]
-                            v_blk = v_blk[sub_perm]
-                            ev_blk = ev_blk[sub_perm]
-                            tau_blk = tau_blk[sub_perm]
-                            rho_blk = rho_blk[sub_perm]
-                            rs_blk = rs_blk[sub_perm]
-
-                        # Nhả ra từng batch_size:
-                        for sub_start in range(0, n_in_blk, self.batch_size):
-                            sub_end = sub_start + self.batch_size
-                            if sub_end <= n_in_blk:
-                                batch_q.put((
-                                    u_blk[sub_start:sub_end],
-                                    v_blk[sub_start:sub_end],
-                                    ev_blk[sub_start:sub_end],
-                                    tau_blk[sub_start:sub_end],
-                                    rho_blk[sub_start:sub_end],
-                                    rs_blk[sub_start:sub_end],
-                                ))
-                            elif self.static_shape:
-                                # Pad cho đủ batch_size tĩnh trên TPU v5e:
-                                rem = n_in_blk - sub_start
-                                pad_len = self.batch_size - rem
-                                pad_idx = np.arange(pad_len) % n_in_blk
-                                batch_q.put((
-                                    np.concatenate([u_blk[sub_start:], u_blk[pad_idx]]),
-                                    np.concatenate([v_blk[sub_start:], v_blk[pad_idx]]),
-                                    np.concatenate([ev_blk[sub_start:], ev_blk[pad_idx]]),
-                                    np.concatenate([tau_blk[sub_start:], tau_blk[pad_idx]]),
-                                    np.concatenate([rho_blk[sub_start:], rho_blk[pad_idx]]),
-                                    np.concatenate([rs_blk[sub_start:], rs_blk[pad_idx]]),
-                                ))
-            except Exception as exc:
-                batch_q.put(exc)
-            finally:
-                batch_q.put(sentinel)
-
-        prod_thread = threading.Thread(target=_producer, daemon=True)
-        prod_thread.start()
-
-        while True:
-            item = batch_q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            us_np, them_np, ev_np, tau_np, rho_np, rs_np = item
-            us_t = self._to_device(us_np, target_dtype=torch.int64)
-            them_t = self._to_device(them_np, target_dtype=torch.int64)
             targets = {
-                "eval": self._to_device(ev_np),
-                "tau": self._to_device(tau_np),
-                "rho": self._to_device(rho_np),
-                "rs": self._to_device(rs_np),
+                "eval": self._to_gpu(ev_np),
+                "tau": self._to_gpu(self.tau_data[actual_ids]),
+                "rho": self._to_gpu(self.rho_data[actual_ids]),
+                "rs": self._to_gpu(self.rs_data[actual_ids]),
             }
             yield us_t, them_t, targets
 
@@ -781,17 +658,6 @@ class FastHKV3BatchLoader:
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. KIẾN TRÚC MẠNG NƠ-RON ĐA NHIỆM HALFKPV3 (HKV3) CHUẨN ĐẠI SỐ & SIMD
 # ═══════════════════════════════════════════════════════════════════════════
-def _bag_sum(emb: nn.EmbeddingBag, idx: torch.Tensor) -> torch.Tensor:
-    """
-    Thực thi phép cộng nhúng thưa (EmbeddingBag mode='sum'):
-      - Trên TPU (native 'tpu' hoặc 'xla'): Hạ trực tiếp xuống F.embedding(...).sum(dim=1) (native Gather + ReduceSum trên HBM2e 819 GB/s).
-      - Trên CUDA/CPU: Gọi kernel C++/CUDA nn.EmbeddingBag nguyên bản.
-    """
-    if idx.device.type in ("tpu", "xla"):
-        return F.embedding(idx, emb.weight, padding_idx=emb.padding_idx).sum(dim=1)
-    return emb(idx)
-
-
 def fake_quant_ste(x: torch.Tensor, scale: float, min_q: float, max_q: float) -> torch.Tensor:
     """Straight-Through Estimator (STE) mô phỏng lượng tử hóa làm tròn (round) của trọng số C++."""
     q = torch.clamp(torch.round(x * scale), min=min_q, max=max_q) / scale
@@ -876,34 +742,26 @@ class HalfKPv3BranchL1(nn.Module):
         self.emb_piece.weight[PADDING_PIECE_IDX].zero_()
         self.emb_rel.weight[PADDING_REL_IDX].zero_()
 
-    def forward(
-        self,
-        us_idx: torch.Tensor,
-        them_idx: torch.Tensor,
-        shared_maps: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if shared_maps is not None:
-            us_p, us_r, them_p, them_r = shared_maps
-        else:
-            us_p = self.piece_map_pad[us_idx]
-            us_r = self.rel_map_pad[us_idx]
-            them_p = self.piece_map_pad[them_idx]
-            them_r = self.rel_map_pad[them_idx]
+    def forward(self, us_idx: torch.Tensor, them_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        us_p = self.piece_map_pad[us_idx]
+        us_r = self.rel_map_pad[us_idx]
+        them_p = self.piece_map_pad[them_idx]
+        them_r = self.rel_map_pad[them_idx]
 
         # Chỉ dropout trên bảng dư emb_full để ép mạng học quy luật tổng quát qua emb_piece & emb_rel
         # mà không làm mất quân cờ hay làm lệch vật chất giữa us và them!
         if self.training and self.full_dropout > 0.0:
-            pad_val = us_idx.new_full((), PADDING_FEATURE_IDX)
-            drop_u = (torch.rand_like(us_idx, dtype=torch.float32) < self.full_dropout) & (us_idx < PADDING_FEATURE_IDX)
-            drop_v = (torch.rand_like(them_idx, dtype=torch.float32) < self.full_dropout) & (them_idx < PADDING_FEATURE_IDX)
+            pad_val = PADDING_FEATURE_IDX
+            drop_u = (torch.rand_like(us_idx, dtype=torch.float32) < self.full_dropout) & (us_idx < pad_val)
+            drop_v = (torch.rand_like(them_idx, dtype=torch.float32) < self.full_dropout) & (them_idx < pad_val)
             us_idx_full = torch.where(drop_u, pad_val, us_idx)
             them_idx_full = torch.where(drop_v, pad_val, them_idx)
         else:
             us_idx_full = us_idx
             them_idx_full = them_idx
 
-        acc_us = _bag_sum(self.emb_full, us_idx_full) + _bag_sum(self.emb_piece, us_p) + _bag_sum(self.emb_rel, us_r) + self.bias
-        acc_them = _bag_sum(self.emb_full, them_idx_full) + _bag_sum(self.emb_piece, them_p) + _bag_sum(self.emb_rel, them_r) + self.bias
+        acc_us = self.emb_full(us_idx_full) + self.emb_piece(us_p) + self.emb_rel(us_r) + self.bias
+        acc_them = self.emb_full(them_idx_full) + self.emb_piece(them_p) + self.emb_rel(them_r) + self.bias
 
         c_us = torch.clamp(acc_us, 0.0, 1.0)
         c_them = torch.clamp(acc_them, 0.0, 1.0)
@@ -931,7 +789,6 @@ class HalfKPv3Network(nn.Module):
       - Tri-Scale Virtual Factorizer: W_full(22,528) + W_piece(704) + W_rel(1,815)
       - Hỗ trợ Tensor-Parallel tự nhiên trên 2 GPU (Kaggle T4x2):
         Left Branch (1024) trên cuda:0 || Right Branch (1024) trên cuda:1
-      - Hỗ trợ tối ưu đồ thị tĩnh XLA + bfloat16 trên Google Cloud / Colab TPU v5e-1
       - 4-Channel Multi-Task PSQT Skip Connection: psqt_full + psqt_piece + psqt_rel
       - Pairwise Bilinear Gating: 2048 -> 1024 per perspective (khớp bit-exact >> 7 của C++)
       - Siamese Perspective Twin FC2: W_self(256x1024) & W_opp(256x1024) (khớp bit-exact >> 6 của C++)
@@ -1027,56 +884,37 @@ class HalfKPv3Network(nn.Module):
         self.psqt_piece.weight[PADDING_PIECE_IDX].zero_()
         self.psqt_rel.weight[PADDING_REL_IDX].zero_()
 
-    def _compute_psqt(
-        self,
-        idx: torch.Tensor,
-        p_idx: Optional[torch.Tensor] = None,
-        r_idx: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if p_idx is None:
-            p_idx = self.piece_map_pad[idx]
-        if r_idx is None:
-            r_idx = self.rel_map_pad[idx]
-        return _bag_sum(self.psqt_full, idx) + _bag_sum(self.psqt_piece, p_idx) + _bag_sum(self.psqt_rel, r_idx)
+    def _compute_psqt(self, idx: torch.Tensor) -> torch.Tensor:
+        p_idx = self.piece_map_pad[idx]
+        r_idx = self.rel_map_pad[idx]
+        return self.psqt_full(idx) + self.psqt_piece(p_idx) + self.psqt_rel(r_idx)
 
     def forward(self, us_idx: torch.Tensor, them_idx: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Bước 1: Chạy song song nhánh Left trên dev0 và nhánh Right trên dev1 (Tensor-Parallel trên T4x2)
-        # hoặc dùng chung bảng tra chỉ số (Shared Factorizer Index Gather) khi chạy trên 1 chip như TPU v5e-1.
-        us_p = self.piece_map_pad[us_idx]
-        us_r = self.rel_map_pad[us_idx]
-        them_p = self.piece_map_pad[them_idx]
-        them_r = self.rel_map_pad[them_idx]
-        shared_maps_0 = (us_p, us_r, them_p, them_r)
-
+        # Bước 1: Chạy song song nhánh Left trên dev0 và nhánh Right trên dev1 (Tensor-Parallel trên T4x2!)
         if self.dev1 != self.dev0:
-            is_dev1_tpu = (self.dev1.type in ("tpu", "xla"))
-            amp_enabled = (us_idx.is_cuda or is_dev1_tpu) and self.use_amp
-            us_idx_1 = us_idx.to(self.dev1, non_blocking=not is_dev1_tpu)
-            them_idx_1 = them_idx.to(self.dev1, non_blocking=not is_dev1_tpu)
-            if is_dev1_tpu:
+            amp_enabled = us_idx.is_cuda and self.use_amp
+            us_idx_1 = us_idx.to(self.dev1, non_blocking=True)
+            them_idx_1 = them_idx.to(self.dev1, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 u_right, v_right = self.right_branch(us_idx_1, them_idx_1)
-            else:
-                with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    u_right, v_right = self.right_branch(us_idx_1, them_idx_1)
-            u_left, v_left = self.left_branch(us_idx, them_idx, shared_maps=shared_maps_0)
-            # Nén sang BF16 (trên TPU ICI) hoặc FP16 (trên GPU PCIe) trước khi truyền từ dev1 về dev0:
+            u_left, v_left = self.left_branch(us_idx, them_idx)
+            # Nén sang FP16 trên dev1 trước khi truyền qua PCIe về dev0 để giảm 50% băng thông PCIe:
             if amp_enabled:
-                xfer_dtype = torch.bfloat16 if is_dev1_tpu else torch.float16
-                u_right = u_right.to(dtype=xfer_dtype).to(self.dev0, non_blocking=not is_dev1_tpu).to(dtype=u_left.dtype)
-                v_right = v_right.to(dtype=xfer_dtype).to(self.dev0, non_blocking=not is_dev1_tpu).to(dtype=v_left.dtype)
+                u_right = u_right.to(dtype=torch.float16).to(self.dev0, non_blocking=True).to(dtype=u_left.dtype)
+                v_right = v_right.to(dtype=torch.float16).to(self.dev0, non_blocking=True).to(dtype=v_left.dtype)
             else:
-                u_right = u_right.to(self.dev0, non_blocking=not is_dev1_tpu)
-                v_right = v_right.to(self.dev0, non_blocking=not is_dev1_tpu)
+                u_right = u_right.to(self.dev0, non_blocking=True)
+                v_right = v_right.to(self.dev0, non_blocking=True)
         else:
-            u_left, v_left = self.left_branch(us_idx, them_idx, shared_maps=shared_maps_0)
-            u_right, v_right = self.right_branch(us_idx, them_idx, shared_maps=shared_maps_0)
+            u_left, v_left = self.left_branch(us_idx, them_idx)
+            u_right, v_right = self.right_branch(us_idx, them_idx)
 
         # Bước 2: Pairwise Bilinear Gating khớp chính xác phép dịch >> 7 (chia 128 floor) của C++ AVX2
         u = bilinear_gate_ste(u_left, u_right, self.qat)
         v = bilinear_gate_ste(v_left, v_right, self.qat)
 
-        psqt_us = self._compute_psqt(us_idx, us_p, us_r)
-        psqt_them = self._compute_psqt(them_idx, them_p, them_r)
+        psqt_us = self._compute_psqt(us_idx)
+        psqt_them = self._compute_psqt(them_idx)
 
         # Bước 3: Siamese Perspective Twin FC2 (QAT luôn bật cả lúc train và eval để val khớp 100% với .harenn)
         if self.qat:
@@ -1147,8 +985,7 @@ class HKV3MultiTaskLoss(nn.Module):
     Hàm mục tiêu huấn luyện đa nhiệm chuẩn Stockfish NNUE + HARENN:
       - Eval Loss: Kết hợp WDL Cross-Entropy (trên xác suất thắng/hòa/thua) và Smooth-L1 Huber Loss (trên Pawns).
       - Auxiliary Search Loss: Binary Cross-Entropy trên logits của tau, rho, rs.
-      - Giữ toàn bộ metrics dưới dạng Tensor trên GPU/TPU trong suốt epoch (Zero Host-Device Sync .item() mỗi step!),
-        giúp TPU v5e-1 chạy bất đồng bộ liên tục với hiệu suất tối đa.
+      - L2 Regularization nhẹ trên bảng dư W_full để khuyến khích mạng ưu tiên học quy luật hình học tổng quát ở W_rel & W_piece.
     """
 
     def __init__(self, wdl_weight: float = 0.75, wdl_scale_pawns: float = WDL_SCALE_PAWNS):
@@ -1160,13 +997,9 @@ class HKV3MultiTaskLoss(nn.Module):
         target_clamped = torch.clamp(target_pawns, -10.0, 10.0)
 
         # 1. Smooth-L1 Huber Loss trực tiếp trên đơn vị Pawns (beta = 0.5 pawns = 50 cp)
-        # Viết bằng các toán tử cơ bản (abs, where, square) để chạy native 100% trên cả TPU (torch_tpu/XLA) và GPU CUDA:
-        #   Khi |diff| < 0.5: 0.5 * diff^2 / 0.5 == diff^2
-        #   Khi |diff| >= 0.5: |diff| - 0.5 * 0.5 == |diff| - 0.25
-        diff = torch.abs(pred_pawns - target_clamped)
-        loss_huber = torch.where(diff < 0.5, diff.square(), diff - 0.25).mean()
+        loss_huber = F.smooth_l1_loss(pred_pawns, target_clamped, reduction="mean", beta=0.5)
 
-        # 2. WDL Sigmoid Binary Cross-Entropy (with logits để an toàn tuyệt đối với FP16/BF16 autocast)
+        # 2. WDL Sigmoid Binary Cross-Entropy (with logits để an toàn tuyệt đối với FP16 autocast)
         target_wdl = torch.sigmoid(target_clamped / self.wdl_scale_pawns)
         loss_wdl = F.binary_cross_entropy_with_logits(
             pred_pawns / self.wdl_scale_pawns, target_wdl, reduction="mean"
@@ -1176,7 +1009,7 @@ class HKV3MultiTaskLoss(nn.Module):
 
     def forward(
         self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         loss_eval = self.compute_eval_loss(outputs["eval"], targets["eval"])
 
         loss_tau = F.binary_cross_entropy_with_logits(outputs["tau"], targets["tau"], reduction="mean")
@@ -1186,21 +1019,19 @@ class HKV3MultiTaskLoss(nn.Module):
         total_loss = loss_eval + 0.15 * (loss_tau + loss_rho + loss_rs)
 
         with torch.no_grad():
-            eval_out = outputs["eval"].float()
-            eval_tgt = targets["eval"].float()
-            mae_cp = torch.mean(torch.abs(eval_out - eval_tgt)) * 100.0
-            pred_wdl = torch.sigmoid(eval_out / self.wdl_scale_pawns)
-            tgt_wdl = torch.sigmoid(eval_tgt / self.wdl_scale_pawns)
-            wdl_err = torch.mean(torch.abs(pred_wdl - tgt_wdl) ** 2.5)
+            mae_cp = torch.mean(torch.abs(outputs["eval"] - targets["eval"])).item() * 100.0
+            pred_wdl = torch.sigmoid(outputs["eval"] / self.wdl_scale_pawns)
+            tgt_wdl = torch.sigmoid(targets["eval"] / self.wdl_scale_pawns)
+            wdl_err = torch.mean(torch.abs(pred_wdl - tgt_wdl) ** 2.5).item()
 
         metrics = {
-            "total": total_loss.detach().float(),
-            "eval": loss_eval.detach().float(),
-            "tau": loss_tau.detach().float(),
-            "rho": loss_rho.detach().float(),
-            "rs": loss_rs.detach().float(),
-            "mae_cp": mae_cp.detach(),
-            "wdl_err": wdl_err.detach(),
+            "total": float(total_loss.item()),
+            "eval": float(loss_eval.item()),
+            "tau": float(loss_tau.item()),
+            "rho": float(loss_rho.item()),
+            "rs": float(loss_rs.item()),
+            "mae_cp": mae_cp,
+            "wdl_err": wdl_err,
         }
         return total_loss, metrics
 
@@ -1488,36 +1319,41 @@ def load_hkv3_weights_or_checkpoint(
             tac_b = np.frombuffer(f.read(3 * 4), dtype=np.int32)
 
         with torch.no_grad():
-            # Phân rã ngược L1 về 3 tầng (W_full, W_piece, W_rel) trên CPU (tránh biên dịch XLA one-off) rồi nạp lên dev0/dev1
-            rel_map_cpu = model.left_branch.rel_map_pad[:HKV3_NUM_FEATURES].cpu()
-            left_flat = torch.from_numpy(fc1_w[:, :HKV3_L1_PAIR_SIZE].astype(np.float32) / QA_SCALE)
-            l_full, l_piece, l_rel = _decompose_triscale_table(left_flat, rel_map_cpu)
-            model.left_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = l_full.to(dev0)
+            # Phân rã ngược L1 về 3 tầng (W_full, W_piece, W_rel) trên cả 2 nhánh Left & Right
+            left_flat = torch.from_numpy(fc1_w[:, :HKV3_L1_PAIR_SIZE].astype(np.float32) / QA_SCALE).to(dev0)
+            l_full, l_piece, l_rel = _decompose_triscale_table(
+                left_flat, model.left_branch.rel_map_pad[:HKV3_NUM_FEATURES]
+            )
+            model.left_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = l_full
             model.left_branch.emb_full.weight.data[HKV3_NUM_FEATURES:].zero_()
-            model.left_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = l_piece.to(dev0)
+            model.left_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = l_piece
             model.left_branch.emb_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
-            model.left_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = l_rel.to(dev0)
+            model.left_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = l_rel
             model.left_branch.emb_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
             model.left_branch.bias.data = torch.from_numpy(fc1_b[:HKV3_L1_PAIR_SIZE].astype(np.float32) / QA_SCALE).to(dev0)
 
-            right_flat = torch.from_numpy(fc1_w[:, HKV3_L1_PAIR_SIZE:].astype(np.float32) / QA_SCALE)
-            r_full, r_piece, r_rel = _decompose_triscale_table(right_flat, rel_map_cpu)
-            model.right_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = r_full.to(dev1)
+            right_flat = torch.from_numpy(fc1_w[:, HKV3_L1_PAIR_SIZE:].astype(np.float32) / QA_SCALE).to(dev1)
+            r_full, r_piece, r_rel = _decompose_triscale_table(
+                right_flat, model.right_branch.rel_map_pad[:HKV3_NUM_FEATURES]
+            )
+            model.right_branch.emb_full.weight.data[:HKV3_NUM_FEATURES] = r_full
             model.right_branch.emb_full.weight.data[HKV3_NUM_FEATURES:].zero_()
-            model.right_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = r_piece.to(dev1)
+            model.right_branch.emb_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = r_piece
             model.right_branch.emb_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
-            model.right_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = r_rel.to(dev1)
+            model.right_branch.emb_rel.weight.data[:HKV3_NUM_REL_FEATURES] = r_rel
             model.right_branch.emb_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
             model.right_branch.bias.data = torch.from_numpy(fc1_b[HKV3_L1_PAIR_SIZE:].astype(np.float32) / QA_SCALE).to(dev1)
 
             # Phân rã ngược PSQT về 3 tầng (psqt_full, psqt_piece, psqt_rel)
-            psqt_flat = torch.from_numpy(psqt.astype(np.float32) / OUTPUT_SCALE)
-            p_full, p_piece, p_rel = _decompose_triscale_table(psqt_flat, rel_map_cpu)
-            model.psqt_full.weight.data[:HKV3_NUM_FEATURES] = p_full.to(dev0)
+            psqt_flat = torch.from_numpy(psqt.astype(np.float32) / OUTPUT_SCALE).to(dev0)
+            p_full, p_piece, p_rel = _decompose_triscale_table(
+                psqt_flat, model.rel_map_pad[:HKV3_NUM_FEATURES]
+            )
+            model.psqt_full.weight.data[:HKV3_NUM_FEATURES] = p_full
             model.psqt_full.weight.data[HKV3_NUM_FEATURES:].zero_()
-            model.psqt_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = p_piece.to(dev0)
+            model.psqt_piece.weight.data[:HKV3_NUM_PIECE_FEATURES] = p_piece
             model.psqt_piece.weight.data[HKV3_NUM_PIECE_FEATURES:].zero_()
-            model.psqt_rel.weight.data[:HKV3_NUM_REL_FEATURES] = p_rel.to(dev0)
+            model.psqt_rel.weight.data[:HKV3_NUM_REL_FEATURES] = p_rel
             model.psqt_rel.weight.data[HKV3_NUM_REL_FEATURES:].zero_()
 
             # Nạp FC2
@@ -1560,141 +1396,27 @@ def load_hkv3_weights_or_checkpoint(
     return (ckpt if isinstance(ckpt, dict) else {}), loaded_epoch
 
 
-def _to_cpu_recursive(obj):
-    """Chuyển đệ quy mọi Tensor (bao gồm cả XLA/TPU tensor hoặc CUDA tensor) về CPU trước khi lưu .pt."""
-    if isinstance(obj, torch.Tensor):
-        return obj.detach().cpu()
-    if isinstance(obj, dict):
-        return {k: _to_cpu_recursive(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_to_cpu_recursive(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_to_cpu_recursive(v) for v in obj)
-    return obj
-
-
-def tpu_mark_step():
-    """Kích hoạt thực thi bước tính toán bất đồng bộ trên TPU (hỗ trợ cả torch_tpu native và torch_xla)."""
-    if HAS_NATIVE_TPU and hasattr(torch, "tpu"):
-        if hasattr(torch.tpu, "mark_step"):
-            torch.tpu.mark_step()
-    elif HAS_XLA:
-        xm.mark_step()
-
-
-def save_portable_checkpoint(data: dict, path: Path, is_tpu: bool = False, is_master: bool = True):
-    """Lưu checkpoint .pt tương thích 100% giữa TPU v5e-1/v5e-8, GPU CUDA và CPU."""
-    if is_tpu:
-        tpu_mark_step()
-    if is_master:
-        torch.save(_to_cpu_recursive(data), path)
-
-
-def get_autocast_ctx(device_type: str, enabled: bool):
-    """
-    Ngữ cảnh Mixed Precision tối ưu phần cứng:
-      - TPU v5e (MXU): Native bfloat16.
-      - GPU Ampere/Hopper (A100, H100, RTX 3090/4090): Native bfloat16.
-      - GPU Turing (Tesla T4): Native float16 (T4 không có phần cứng BF16, chạy BF16 sẽ bị giả lập chậm gấp 4 lần!).
-    """
-    if not enabled:
-        return contextlib.nullcontext()
-    if device_type in ("tpu", "xla"):
-        try:
-            return torch.autocast(device_type, dtype=torch.bfloat16, enabled=True)
-        except Exception:
-            return contextlib.nullcontext()
-    if device_type == "cuda":
-        # Kiểm tra Compute Capability: >= 8.0 (Ampere+) mới dùng BF16, còn < 8.0 (Tesla T4 là 7.5) bắt buộc dùng FP16!
-        cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
-        amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
-        return torch.amp.autocast("cuda", dtype=amp_dtype, enabled=True)
-    return contextlib.nullcontext()
-
-
-def step_optimizer(
-    loss: torch.Tensor,
-    optimizer: optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    clip_params=None,
-    max_norm: Optional[float] = None,
-    base_model: Optional[HalfKPv3Network] = None,
-    is_tpu: bool = False,
-    xla_ddp: bool = False,
-):
-    """
-    Thực hiện backward + gradient clipping + optimizer step + weight clamping:
-      - Trên TPU v5e-8 (XLA Multi-Core DDP): Dùng xm.optimizer_step(optimizer, barrier=True) để AllReduce qua ICI 400 GB/s.
-      - Trên TPU v5e-1 (Native torch_tpu / XLA bfloat16): Không cần GradScaler, gọi tpu_mark_step() cuối bước.
-      - Trên CUDA (T4x2 FP16): Sử dụng GradScaler tiêu chuẩn.
-    """
-    if is_tpu:
-        loss.backward()
-        if clip_params is not None and max_norm is not None:
-            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=max_norm)
-        if xla_ddp and HAS_XLA:
-            xm.optimizer_step(optimizer, barrier=True)
-        else:
-            optimizer.step()
-        if base_model is not None:
-            base_model.clamp_quantizable_weights()
-        if not (xla_ddp and HAS_XLA):
-            tpu_mark_step()
-    else:
-        scaler.scale(loss).backward()
-        if clip_params is not None and max_norm is not None:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=max_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        if base_model is not None:
-            base_model.clamp_quantizable_weights()
-
-
-def _detect_xla_tpu_chip_count() -> int:
-    """Phát hiện số lượng chip TPU khả dụng khi chạy dưới runtime torch_xla (1 cho v5e-1, 8 cho v5e-8)."""
-    if not HAS_XLA:
-        return 0
-    try:
-        if xr is not None and hasattr(xr, "global_runtime_device_count"):
-            return int(xr.global_runtime_device_count())
-    except Exception:
-        pass
-    try:
-        devs = xm.get_xla_supported_devices()
-        return len(devs) if devs else 1
-    except Exception:
-        return 1
-
-
-def _xla_mp_entry(rank: int, args, shared_tensors):
-    """Hàm entry point cho từng tiến trình TPU khi chạy 8-chip Data-Parallel trên TPU v5e-8 (xmp.spawn)."""
-    _run_training_pipeline(args, preloaded_data=shared_tensors, xla_rank=rank)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# 8. VÒNG LẶP HUẤN LUYỆN CHÍNH (TỰ ĐỘNG TỐI ƯU KAGGLE T4x2, TPU v5e-1 & TPU v5e-8)
+# 8. VÒNG LẶP HUẤN LUYỆN CHÍNH (HỖ TRỢ ĐA GPU KAGGLE T4x2 + AMP FP16)
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(
-        description="HalfKPv3 (HKV3) + HARENN Unified Training Pipeline (Auto-Optimized for T4x2, TPU v5e-1 & TPU v5e-8)"
+        description="HalfKPv3 (HKV3) + HARENN Training Pipeline (Kaggle T4x2 Ready)"
     )
     parser.add_argument("--data", type=str, default="Neuron Network/data", help="Thư mục chứa các file .jsonl/.json")
     parser.add_argument("--cache", type=str, default="", help="Đường dẫn file cache .npz (tùy chọn)")
     parser.add_argument("--sync-hf", action="store_true", help="Tự động tải toàn bộ .jsonl từ Hugging Face Bucket trước khi train")
-    parser.add_argument("--hf-bucket", type=str, default="australia1/harenn-high-quality-data", help="ID của Hugging Face Bucket")
+    parser.add_argument("--hf-bucket", type=str, default="australia1/myrandombucket", help="ID của Hugging Face Bucket")
     parser.add_argument("--epochs", type=int, default=16, help="Số epoch huấn luyện đa nhiệm Giai đoạn 1")
     parser.add_argument("--finetune-eval-epochs", type=int, default=4, help="Số epoch tinh chỉnh chuyên sâu Eval ở Giai đoạn 2")
-    parser.add_argument("--batch-size", type=int, default=0, help="Kích thước batch (0 = Tự động theo phần cứng: 16384 cho T4x2, 32768 cho v5e-1, 65536 cho v5e-8)")
-    parser.add_argument("--lr", type=float, default=0.0, help="Learning rate cho AdamW (0.0 = Tự động theo phần cứng: 1.5e-3 cho T4x2, 2.5e-3 cho v5e-1, 3.0e-3 cho v5e-8)")
+    parser.add_argument("--batch-size", type=int, default=16384, help="Kích thước batch (khuyến nghị 16384 cho T4x2)")
+    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate cơ sở cho AdamW")
     parser.add_argument("--wdl-weight", type=float, default=0.75, help="Tỷ trọng WDL BCE Loss so với Huber Loss (mặc định: 0.75)")
     parser.add_argument("--symmetry", type=int, default=1, choices=[1, 2], help="Chế độ đối xứng lật màu dọc (mặc định: 1x do kiến trúc đã đối xứng đại số tuyệt đối)")
     parser.add_argument("--feature-dropout", type=float, default=0.0, help="Tỷ lệ dropout chỉ riêng trên bảng W_full ở Stage 1 (mặc định: 0.0 - tắt hoàn toàn)")
     parser.add_argument("--val-split", type=float, default=0.03, help="Tỷ lệ tập validation")
-    parser.add_argument("--tpu", action="store_true", help="Ưu tiên sử dụng thiết bị Google Cloud / Colab / Kaggle TPU (v5e-1 / v5e-8)")
-    parser.add_argument("--tpu-cores", type=int, default=0, help="Số lõi TPU khi chạy XLA đa tiến trình (0 = Tự động nhận diện v5e-1 hoặc v5e-8, 1 = Đơn tiến trình)")
     parser.add_argument("--no-qat", action="store_true", help="Tắt Quantization-Aware Training")
-    parser.add_argument("--no-amp", action="store_true", help="Tắt Mixed Precision (BF16 trên TPU / FP16 trên GPU)")
+    parser.add_argument("--no-amp", action="store_true", help="Tắt Mixed Precision (FP16 Tensor Cores)")
     parser.add_argument("--resume", type=str, default="", help="Đường dẫn checkpoint (.pt) hoặc file nhị phân (.harenn) để tiếp tục train")
     parser.add_argument("--resume-epoch", type=int, default=None, help="Chỉ định epoch bắt đầu (mặc định: tự động nhận diện từ checkpoint + 1)")
     parser.add_argument("--reset-optimizer", action="store_true", help="Khởi tạo lại optimizer & LR schedule, chỉ dùng weights của model cũ")
@@ -1704,190 +1426,67 @@ def main():
     parser.add_argument("--output", type=str, default="Neuron Network/nextfish_hkv3.harenn", help="Đường dẫn xuất file .harenn")
     args = parser.parse_args()
 
-    # Nếu chạy trên TPU v5e-8 với torch_xla từ dòng lệnh và có >1 chip:
-    # Nạp dữ liệu 1 lần duy nhất vào Shared Memory RAM của tiến trình cha trước khi gọi xmp.spawn
-    in_ipython = ("ipykernel" in sys.modules) or ("google.colab" in sys.modules)
-    if (not HAS_NATIVE_TPU) and HAS_XLA and (not torch.cuda.is_available()) and (not in_ipython) and args.tpu_cores != 1:
-        os.environ.setdefault("PJRT_DEVICE", "TPU")
-        n_chips = args.tpu_cores if args.tpu_cores > 1 else _detect_xla_tpu_chip_count()
-        if n_chips > 1:
-            print(f"[TPU v5e-{n_chips} Auto-Detect] Phát hiện {n_chips} chip TPU XLA! Đang nạp dữ liệu vào Shared Memory RAM (Zero-Copy)...", flush=True)
-            if args.sync_hf:
-                sync_from_huggingface(args.hf_bucket, args.data)
-            us_d, them_d, ev_d, tau_d, rho_d, rs_d = load_or_build_hkv3_cache(
-                args.data, cache_path=args.cache if args.cache else None, use_cache=True
-            )
-            shared_tensors = (
-                torch.from_numpy(us_d).share_memory_(),
-                torch.from_numpy(them_d).share_memory_(),
-                torch.from_numpy(ev_d).share_memory_(),
-                torch.from_numpy(tau_d).share_memory_(),
-                torch.from_numpy(rho_d).share_memory_(),
-                torch.from_numpy(rs_d).share_memory_(),
-            )
-            print(f"[TPU v5e-{n_chips} Spawn] Khởi chạy {n_chips} tiến trình huấn luyện song song qua liên kết ICI...", flush=True)
-            xmp.spawn(_xla_mp_entry, args=(args, shared_tensors), nprocs=n_chips, start_method="fork")
-            return
-
-    _run_training_pipeline(args, preloaded_data=None, xla_rank=0)
-
-
-def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
     torch.manual_seed(42)
     np.random.seed(42)
     random.seed(42)
 
-    is_tpu = False
-    num_tpu_chips = 0
-    xla_world_size = 1
-    xla_ddp = False
-
-    if args.tpu or HAS_NATIVE_TPU or (HAS_XLA and not torch.cuda.is_available()):
-        if HAS_NATIVE_TPU:
-            try:
-                num_tpu_chips = int(torch.tpu.device_count()) if hasattr(torch.tpu, "device_count") else 1
-                device = torch.device("tpu:0" if num_tpu_chips > 1 else "tpu")
-                _ = torch.zeros(1, device=device)
-                is_tpu = True
-            except Exception as e:
-                if args.tpu and not HAS_XLA:
-                    raise RuntimeError(f"Không thể khởi tạo thiết bị Native TPU (torch_tpu): {e}") from e
-        if not is_tpu and HAS_XLA:
-            os.environ.setdefault("PJRT_DEVICE", "TPU")
-            try:
-                device = xm.xla_device()
-                xla_world_size = int(xm.xrt_world_size()) if hasattr(xm, "xrt_world_size") else 1
-                xla_rank = int(xm.get_ordinal()) if hasattr(xm, "get_ordinal") else xla_rank
-                xla_ddp = (xla_world_size > 1)
-                num_tpu_chips = xla_world_size if xla_ddp else max(1, _detect_xla_tpu_chip_count())
-                is_tpu = True
-            except Exception as e:
-                if args.tpu:
-                    raise RuntimeError(f"Không thể khởi tạo thiết bị TPU (torch_xla): {e}") from e
-                device = torch.device("cpu")
-        if not is_tpu:
-            if args.tpu:
-                raise RuntimeError("Cờ --tpu được bật nhưng không tìm thấy torch_tpu hoặc torch_xla khả dụng!")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    is_master = (not xla_ddp) or (xla_rank == 0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
-    use_amp = (is_tpu or device.type == "cuda") and (not args.no_amp)
-    dev_type = device.type
+    use_amp = (device.type == "cuda") and (not args.no_amp)
 
-    # Tự động chọn Batch Size & Learning Rate tối ưu theo phần cứng nếu người dùng để mặc định (0)
-    if args.batch_size <= 0:
-        if is_tpu:
-            if xla_ddp:
-                args.batch_size = 16384  # 16384 x 8 cores = 131,072 global batch size trên TPU v5e-8!
-            elif num_tpu_chips >= 2:
-                args.batch_size = 65536  # Multi-chip Tensor-Parallel trên TPU v5e-8
-            else:
-                args.batch_size = 32768  # Tối ưu cho TPU v5e-1 (16GB HBM2e)
-        elif num_gpus >= 1:
-            args.batch_size = 16384      # Tối ưu cho Kaggle T4x2 / GPU
-        else:
-            args.batch_size = 4096       # CPU fallback
-
-    if args.lr <= 0.0:
-        effective_global_bs = args.batch_size * xla_world_size
-        if effective_global_bs >= 65536:
-            args.lr = 3.0e-3
-        elif effective_global_bs >= 32768:
-            args.lr = 2.5e-3
-        else:
-            args.lr = 1.5e-3
-
-    if is_master:
-        print("=" * 76)
-        print("  HALFKPV3 (HKV3) + HARENN TRAINING PIPELINE (SINGLE BIG NET ~88.85 MB)")
-        print("=" * 76)
-        if is_tpu:
-            tpu_desc = f"TPU v5e-{num_tpu_chips}" if num_tpu_chips >= 1 else "Google Cloud / Colab TPU"
-            mode_desc = f"{xla_world_size}x Core ICI Data-Parallel" if xla_ddp else (
-                "Multi-Chip ICI Tensor-Parallel" if (HAS_NATIVE_TPU and num_tpu_chips >= 2) else "Single-Chip Unified HBM2e"
-            )
-            print(f"  Thiết bị TPU:            {tpu_desc} ({device}) | Mode: {mode_desc} | MXU BF16: {'ON' if use_amp else 'OFF'}")
-            print("  Tối ưu hóa TPU:          Static Batch Graph + Zero .item() Sync + Native Gather-Sum + Native Huber")
-        elif num_gpus > 0:
-            gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
-            cap = torch.cuda.get_device_capability(0)
-            amp_str = "BF16" if cap[0] >= 8 else "FP16 (Tensor Cores)"
-            print(f"  Thiết bị GPU:            {num_gpus}x GPU ({', '.join(gpu_names)}) | AMP {amp_str}: {'ON' if use_amp else 'OFF'}")
-        else:
-            print("  Thiết bị:                CPU")
-        print(f"  Không gian đặc trưng:    {HKV3_NUM_FEATURES:,} (32 Mirrored King Buckets x 11 Channels x 64)")
-        print(f"  Virtual Factorizer:      W_full({HKV3_NUM_FEATURES:,}) + W_piece({HKV3_NUM_PIECE_FEATURES}) + W_rel({HKV3_NUM_REL_FEATURES:,})")
-        print(f"  Cấu trúc tầng ẩn:        {HKV3_L1_SIZE} -> PairwiseGating({HKV3_L1_PAIR_SIZE}) -> SiameseTwinFC2({HKV3_L2_SIZE}) -> 4 Heads")
-        print(f"  Đối xứng dữ liệu:        {args.symmetry}x Data Loader + Bit-Exact Algebraic Parity")
-        print(f"  W_full Dropout:          {args.feature_dropout:.2%} (Chỉ áp dụng lên emb_full ở Stage 1, bảo toàn vật chất)")
-        print(f"  Batch Size:              {args.batch_size:,}/chip (Global: {args.batch_size * xla_world_size:,}) | LR: {args.lr:.2e} | Epochs: {args.epochs} + {args.finetune_eval_epochs} FT")
-        if args.resume:
-            print(f"  Resume Model:            {args.resume}")
-        print(f"  File xuất nhị phân:      {args.output}")
-        print("=" * 76, flush=True)
+    print("=" * 76)
+    print("  HALFKPV3 (HKV3) + HARENN TRAINING PIPELINE (SINGLE BIG NET ~88.85 MB)")
+    print("=" * 76)
+    if num_gpus > 0:
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
+        print(f"  Thiết bị GPU:            {num_gpus}x GPU ({', '.join(gpu_names)}) | AMP FP16: {'ON' if use_amp else 'OFF'}")
+    else:
+        print("  Thiết bị:                CPU")
+    print(f"  Không gian đặc trưng:    {HKV3_NUM_FEATURES:,} (32 Mirrored King Buckets x 11 Channels x 64)")
+    print(f"  Virtual Factorizer:      W_full({HKV3_NUM_FEATURES:,}) + W_piece({HKV3_NUM_PIECE_FEATURES}) + W_rel({HKV3_NUM_REL_FEATURES:,})")
+    print(f"  Cấu trúc tầng ẩn:        {HKV3_L1_SIZE} -> PairwiseGating({HKV3_L1_PAIR_SIZE}) -> SiameseTwinFC2({HKV3_L2_SIZE}) -> 4 Heads")
+    print(f"  Đối xứng dữ liệu:        {args.symmetry}x Data Loader + Bit-Exact Algebraic Parity")
+    print(f"  W_full Dropout:          {args.feature_dropout:.2%} (Chỉ áp dụng lên emb_full ở Stage 1, bảo toàn vật chất)")
+    print(f"  Batch Size:              {args.batch_size:,} | LR: {args.lr:.2e} | Epochs: {args.epochs} + {args.finetune_eval_epochs} FT")
+    if args.resume:
+        print(f"  Resume Model:            {args.resume}")
+    print(f"  File xuất nhị phân:      {args.output}")
+    print("=" * 76, flush=True)
 
     # 1. Đồng bộ dữ liệu từ Hugging Face Bucket nếu có cờ --sync-hf
-    if preloaded_data is not None:
-        us_data, them_data, eval_data, tau_data, rho_data, rs_data = [np.asarray(t) for t in preloaded_data]
-    else:
-        if args.sync_hf and is_master:
-            sync_from_huggingface(args.hf_bucket, args.data)
-        if xla_ddp and HAS_XLA:
-            xm.rendezvous("sync_hf_done")
-        us_data, them_data, eval_data, tau_data, rho_data, rs_data = load_or_build_hkv3_cache(
-            args.data, cache_path=args.cache if args.cache else None, use_cache=True
-        )
+    if args.sync_hf:
+        sync_from_huggingface(args.hf_bucket, args.data)
+
+    # 2. Nạp hoặc xây dựng cache nhị phân HKV3
+    us_data, them_data, eval_data, tau_data, rho_data, rs_data = load_or_build_hkv3_cache(
+        args.data, cache_path=args.cache if args.cache else None, use_cache=True
+    )
 
     n_total = len(eval_data)
-    raw_val_count = min(100000, max(1000, int(n_total * args.val_split)))
-    if is_tpu and n_total > args.batch_size * 2:
-        # Căn chỉnh tập Val thành bội số nguyên của batch_size trên TPU để dùng chung 100% đồ thị HLO tĩnh với tập Train
-        val_batches = max(1, round(raw_val_count / args.batch_size))
-        val_count = min(n_total // 2, val_batches * args.batch_size)
-    else:
-        val_count = raw_val_count
-
+    val_count = min(100000, max(1000, int(n_total * args.val_split)))
     perm = np.random.permutation(n_total)
     val_indices = perm[:val_count]
-    all_train_indices = perm[val_count:]
-    # Nếu chạy 8-chip XLA Data-Parallel trên TPU v5e-8, chia đều tập train cho từng chip
-    train_indices = all_train_indices[xla_rank::xla_world_size] if xla_ddp else all_train_indices
+    train_indices = perm[val_count:]
 
-    if is_master:
-        print(f"[Split] Train: {len(all_train_indices):,} base ({len(all_train_indices) * args.symmetry:,} effective, "
-              f"{len(train_indices) * args.symmetry:,}/chip) | Val: {len(val_indices):,} positions.", flush=True)
+    print(f"[Split] Train: {len(train_indices):,} base ({len(train_indices) * args.symmetry:,} effective) | "
+          f"Val: {len(val_indices):,} positions.", flush=True)
 
     train_loader = FastHKV3BatchLoader(
         us_data, them_data, eval_data, tau_data, rho_data, rs_data,
         train_indices, batch_size=args.batch_size, shuffle=True,
-        symmetry=args.symmetry, device=device, static_shape=is_tpu
+        symmetry=args.symmetry, device=device
     )
     val_loader = FastHKV3BatchLoader(
         us_data, them_data, eval_data, tau_data, rho_data, rs_data,
         val_indices, batch_size=args.batch_size, shuffle=False,
-        symmetry=1, device=device, static_shape=is_tpu
+        symmetry=1, device=device
     )
 
-    # 3. Khởi tạo mạng HalfKPv3 trên TPU v5e-1 / v5e-8 hoặc Tensor-Parallel trên 2 GPU (Kaggle T4x2)
-    if is_tpu:
-        if HAS_NATIVE_TPU and num_tpu_chips >= 2:
-            dev0 = torch.device("tpu:0")
-            dev1 = torch.device("tpu:1")
-            if is_master:
-                print(f"[TPU v5e-{num_tpu_chips} Tensor-Parallel] Nhánh Left (1024) -> {dev0} || Nhánh Right (1024) -> {dev1} (ICI High-Speed Link!)", flush=True)
-        else:
-            dev0 = device
-            dev1 = device
-            if is_master:
-                print(f"[TPU v5e Unified HBM] Toàn bộ mô hình + Shared Factorizer Maps đặt trên {dev0} (Active Chips: {xla_world_size})", flush=True)
-    else:
-        dev0 = torch.device("cuda:0") if num_gpus >= 1 else torch.device("cpu")
-        dev1 = torch.device("cuda:1") if num_gpus >= 2 else dev0
-        if num_gpus >= 2 and is_master:
-            print(f"[T4x2 Tensor-Parallel] Nhánh Left (1024) -> {dev0} || Nhánh Right (1024) -> {dev1} (Zero PCIe Weight Copy!)", flush=True)
+    # 3. Khởi tạo mạng HalfKPv3 với Tensor-Parallel tự nhiên trên 2 GPU (ví dụ Kaggle T4x2)
+    dev0 = torch.device("cuda:0") if num_gpus >= 1 else torch.device("cpu")
+    dev1 = torch.device("cuda:1") if num_gpus >= 2 else dev0
+    if num_gpus >= 2:
+        print(f"[T4x2 Tensor-Parallel] Nhánh Left (1024) -> {dev0} || Nhánh Right (1024) -> {dev1} (Zero PCIe Weight Copy!)", flush=True)
 
     base_model = HalfKPv3Network(
         qat=not args.no_qat,
@@ -1899,7 +1498,7 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
 
     model: nn.Module = base_model
     criterion = HKV3MultiTaskLoss(wdl_weight=args.wdl_weight).to(dev0)
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not is_tpu))
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Phân nhóm tham số tối ưu:
     # - W_full chịu weight_decay cao hơn (5e-5) để ép các ô Vua hiếm dựa vào W_piece & W_rel
@@ -1947,7 +1546,7 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
                     print("[Resume] Đã khôi phục trạng thái AdamW optimizer thành công!", flush=True)
                 except Exception as e:
                     print(f"[Resume Warning] Không thể khôi phục optimizer: {e}", flush=True)
-            if "scaler_state_dict" in ckpt_dict and use_amp and not is_tpu:
+            if "scaler_state_dict" in ckpt_dict and use_amp:
                 try:
                     scaler.load_state_dict(ckpt_dict["scaler_state_dict"])
                     print("[Resume] Đã khôi phục trạng thái AMP GradScaler thành công!", flush=True)
@@ -1973,33 +1572,29 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
         else:
             print("[Resume] Cờ --reset-optimizer được bật: Khởi tạo lại optimizer và LR schedule mới.", flush=True)
 
-    metric_keys = ("total", "eval", "tau", "rho", "rs", "mae_cp", "wdl_err")
-
     def evaluate_validation() -> Dict[str, float]:
         model.eval()
-        totals_t = {k: torch.zeros((), dtype=torch.float32, device=dev0) for k in metric_keys}
+        totals = {"total": 0.0, "eval": 0.0, "tau": 0.0, "rho": 0.0, "rs": 0.0, "mae_cp": 0.0, "wdl_err": 0.0}
         steps = 0
         with torch.no_grad():
             for us_b, them_b, targets_b in val_loader:
-                with get_autocast_ctx(dev_type, use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     _, m = criterion(outputs_b, targets_b)
-                for k in metric_keys:
-                    totals_t[k] = totals_t[k] + m[k]
+                for k in totals:
+                    totals[k] += m[k]
                 steps += 1
-                if is_tpu:
-                    tpu_mark_step()
-        denom = float(max(1, steps))
-        return {k: float(totals_t[k].item()) / denom for k in metric_keys}
+        for k in totals:
+            totals[k] /= max(1, steps)
+        return totals
 
     # ─── GIAI ĐOẠN ĐẶC BIỆT: CHUYÊN SÂU FINETUNE ĐẦU CHIẾN THUẬT (TAU, RHO, RS) ───
     if args.finetune_tactical:
-        if is_master:
-            print("\n" + "=" * 76)
-            print("  [Stage Tactical] CHUYÊN SÂU FINETUNE ĐẦU CHIẾN THUẬT (TAU, RHO, RS)")
-            print("  Đóng băng toàn bộ Feature Extractor Backbone và Eval Head!")
-            print("  Chỉ huấn luyện 3 Linear Heads: tau, rho, rs với lr=2.0e-3")
-            print("=" * 76, flush=True)
+        print("\n" + "=" * 76)
+        print("  [Stage Tactical] CHUYÊN SÂU FINETUNE ĐẦU CHIẾN THUẬT (TAU, RHO, RS)")
+        print("  Đóng băng toàn bộ Feature Extractor Backbone và Eval Head!")
+        print("  Chỉ huấn luyện 3 Linear Heads: tau, rho, rs với lr=2.0e-3")
+        print("=" * 76, flush=True)
 
         base_model.set_full_dropout(0.0)
         for p in base_model.parameters():
@@ -2013,122 +1608,92 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
         for ep in range(1, args.tactical_epochs + 1):
             model.train()
             t0 = time.time()
-            tac_loss_sum_t = torch.zeros((), dtype=torch.float32, device=dev0)
+            tac_loss_sum = 0.0
             steps = 0
             for us_b, them_b, targets_b in train_loader:
                 tac_opt.zero_grad(set_to_none=True)
-                with get_autocast_ctx(dev_type, use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     loss_tau = F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
                     loss_rho = F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
                     loss_rs = F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
                     loss = loss_tau + loss_rho + loss_rs
 
-                tac_loss_sum_t = tac_loss_sum_t + loss.detach().float()
-                step_optimizer(
-                    loss, tac_opt, scaler,
-                    clip_params=base_model.tac_head.parameters(),
-                    max_norm=1.0,
-                    base_model=None,
-                    is_tpu=is_tpu,
-                    xla_ddp=xla_ddp,
-                )
+                scaler.scale(loss).backward()
+                scaler.unscale_(tac_opt)
+                torch.nn.utils.clip_grad_norm_(base_model.tac_head.parameters(), max_norm=1.0)
+                scaler.step(tac_opt)
+                scaler.update()
+                tac_loss_sum += loss.item()
                 steps += 1
 
             tac_sched.step()
-            tac_loss_avg = float(tac_loss_sum_t.item()) / max(1, steps)
             dt = time.time() - t0
             val_m = evaluate_validation()
-            if is_master:
-                print(
-                    f"[Tactical Ep {ep:02d}/{args.tactical_epochs:02d} ({dt:5.1f}s)] "
-                    f"Train BCE Loss: {tac_loss_avg:.4f} | "
-                    f"Val: [tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | Val MAE: {val_m['mae_cp']:.2f}cp",
-                    flush=True,
-                )
+            print(
+                f"[Tactical Ep {ep:02d}/{args.tactical_epochs:02d} ({dt:5.1f}s)] "
+                f"Train BCE Loss: {tac_loss_sum / max(1, steps):.4f} | "
+                f"Val: [tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | Val MAE: {val_m['mae_cp']:.2f}cp",
+                flush=True,
+            )
 
-        if is_master:
-            print(f"\n[Export] Xuất nhị phân cập nhật Tactical Heads: {args.output}...", flush=True)
-            export_hkv3_binary(base_model, args.output)
+        print(f"\n[Export] Xuất nhị phân cập nhật Tactical Heads: {args.output}...", flush=True)
+        export_hkv3_binary(base_model, args.output)
         for p in base_model.parameters():
             p.requires_grad = True
 
-        if is_master:
-            print(f"[Done] Tactical heads finetune hoàn tất! -> {args.output}", flush=True)
+        print(f"[Done] Tactical heads finetune hoàn tất! -> {args.output}", flush=True)
         return
 
     # ─── GIAI ĐOẠN 1: HUẤN LUYỆN ĐA NHIỆM ĐỒNG THỜI (EVAL + TAU + RHO + RS) ───
     if args.skip_stage1:
-        if is_master:
-            print("\n[Stage 1] Bỏ qua Giai đoạn 1 do cờ --skip-stage1 được kích hoạt.", flush=True)
+        print("\n[Stage 1] Bỏ qua Giai đoạn 1 do cờ --skip-stage1 được kích hoạt.", flush=True)
     elif start_epoch > args.epochs:
-        if is_master:
-            print(
-                f"\n[Stage 1] Checkpoint đã hoàn thành {start_epoch - 1}/{args.epochs} epochs. "
-                f"Bỏ qua Stage 1 để chuyển tiếp sang Stage 2 (hoặc chỉ định --epochs lớn hơn để train tiếp).",
-                flush=True,
-            )
+        print(
+            f"\n[Stage 1] Checkpoint đã hoàn thành {start_epoch - 1}/{args.epochs} epochs. "
+            f"Bỏ qua Stage 1 để chuyển tiếp sang Stage 2 (hoặc chỉ định --epochs lớn hơn để train tiếp).",
+            flush=True,
+        )
     else:
-        if is_master:
-            print(f"\n[Stage 1] Bắt đầu huấn luyện Đa nhiệm HalfKPv3 (Epoch {start_epoch:02d} -> {args.epochs:02d})...", flush=True)
-            if is_tpu:
-                print("[TPU Warmup] Batch đầu tiên của Epoch 1 sẽ biên dịch đồ thị XLA HLO tĩnh (~30-45s), sau đó chạy tốc độ tối đa!", flush=True)
-        train_keys = ("total", "eval", "tau", "rho", "rs", "mae_cp")
+        print(f"\n[Stage 1] Bắt đầu huấn luyện Đa nhiệm HalfKPv3 (Epoch {start_epoch:02d} -> {args.epochs:02d})...", flush=True)
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             t0 = time.time()
-            train_totals_t = {k: torch.zeros((), dtype=torch.float32, device=dev0) for k in train_keys}
+            train_totals = {"total": 0.0, "eval": 0.0, "tau": 0.0, "rho": 0.0, "rs": 0.0, "mae_cp": 0.0}
             steps = 0
 
             for us_b, them_b, targets_b in train_loader:
                 optimizer.zero_grad(set_to_none=True)
-                with get_autocast_ctx(dev_type, use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     loss, m = criterion(outputs_b, targets_b)
 
-                for k in train_keys:
-                    train_totals_t[k] = train_totals_t[k] + m[k]
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                base_model.clamp_quantizable_weights()
 
-                step_optimizer(
-                    loss, optimizer, scaler,
-                    clip_params=base_model.parameters(),
-                    max_norm=1.0,
-                    base_model=base_model,
-                    is_tpu=is_tpu,
-                    xla_ddp=xla_ddp,
-                )
+                for k in train_totals:
+                    train_totals[k] += m[k]
                 steps += 1
 
-                # In tiến độ định kỳ mỗi 500 batches để người dùng luôn thấy tốc độ thực tế (Zero Freeze!)
-                if is_master and (steps % 500 == 0):
-                    cur_t = time.time()
-                    elapsed = cur_t - t0
-                    cur_pos_s = int((steps * args.batch_size * xla_world_size) / max(1e-3, elapsed))
-                    batch_loss = float(m["total"].item()) if hasattr(m["total"], "item") else float(m["total"])
-                    batch_mae = float(m["mae_cp"].item()) if hasattr(m["mae_cp"], "item") else float(m["mae_cp"])
-                    print(
-                        f"  [Ep {epoch:02d} | Step {steps:5d}/{len(train_loader):5d} ({steps/len(train_loader):.1%})] "
-                        f"Speed: {cur_pos_s:,} pos/s | Batch Loss: {batch_loss:.4f} (MAE: {batch_mae:.1f}cp) | Time: {elapsed:.0f}s",
-                        flush=True,
-                    )
-
             scheduler.step()
-            denom = float(max(1, steps))
-            train_totals = {k: float(train_totals_t[k].item()) / denom for k in train_keys}
             dt = time.time() - t0
+            for k in train_totals:
+                train_totals[k] /= max(1, steps)
 
             val_m = evaluate_validation()
             cur_lr = scheduler.get_last_lr()[0]
-            pos_per_sec = int((steps * args.batch_size * xla_world_size) / max(1e-3, dt))
 
-            if is_master:
-                print(
-                    f"Epoch {epoch:02d}/{args.epochs:02d} ({dt:5.1f}s | {pos_per_sec:,} pos/s) | "
-                    f"Train Loss: {train_totals['total']:.4f} (MAE: {train_totals['mae_cp']:.1f}cp) | "
-                    f"Val Loss: {val_m['total']:.4f} (MAE: {val_m['mae_cp']:.1f}cp, WDL^2.5: {val_m['wdl_err']:.5f}) | "
-                    f"[tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | LR: {cur_lr:.2e}",
-                    flush=True,
-                )
+            print(
+                f"Epoch {epoch:02d}/{args.epochs:02d} ({dt:5.1f}s) | "
+                f"Train Loss: {train_totals['total']:.4f} (MAE: {train_totals['mae_cp']:.1f}cp) | "
+                f"Val Loss: {val_m['total']:.4f} (MAE: {val_m['mae_cp']:.1f}cp, WDL^2.5: {val_m['wdl_err']:.5f}) | "
+                f"[tau:{val_m['tau']:.4f} rho:{val_m['rho']:.4f} rs:{val_m['rs']:.4f}] | LR: {cur_lr:.2e}",
+                flush=True,
+            )
 
             # Cập nhật best_val_loss / best_val_mae TRƯỚC khi đóng gói ckpt_data để lưu đúng kỷ lục mới nhất
             is_new_best = val_m["total"] < best_val_loss
@@ -2147,33 +1712,28 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
             }
             ckpt_path = Path(args.output).with_suffix(f".epoch{epoch}.pt")
             latest_path = Path(args.output).with_suffix(".latest.pt")
-            save_portable_checkpoint(ckpt_data, ckpt_path, is_tpu=is_tpu, is_master=is_master)
-            save_portable_checkpoint(ckpt_data, latest_path, is_tpu=is_tpu, is_master=is_master)
+            torch.save(ckpt_data, ckpt_path)
+            torch.save(ckpt_data, latest_path)
 
-            if is_new_best and is_master:
-                save_portable_checkpoint(ckpt_data, best_pt_path, is_tpu=is_tpu, is_master=True)
+            if is_new_best:
+                torch.save(ckpt_data, best_pt_path)
                 export_hkv3_binary(base_model, args.output)
-            if xla_ddp and HAS_XLA:
-                xm.rendezvous(f"ep_{epoch}_save_done")
 
     # ─── GIAI ĐOẠN 2: TINH CHỈNH CHUYÊN SÂU ĐẦU ĐỌC EVAL (2A: JOINT REFINEMENT + 2B: LOCKED HEAD) ───
     if args.finetune_eval_epochs > 0:
         phase_a = max(1, args.finetune_eval_epochs // 2)
         phase_b = max(1, args.finetune_eval_epochs - phase_a)
-        if is_master:
-            print(f"\n[Stage 2] Tinh chỉnh chuyên sâu Eval ({phase_a} epochs Phase 2A + {phase_b} epochs Phase 2B)...", flush=True)
+        print(f"\n[Stage 2] Tinh chỉnh chuyên sâu Eval ({phase_a} epochs Phase 2A + {phase_b} epochs Phase 2B)...", flush=True)
 
         # Tắt hoàn toàn W_full dropout ở Stage 2 để mạng hội tụ chính xác từng centipawn
         base_model.set_full_dropout(0.0)
 
         # Khôi phục Best Model từ Stage 1 trước khi bước vào Stage 2A (tránh bắt đầu từ epoch cuối bị overfit)
         if best_pt_path.exists():
-            if is_master:
-                print(f"[Stage 2A] Nạp lại Best Checkpoint từ Stage 1 ({best_pt_path})...", flush=True)
+            print(f"[Stage 2A] Nạp lại Best Checkpoint từ Stage 1 ({best_pt_path})...", flush=True)
             _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
         elif Path(args.output).exists():
-            if is_master:
-                print(f"[Stage 2A] Nạp lại Best Binary từ Stage 1 ({args.output})...", flush=True)
+            print(f"[Stage 2A] Nạp lại Best Binary từ Stage 1 ({args.output})...", flush=True)
             _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
 
         # Nếu chưa có mốc best_val_mae (ví dụ khi chạy --skip-stage1 từ file .harenn), đo ngay trên tập Val
@@ -2181,8 +1741,7 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
             init_val = evaluate_validation()
             best_val_loss = init_val["total"]
             best_val_mae = init_val["mae_cp"]
-            if is_master:
-                print(f"[Stage 2A] Baseline Val MAE trước khi fine-tune: {best_val_mae:.2f} cp", flush=True)
+            print(f"[Stage 2A] Baseline Val MAE trước khi fine-tune: {best_val_mae:.2f} cp", flush=True)
 
         # Phase 2A: Ưu tiên Eval gấp 4 lần nhưng vẫn giữ neo tau/rho/rs
         ft_opt_a = optim.AdamW([
@@ -2205,7 +1764,7 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
             t0 = time.time()
             for us_b, them_b, targets_b in train_loader:
                 ft_opt_a.zero_grad(set_to_none=True)
-                with get_autocast_ctx(dev_type, use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
                     loss_aux = (
@@ -2214,54 +1773,44 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
                         + F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
                     )
                     loss = 4.0 * loss_ev + 0.15 * loss_aux
-                step_optimizer(
-                    loss, ft_opt_a, scaler,
-                    clip_params=base_model.parameters(),
-                    max_norm=0.5,
-                    base_model=base_model,
-                    is_tpu=is_tpu,
-                    xla_ddp=xla_ddp,
-                )
+                scaler.scale(loss).backward()
+                scaler.unscale_(ft_opt_a)
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=0.5)
+                scaler.step(ft_opt_a)
+                scaler.update()
+                base_model.clamp_quantizable_weights()
 
             ft_sched_a.step()
-            val_m = evaluate_validation()
             dt = time.time() - t0
-            if is_master:
-                print(
-                    f"[Phase 2A {ep:02d}/{phase_a:02d} ({dt:5.1f}s)] "
-                    f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
-                    flush=True,
-                )
+            val_m = evaluate_validation()
+            print(
+                f"[Phase 2A {ep:02d}/{phase_a:02d} ({dt:5.1f}s)] "
+                f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
+                flush=True,
+            )
             if val_m["mae_cp"] < best_val_mae:
                 best_val_mae = val_m["mae_cp"]
-                if is_master:
-                    save_portable_checkpoint({
-                        "stage": "2A_best",
-                        "model_state_dict": base_model.state_dict(),
-                        "best_val_loss": best_val_loss,
-                        "best_val_mae": best_val_mae,
-                    }, best_pt_path, is_tpu=is_tpu, is_master=True)
-                    export_hkv3_binary(base_model, args.output)
-            if xla_ddp and HAS_XLA:
-                xm.rendezvous(f"p2a_{ep}_done")
+                torch.save({
+                    "stage": "2A_best",
+                    "model_state_dict": base_model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_val_mae": best_val_mae,
+                }, best_pt_path)
+                export_hkv3_binary(base_model, args.output)
 
         ckpt_2a_path = Path(args.output).with_suffix(".phase2a.pt")
-        save_portable_checkpoint({
+        torch.save({
             "stage": "2A",
             "model_state_dict": base_model.state_dict(),
             "best_val_mae": best_val_mae,
-        }, ckpt_2a_path, is_tpu=is_tpu, is_master=is_master)
-        if xla_ddp and HAS_XLA:
-            xm.rendezvous("p2a_complete")
+        }, ckpt_2a_path)
 
         # Khôi phục Best Model sau Phase 2A trước khi đóng băng Backbone sang Phase 2B
         if best_pt_path.exists():
-            if is_master:
-                print(f"[Stage 2B] Nạp lại Best Checkpoint ({best_pt_path}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
+            print(f"[Stage 2B] Nạp lại Best Checkpoint ({best_pt_path}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
             _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
         elif Path(args.output).exists():
-            if is_master:
-                print(f"[Stage 2B] Nạp lại Best Binary ({args.output}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
+            print(f"[Stage 2B] Nạp lại Best Binary ({args.output}, MAE: {best_val_mae:.2f} cp) trước khi khóa Backbone...", flush=True)
             _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
 
         # Phase 2B: Đóng băng toàn bộ Backbone & tac_head, chỉ hiệu chỉnh eval_head (0.00% drift trên tau/rho/rs)
@@ -2278,74 +1827,60 @@ def _run_training_pipeline(args, preloaded_data=None, xla_rank: int = 0):
             t0 = time.time()
             for us_b, them_b, targets_b in train_loader:
                 ft_opt_b.zero_grad(set_to_none=True)
-                with get_autocast_ctx(dev_type, use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
-                step_optimizer(
-                    loss_ev, ft_opt_b, scaler,
-                    clip_params=None,
-                    max_norm=None,
-                    base_model=base_model,
-                    is_tpu=is_tpu,
-                    xla_ddp=xla_ddp,
-                )
+                scaler.scale(loss_ev).backward()
+                scaler.unscale_(ft_opt_b)
+                scaler.step(ft_opt_b)
+                scaler.update()
+                base_model.clamp_quantizable_weights()
 
             ft_sched_b.step()
-            val_m = evaluate_validation()
             dt = time.time() - t0
-            if is_master:
-                print(
-                    f"[Phase 2B {ep:02d}/{phase_b:02d} ({dt:5.1f}s)] "
-                    f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
-                    flush=True,
-                )
+            val_m = evaluate_validation()
+            print(
+                f"[Phase 2B {ep:02d}/{phase_b:02d} ({dt:5.1f}s)] "
+                f"Val Eval Loss: {val_m['eval']:.4f} | Val MAE: {val_m['mae_cp']:.2f}cp | WDL^2.5: {val_m['wdl_err']:.5f}",
+                flush=True,
+            )
             if val_m["mae_cp"] < best_val_mae:
                 best_val_mae = val_m["mae_cp"]
-                if is_master:
-                    save_portable_checkpoint({
-                        "stage": "2B_best",
-                        "model_state_dict": base_model.state_dict(),
-                        "best_val_loss": best_val_loss,
-                        "best_val_mae": best_val_mae,
-                    }, best_pt_path, is_tpu=is_tpu, is_master=True)
-                    export_hkv3_binary(base_model, args.output)
-            if xla_ddp and HAS_XLA:
-                xm.rendezvous(f"p2b_{ep}_done")
+                torch.save({
+                    "stage": "2B_best",
+                    "model_state_dict": base_model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_val_mae": best_val_mae,
+                }, best_pt_path)
+                export_hkv3_binary(base_model, args.output)
 
         ckpt_2b_path = Path(args.output).with_suffix(".phase2b.pt")
-        save_portable_checkpoint({
+        torch.save({
             "stage": "2B",
             "model_state_dict": base_model.state_dict(),
             "best_val_mae": best_val_mae,
-        }, ckpt_2b_path, is_tpu=is_tpu, is_master=is_master)
+        }, ckpt_2b_path)
 
         for p in base_model.parameters():
             p.requires_grad = True
 
     # ─── KIỂM CHỨNG ĐỐI XỨNG SỐ NGUYÊN C++ AVX2 SAU KHI XUẤT FILE ───
-    if is_master:
-        # Nạp lại chính xác Best Model đã lưu để tránh model ở epoch cuối ghi đè làm mất best model!
-        if best_pt_path.exists():
-            print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {best_pt_path} để kiểm chứng...", flush=True)
-            _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
-        elif Path(args.output).exists():
-            print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {args.output} để kiểm chứng...", flush=True)
-            _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
-        quant_tensors = export_hkv3_binary(base_model, args.output)
-
-        # Chuyển model về CPU cho bước kiểm chứng 64 thế cờ cuối cùng (tránh XLA biên dịch lại đồ thị cho batch=64)
-        base_model.to("cpu")
-        base_model.dev0 = torch.device("cpu")
-        base_model.dev1 = torch.device("cpu")
-
-        sample_n = min(64, len(val_indices))
-        verify_integer_avx2_parity_and_accuracy(
-            quant_tensors,
-            us_data[val_indices[:sample_n]],
-            them_data[val_indices[:sample_n]],
-            model=base_model,
-        )
-        print(f"\n[Done] Huấn luyện hoàn tất! Best Validation MAE: {best_val_mae:.2f} cp -> {args.output}", flush=True)
+    # Nạp lại chính xác Best Model đã lưu để tránh model ở epoch cuối ghi đè làm mất best model!
+    if best_pt_path.exists():
+        print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {best_pt_path} để kiểm chứng...", flush=True)
+        _, _ = load_hkv3_weights_or_checkpoint(base_model, str(best_pt_path), dev0, dev1)
+    elif Path(args.output).exists():
+        print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {args.output} để kiểm chứng...", flush=True)
+        _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
+    quant_tensors = export_hkv3_binary(base_model, args.output)
+    sample_n = min(64, len(val_indices))
+    verify_integer_avx2_parity_and_accuracy(
+        quant_tensors,
+        us_data[val_indices[:sample_n]],
+        them_data[val_indices[:sample_n]],
+        model=base_model,
+    )
+    print(f"\n[Done] Huấn luyện hoàn tất! Best Validation MAE: {best_val_mae:.2f} cp -> {args.output}", flush=True)
 
 
 if __name__ == "__main__":
