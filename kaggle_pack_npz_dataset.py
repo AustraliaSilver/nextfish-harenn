@@ -38,6 +38,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 try:
+    import orjson as _orjson
+    def _fast_json_loads(raw):
+        return _orjson.loads(raw)
+except ImportError:
+    def _fast_json_loads(raw):
+        return json.loads(raw)
+
+try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
@@ -237,19 +245,19 @@ def _parse_file_worker(file_path_str: str):
 
     try:
         if path.suffix == ".json":
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with open(path, "rb") as f:
+                data = _fast_json_loads(f.read())
             positions = data.get("positions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for p in positions:
                 process_record(p)
         else:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "rb") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        process_record(json.loads(line))
+                        process_record(_fast_json_loads(line))
                     except Exception:
                         continue
     except Exception as e:
