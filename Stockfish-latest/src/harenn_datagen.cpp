@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -38,7 +39,35 @@ struct DatagenConfig {
     int time_budget_sec = 0;
     std::string output_dir = "data";
     std::string worker_id = "";
+    std::string book_path = "";
+    int book_random_plies = 2;
+    int branch_plies = 12;
+    int branch_cp = 75;
 };
+
+std::vector<std::string> load_book_fens(const std::string& path) {
+    std::vector<std::string> fens;
+    if (path.empty()) return fens;
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "Warning: could not open book file: " << path << std::endl;
+        return fens;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ls(line);
+        std::string board, stm, castling, ep, hm, fm;
+        if (!(ls >> board >> stm >> castling >> ep)) continue;
+        if (ls >> hm >> fm && std::isdigit(static_cast<unsigned char>(hm[0])) &&
+            std::isdigit(static_cast<unsigned char>(fm[0]))) {
+            fens.push_back(board + " " + stm + " " + castling + " " + ep + " " + hm + " " + fm);
+        } else {
+            fens.push_back(board + " " + stm + " " + castling + " " + ep + " 0 1");
+        }
+    }
+    return fens;
+}
 
 struct RawPosRecord {
     std::string fen;
@@ -137,6 +166,7 @@ std::string first_token(std::string_view sv) {
 
 void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                Engine& engine,
+               const std::vector<std::string>& book_fens,
                std::atomic<uint64_t>& total_positions,
                std::chrono::steady_clock::time_point start_tp,
                std::mutex& log_mtx) {
@@ -163,7 +193,8 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         engine.get_options().setoption(os);
     };
     set_opt("Threads", "1");
-    set_opt("MultiPV", std::to_string(cfg.multipv));
+    int cur_multipv = cfg.multipv;
+    set_opt("MultiPV", std::to_string(cur_multipv));
 
     std::string m_shallow_str, sec_shallow_str;
     int cp_shallow = 0;
@@ -218,11 +249,21 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         }
 
         games_played++;
-        bool is_standard = (u01(rng) < 0.70);
-        std::string start_fen = is_standard
-            ? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-            : generate_dfrc_fen(rng);
-        int random_plies = is_standard ? 3 : std::uniform_int_distribution<int>(4, 6)(rng);
+        bool is_standard = true;
+        std::string start_fen;
+        int random_plies = 2;
+        if (!book_fens.empty()) {
+            std::uniform_int_distribution<size_t> bdist(0, book_fens.size() - 1);
+            start_fen = book_fens[bdist(rng)];
+            is_standard = true;
+            random_plies = cfg.book_random_plies;
+        } else {
+            is_standard = (u01(rng) < 0.70);
+            start_fen = is_standard
+                ? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                : generate_dfrc_fen(rng);
+            random_plies = is_standard ? 3 : std::uniform_int_distribution<int>(4, 6)(rng);
+        }
 
         set_opt("UCI_Chess960", is_standard ? "false" : "true");
 
@@ -271,6 +312,14 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             achieved_depth = 1;
             best_move_uci.clear();
 
+            bool in_branch_window = (cfg.branch_plies > 0 && move_num > random_plies &&
+                                     move_num <= random_plies + cfg.branch_plies);
+            int target_mpv = in_branch_window ? 2 : cfg.multipv;
+            if (target_mpv != cur_multipv) {
+                cur_multipv = target_mpv;
+                set_opt("MultiPV", std::to_string(cur_multipv));
+            }
+
             Search::LimitsType limits;
             limits.nodes = cfg.soft_nodes ? (cfg.nodes * 4) : cfg.nodes;
             engine.go(limits);
@@ -286,7 +335,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
             if (m_deep_str.empty()) m_deep_str = best_move_uci;
             if (sec_shallow_str.empty()) sec_shallow_str = sec_deep_str;
-            if (cfg.multipv == 1) cp_second = cp_deep;
+            if (cur_multipv == 1) cp_second = cp_deep;
 
             last_eval_white = (pos.side_to_move() == WHITE) ? cp_deep : -cp_deep;
             has_last_eval = true;
@@ -338,8 +387,13 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             rec.rs = std::round(rs * 10000.0) / 10000.0;
             rec.is_quiet = quiet;
 
+            std::string move_to_play = best_move_uci;
+            if (in_branch_window && !sec_deep_str.empty() &&
+                (cp_deep - cp_second) <= cfg.branch_cp && u01(rng) < 0.50) {
+                move_to_play = sec_deep_str;
+            }
             game_positions.push_back(std::move(rec));
-            played_moves.push_back(best_move_uci);
+            played_moves.push_back(move_to_play);
         }
 
         // Determine game outcome
@@ -415,11 +469,18 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
         else if (tok == "--time-budget" && (is >> tok)) cfg.time_budget_sec = std::stoi(tok);
         else if ((tok == "--output" || tok == "-o") && (is >> tok)) cfg.output_dir = tok;
         else if ((tok == "--worker-id" || tok == "-w") && (is >> tok)) cfg.worker_id = tok;
+        else if (tok == "--book" && (is >> tok)) cfg.book_path = tok;
+        else if (tok == "--book-random-plies" && (is >> tok)) cfg.book_random_plies = std::max(0, std::stoi(tok));
+        else if (tok == "--branch-plies" && (is >> tok)) cfg.branch_plies = std::max(0, std::stoi(tok));
+        else if (tok == "--branch-cp" && (is >> tok)) cfg.branch_cp = std::max(0, std::stoi(tok));
     }
 
+    std::vector<std::string> book_fens = load_book_fens(cfg.book_path);
     std::cout << "=== HARENN C++ Native Datagen (Stockfish Latest) | Games: " << cfg.games
               << " | Nodes: " << cfg.nodes << " | Hash: " << cfg.hash_mb << "MB | Threads: "
-              << cfg.concurrency << " | MultiPV: " << cfg.multipv << " ===" << std::endl;
+              << cfg.concurrency << " | MultiPV: " << cfg.multipv
+              << " | Book: " << book_fens.size() << " pos | RandPlies: " << cfg.book_random_plies
+              << " | BranchPlies: " << cfg.branch_plies << " (cp<=" << cfg.branch_cp << ") ===" << std::endl;
 
     std::atomic<uint64_t> total_positions{0};
     auto start_tp = std::chrono::steady_clock::now();
@@ -436,7 +497,7 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
     threads.reserve(cfg.concurrency);
     for (int i = 0; i < cfg.concurrency; ++i) {
         threads.emplace_back(worker_fn, i, std::cref(cfg), per_worker, std::ref(*engines[i]),
-                             std::ref(total_positions), start_tp, std::ref(log_mtx));
+                             std::cref(book_fens), std::ref(total_positions), start_tp, std::ref(log_mtx));
     }
     for (auto& t : threads) t.join();
 

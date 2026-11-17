@@ -62,6 +62,9 @@ jobs:
           sleep $(( (${{ inputs.worker_id }} % 10) * 2 ))
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
           cp Stockfish-latest/src/nn-bddd9d57eb87.nnue ./nn-bddd9d57eb87.nnue
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o uho.epd.zip https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip
+          unzip -p uho.epd.zip > uho.epd
+          rm -f uho.epd.zip
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           mv Stockfish-latest/src/stockfish ./harenn_engine
           chmod +x ./harenn_engine
@@ -70,7 +73,7 @@ jobs:
         if: steps.chk.outputs.reroll == 'false'
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
@@ -193,6 +196,9 @@ jobs:
           sleep $(( (${{ inputs.worker_id }} % 10) * 2 ))
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
           cp Stockfish-latest/src/nn-bddd9d57eb87.nnue ./nn-bddd9d57eb87.nnue
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o uho.epd.zip https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip
+          unzip -p uho.epd.zip > uho.epd
+          rm -f uho.epd.zip
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           mv Stockfish-latest/src/stockfish ./harenn_engine
           chmod +x ./harenn_engine
@@ -201,7 +207,7 @@ jobs:
         if: steps.chk.outputs.reroll == 'false'
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
@@ -310,6 +316,9 @@ jobs:
           sleep $(( (${{ inputs.worker_id }} % 10) * 2 ))
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
           cp Stockfish-latest/src/nn-bddd9d57eb87.nnue ./nn-bddd9d57eb87.nnue
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o uho.epd.zip https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip
+          unzip -p uho.epd.zip > uho.epd
+          rm -f uho.epd.zip
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           mv Stockfish-latest/src/stockfish ./harenn_engine
           chmod +x ./harenn_engine
@@ -317,7 +326,7 @@ jobs:
       - name: Generate Data (time-budgeted C++ native)
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
