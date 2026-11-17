@@ -299,12 +299,18 @@ def sync_from_huggingface(bucket_id: str, data_dir: str, token: Optional[str] = 
     return len(jsonl_files)
 
 
-def _parse_single_data_file_worker(file_path_str: str):
+def _parse_single_data_file_worker(task):
     """Hàm worker chạy đa tiến trình để phân tích 1 file .jsonl hoặc .json sang chỉ số HKV3."""
+    if isinstance(task, tuple):
+        file_path_str, is_val_file, tail_val_split = task
+    else:
+        file_path_str, is_val_file, tail_val_split = task, False, 0.0
     path = Path(file_path_str)
     us_list = []
     them_list = []
     eval_list = []
+    wdl_list = []
+    eval_mask_list = []
     tau_list = []
     rho_list = []
     rs_list = []
@@ -358,12 +364,35 @@ def _parse_single_data_file_worker(file_path_str: str):
             return
 
         try:
-            ev_cp = float(ev_raw)
+            ev_cp_raw = float(ev_raw)
         except (ValueError, TypeError):
             return
 
-        ev_cp = max(-1000.0, min(1000.0, ev_cp))
+        # Lọc mặt nạ Eval: chỉ train Static Eval trên thế cờ yên tĩnh (is_quiet) và không phải thế Mate (|eval| < 9000).
+        # Các thế non-quiet vẫn giữ nguyên để train 3 đầu chiến thuật tau / rho / rs!
+        q_raw = pos.get("is_quiet", True)
+        if isinstance(q_raw, str):
+            is_quiet_flag = q_raw.strip().lower() in ("true", "1", "yes")
+        else:
+            is_quiet_flag = bool(q_raw)
+        eval_mask = 1.0 if (is_quiet_flag and abs(ev_cp_raw) < 9000.0) else 0.0
+
+        ev_cp = max(-1000.0, min(1000.0, ev_cp_raw))
         ev_pawns = ev_cp / 100.0
+
+        # Kết quả ván cờ thật (WDL theo góc nhìn bên đi): 1.0=Win, 0.5=Draw, 0.0=Loss
+        if "wdl" in pos and pos["wdl"] is not None:
+            try:
+                wdl_val = max(0.0, min(1.0, float(pos["wdl"])))
+            except (ValueError, TypeError):
+                wdl_val = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, ev_pawns / WDL_SCALE_PAWNS))))
+        elif "game_result" in pos and pos["game_result"] is not None:
+            try:
+                wdl_val = max(0.0, min(1.0, float(pos["game_result"]) / 2.0))
+            except (ValueError, TypeError):
+                wdl_val = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, ev_pawns / WDL_SCALE_PAWNS))))
+        else:
+            wdl_val = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, ev_pawns / WDL_SCALE_PAWNS))))
 
         tau = max(0.0, min(1.0, float(pos.get("tau", 0.5))))
         rho = max(0.0, min(1.0, float(pos.get("rho", 0.3))))
@@ -373,6 +402,8 @@ def _parse_single_data_file_worker(file_path_str: str):
         us_list.append(us_arr)
         them_list.append(them_arr)
         eval_list.append(ev_pawns)
+        wdl_list.append(wdl_val)
+        eval_mask_list.append(eval_mask)
         tau_list.append(tau)
         rho_list.append(rho)
         rs_list.append(rs)
@@ -409,18 +440,36 @@ def _parse_single_data_file_worker(file_path_str: str):
     if not us_list:
         return None
 
+    n_rec = len(eval_list)
+    if is_val_file:
+        val_arr = np.ones(n_rec, dtype=np.uint8)
+    elif tail_val_split > 0.0:
+        val_arr = np.zeros(n_rec, dtype=np.uint8)
+        n_tail = max(1, int(n_rec * tail_val_split))
+        val_arr[n_rec - n_tail:] = 1
+    else:
+        val_arr = np.zeros(n_rec, dtype=np.uint8)
+
     return (
         np.asarray(hash_list, dtype=np.int64),
         np.vstack(us_list).astype(np.uint16, copy=False),
         np.vstack(them_list).astype(np.uint16, copy=False),
         np.asarray(eval_list, dtype=np.float32),
+        np.asarray(wdl_list, dtype=np.float32),
+        np.asarray(eval_mask_list, dtype=np.float32),
         np.asarray(tau_list, dtype=np.float32),
         np.asarray(rho_list, dtype=np.float32),
         np.asarray(rs_list, dtype=np.float32),
+        val_arr,
     )
 
 
-def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, use_cache: bool = True):
+def load_or_build_hkv3_cache(
+    data_dir: str,
+    cache_path: Optional[str] = None,
+    use_cache: bool = True,
+    val_split: float = 0.03,
+):
     """
     Tải cache nhị phân HKV3 (.npz) hoặc xây dựng song song trên toàn bộ các nhân CPU.
     """
@@ -435,14 +484,13 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
     elif data_path.is_file() and data_path.suffix == ".npz":
         cpath = data_path
     elif data_path.is_dir():
-        default_cache = data_path / "_hkv3_sparse_cache_v1.npz"
+        default_cache = data_path / "_hkv3_sparse_cache_v2.npz"
         if default_cache.exists():
             cpath = default_cache
         else:
-            npz_files = list(data_path.glob("*.npz"))
-            cpath = npz_files[0] if npz_files else default_cache
+            cpath = default_cache
     else:
-        cpath = data_path / "_hkv3_sparse_cache_v1.npz"
+        cpath = data_path / "_hkv3_sparse_cache_v2.npz"
 
     if cpath.exists() and use_cache:
         t0 = time.time()
@@ -452,9 +500,18 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
             us_indices = data["us_indices"]
             them_indices = data["them_indices"]
             labels_eval = data["labels_eval"]
+            if "labels_wdl" in data:
+                labels_wdl = data["labels_wdl"]
+            else:
+                labels_wdl = (1.0 / (1.0 + np.exp(-np.clip(labels_eval / WDL_SCALE_PAWNS, -20.0, 20.0)))).astype(np.float32)
+            if "labels_eval_mask" in data:
+                labels_eval_mask = data["labels_eval_mask"]
+            else:
+                labels_eval_mask = np.ones(len(labels_eval), dtype=np.float32)
             labels_tau = data["labels_tau"]
             labels_rho = data["labels_rho"]
             labels_rs = data["labels_rs"]
+            is_val_mask = data["is_val"] if "is_val" in data else None
 
             # Tự động phát hiện và chuẩn hóa nếu file cache được sinh ở không gian 64-King cũ
             max_feat = max(int(us_indices.max()), int(them_indices.max()))
@@ -472,15 +529,13 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
                     knorm = ksq ^ mirror
                     kb = ((knorm >> 3) * 4 + (knorm & 3)) * HKV3_PLANES_PER_BUCKET
                     lut[f] = kb + ch * 64 + (sq ^ mirror)
-                # Lưu ý: Trong không gian 64-King cũ (0..45055), chỉ số padding là >= 45056 (đã được khởi tạo
-                # bằng PADDING_FEATURE_IDX trong np.full ở trên). Tuyệt đối KHÔNG gán lut[22528] = 22528
-                # vì 22528 là đặc trưng hợp lệ của 64-King (ksq=32 [a5], ch=0 [Tốt mình], sq=0 [a1])!
                 us_indices = lut[us_indices]
                 them_indices = lut[them_indices]
                 print(f"[Cache Auto-Fix] Chuẩn hóa thành công trong {time.time() - t_fix:.2f}s! (Max index mới: {max(int(us_indices.max()), int(them_indices.max()))})", flush=True)
 
-            print(f"[Cache] Đã nạp {len(labels_eval):,} thế cờ duy nhất trong {time.time() - t0:.2f}s!", flush=True)
-            return us_indices, them_indices, labels_eval, labels_tau, labels_rho, labels_rs
+            quiet_pct = 100.0 * float(np.mean(labels_eval_mask))
+            print(f"[Cache] Đã nạp {len(labels_eval):,} thế cờ duy nhất (Quiet Eval Mask: {quiet_pct:.1f}%) trong {time.time() - t0:.2f}s!", flush=True)
+            return us_indices, them_indices, labels_eval, labels_wdl, labels_eval_mask, labels_tau, labels_rho, labels_rs, is_val_mask
         except Exception as e:
             print(f"[Cache] File cache cũ hoặc lỗi ({e}), tiến hành xây dựng lại...", flush=True)
 
@@ -496,9 +551,15 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
           f"với {workers} tiến trình CPU...", flush=True)
     t0 = time.time()
 
-    file_strs = [str(f) for f in source_files]
+    # Tách Val độc lập theo file (nếu >= 10 file) hoặc theo phần đuôi ván đấu (nếu < 10 file) để chống data leakage cùng ván!
+    if len(source_files) >= 10:
+        n_val_files = max(1, int(round(len(source_files) * val_split)))
+        tasks = [(str(f), i >= len(source_files) - n_val_files, 0.0) for i, f in enumerate(source_files)]
+    else:
+        tasks = [(str(f), False, val_split) for f in source_files]
+
     with Pool(workers) as pool:
-        results = pool.map(_parse_single_data_file_worker, file_strs)
+        results = pool.map(_parse_single_data_file_worker, tasks)
 
     valid_results = [r for r in results if r is not None]
     del results
@@ -509,9 +570,12 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
     all_us = np.concatenate([r[1] for r in valid_results], axis=0)
     all_them = np.concatenate([r[2] for r in valid_results], axis=0)
     all_eval = np.concatenate([r[3] for r in valid_results], axis=0)
-    all_tau = np.concatenate([r[4] for r in valid_results], axis=0)
-    all_rho = np.concatenate([r[5] for r in valid_results], axis=0)
-    all_rs = np.concatenate([r[6] for r in valid_results], axis=0)
+    all_wdl = np.concatenate([r[4] for r in valid_results], axis=0)
+    all_eval_mask = np.concatenate([r[5] for r in valid_results], axis=0)
+    all_tau = np.concatenate([r[6] for r in valid_results], axis=0)
+    all_rho = np.concatenate([r[7] for r in valid_results], axis=0)
+    all_rs = np.concatenate([r[8] for r in valid_results], axis=0)
+    all_is_val = np.concatenate([r[9] for r in valid_results], axis=0)
     del valid_results
     gc.collect()
 
@@ -526,12 +590,19 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
     them_indices = all_them[unique_idx]
     del all_them, unique_idx
 
-    # Tính kỳ vọng trung bình (mean) của các nhãn khi 1 thế cờ xuất hiện nhiều lần trong các ván khác nhau:
-    # Tránh việc thế cờ bị gán nhãn thiên lệch do chỉ lấy ngẫu nhiên bản ghi đầu tiên!
+    # Nếu một thế cờ xuất hiện ở cả tập Train và Val, ép thuộc về Train để 0% thế cờ trùng lọt sang Val
+    train_hits = np.bincount(inv_idx, weights=(1 - all_is_val).astype(np.int32))
+    is_val_mask = (train_hits == 0).astype(np.uint8)
+    del all_is_val, train_hits
+
     counts_f = counts.astype(np.float32)
     del counts
     labels_eval = (np.bincount(inv_idx, weights=all_eval) / counts_f).astype(np.float32)
     del all_eval
+    labels_wdl = (np.bincount(inv_idx, weights=all_wdl) / counts_f).astype(np.float32)
+    del all_wdl
+    labels_eval_mask = ((np.bincount(inv_idx, weights=all_eval_mask) / counts_f) >= 0.5).astype(np.float32)
+    del all_eval_mask
     labels_tau = (np.bincount(inv_idx, weights=all_tau) / counts_f).astype(np.float32)
     del all_tau
     labels_rho = (np.bincount(inv_idx, weights=all_rho) / counts_f).astype(np.float32)
@@ -541,8 +612,9 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
     gc.collect()
 
     dt = time.time() - t0
+    quiet_pct = 100.0 * float(np.mean(labels_eval_mask))
     print(f"[Dataset] Hoàn tất lọc trùng: giữ lại {len(labels_eval):,} thế cờ duy nhất "
-          f"(từ {total_raw:,} bản ghi thô) trong {dt:.2f}s ({total_raw / max(1e-6, dt):,.0f} pos/s).", flush=True)
+          f"(từ {total_raw:,} bản ghi thô | Quiet Eval: {quiet_pct:.1f}%) trong {dt:.2f}s ({total_raw / max(1e-6, dt):,.0f} pos/s).", flush=True)
 
     if use_cache:
         try:
@@ -553,16 +625,19 @@ def load_or_build_hkv3_cache(data_dir: str, cache_path: Optional[str] = None, us
                 us_indices=us_indices,
                 them_indices=them_indices,
                 labels_eval=labels_eval,
+                labels_wdl=labels_wdl,
+                labels_eval_mask=labels_eval_mask,
                 labels_tau=labels_tau,
                 labels_rho=labels_rho,
                 labels_rs=labels_rs,
+                is_val=is_val_mask,
             )
             sz_mb = cpath.stat().st_size / (1024 * 1024)
             print(f"[Cache] Đã lưu cache nhị phân tốc độ cao tại {cpath} ({sz_mb:.1f} MB, {time.time() - t_save:.1f}s).", flush=True)
         except Exception as e:
             print(f"[Cache] Cảnh báo không thể ghi file cache: {e}", flush=True)
 
-    return us_indices, them_indices, labels_eval, labels_tau, labels_rho, labels_rs
+    return us_indices, them_indices, labels_eval, labels_wdl, labels_eval_mask, labels_tau, labels_rho, labels_rs, is_val_mask
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -581,6 +656,8 @@ class FastHKV3BatchLoader:
         us_data: np.ndarray,
         them_data: np.ndarray,
         eval_data: np.ndarray,
+        wdl_data: np.ndarray,
+        eval_mask_data: np.ndarray,
         tau_data: np.ndarray,
         rho_data: np.ndarray,
         rs_data: np.ndarray,
@@ -593,6 +670,8 @@ class FastHKV3BatchLoader:
         self.us_data = us_data
         self.them_data = them_data
         self.eval_data = eval_data
+        self.wdl_data = wdl_data
+        self.eval_mask_data = eval_mask_data
         self.tau_data = tau_data
         self.rho_data = rho_data
         self.rs_data = rs_data
@@ -632,15 +711,18 @@ class FastHKV3BatchLoader:
                 us_np = self.us_data[actual_ids]
                 them_np = self.them_data[actual_ids]
                 ev_np = self.eval_data[actual_ids]
+                wdl_np = self.wdl_data[actual_ids]
                 if np.any(is_flipped):
                     us_np = np.where(is_flipped[:, None], self.them_data[actual_ids], us_np)
                     them_np = np.where(is_flipped[:, None], self.us_data[actual_ids], them_np)
                     ev_np = np.where(is_flipped, -ev_np, ev_np)
+                    wdl_np = np.where(is_flipped, 1.0 - wdl_np, wdl_np)
             else:
                 actual_ids = self.base_indices[v_ids]
                 us_np = self.us_data[actual_ids]
                 them_np = self.them_data[actual_ids]
                 ev_np = self.eval_data[actual_ids]
+                wdl_np = self.wdl_data[actual_ids]
 
             # Truyền uint16 (2 bytes) qua PCIe bằng Pinned Memory DMA, sau đó mới .to(torch.int64) trên GPU VRAM:
             us_t = self._to_gpu(us_np, target_dtype=torch.int64)
@@ -648,6 +730,8 @@ class FastHKV3BatchLoader:
 
             targets = {
                 "eval": self._to_gpu(ev_np),
+                "wdl": self._to_gpu(wdl_np),
+                "eval_mask": self._to_gpu(self.eval_mask_data[actual_ids]),
                 "tau": self._to_gpu(self.tau_data[actual_ids]),
                 "rho": self._to_gpu(self.rho_data[actual_ids]),
                 "rs": self._to_gpu(self.rs_data[actual_ids]),
@@ -988,29 +1072,50 @@ class HKV3MultiTaskLoss(nn.Module):
       - L2 Regularization nhẹ trên bảng dư W_full để khuyến khích mạng ưu tiên học quy luật hình học tổng quát ở W_rel & W_piece.
     """
 
-    def __init__(self, wdl_weight: float = 0.75, wdl_scale_pawns: float = WDL_SCALE_PAWNS):
+    def __init__(self, wdl_weight: float = 0.75, wdl_lambda: float = 0.80, wdl_scale_pawns: float = WDL_SCALE_PAWNS):
         super().__init__()
         self.wdl_weight = wdl_weight
+        self.wdl_lambda = wdl_lambda
         self.wdl_scale_pawns = wdl_scale_pawns
 
-    def compute_eval_loss(self, pred_pawns: torch.Tensor, target_pawns: torch.Tensor) -> torch.Tensor:
+    def compute_eval_loss(
+        self,
+        pred_pawns: torch.Tensor,
+        target_pawns: torch.Tensor,
+        target_wdl_game: Optional[torch.Tensor] = None,
+        eval_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         target_clamped = torch.clamp(target_pawns, -10.0, 10.0)
 
         # 1. Smooth-L1 Huber Loss trực tiếp trên đơn vị Pawns (beta = 0.5 pawns = 50 cp)
-        loss_huber = F.smooth_l1_loss(pred_pawns, target_clamped, reduction="mean", beta=0.5)
+        loss_huber = F.smooth_l1_loss(pred_pawns, target_clamped, reduction="none", beta=0.5)
 
-        # 2. WDL Sigmoid Binary Cross-Entropy (with logits để an toàn tuyệt đối với FP16 autocast)
-        target_wdl = torch.sigmoid(target_clamped / self.wdl_scale_pawns)
+        # 2. WDL Sigmoid Binary Cross-Entropy: trộn eval teacher với kết quả ván thật (lambda blending)
+        wdl_eval = torch.sigmoid(target_clamped / self.wdl_scale_pawns)
+        if target_wdl_game is not None and self.wdl_lambda < 1.0:
+            target_wdl = self.wdl_lambda * wdl_eval + (1.0 - self.wdl_lambda) * target_wdl_game
+        else:
+            target_wdl = wdl_eval
         loss_wdl = F.binary_cross_entropy_with_logits(
-            pred_pawns / self.wdl_scale_pawns, target_wdl, reduction="mean"
+            pred_pawns / self.wdl_scale_pawns, target_wdl, reduction="none"
         )
 
-        return self.wdl_weight * loss_wdl + (1.0 - self.wdl_weight) * loss_huber
+        per_pos = self.wdl_weight * loss_wdl + (1.0 - self.wdl_weight) * loss_huber
+        if eval_mask is not None:
+            denom = eval_mask.sum().clamp(min=1.0)
+            return (per_pos * eval_mask).sum() / denom
+        return per_pos.mean()
 
     def forward(
         self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        loss_eval = self.compute_eval_loss(outputs["eval"], targets["eval"])
+        eval_mask = targets.get("eval_mask")
+        loss_eval = self.compute_eval_loss(
+            outputs["eval"],
+            targets["eval"],
+            target_wdl_game=targets.get("wdl"),
+            eval_mask=eval_mask,
+        )
 
         loss_tau = F.binary_cross_entropy_with_logits(outputs["tau"], targets["tau"], reduction="mean")
         loss_rho = F.binary_cross_entropy_with_logits(outputs["rho"], targets["rho"], reduction="mean")
@@ -1019,10 +1124,17 @@ class HKV3MultiTaskLoss(nn.Module):
         total_loss = loss_eval + 0.15 * (loss_tau + loss_rho + loss_rs)
 
         with torch.no_grad():
-            mae_cp = torch.mean(torch.abs(outputs["eval"] - targets["eval"])).item() * 100.0
             pred_wdl = torch.sigmoid(outputs["eval"] / self.wdl_scale_pawns)
             tgt_wdl = torch.sigmoid(targets["eval"] / self.wdl_scale_pawns)
-            wdl_err = torch.mean(torch.abs(pred_wdl - tgt_wdl) ** 2.5).item()
+            abs_err = torch.abs(outputs["eval"] - targets["eval"])
+            w_err = torch.abs(pred_wdl - tgt_wdl) ** 2.5
+            if eval_mask is not None:
+                denom = eval_mask.sum().clamp(min=1.0)
+                mae_cp = ((abs_err * eval_mask).sum() / denom).item() * 100.0
+                wdl_err = ((w_err * eval_mask).sum() / denom).item()
+            else:
+                mae_cp = torch.mean(abs_err).item() * 100.0
+                wdl_err = torch.mean(w_err).item()
 
         metrics = {
             "total": float(total_loss.item()),
@@ -1412,6 +1524,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16384, help="Kích thước batch (khuyến nghị 16384 cho T4x2)")
     parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate cơ sở cho AdamW")
     parser.add_argument("--wdl-weight", type=float, default=0.75, help="Tỷ trọng WDL BCE Loss so với Huber Loss (mặc định: 0.75)")
+    parser.add_argument("--wdl-lambda", type=float, default=0.80, help="Tỷ trọng eval teacher so với kết quả ván thật wdl (mặc định: 0.80)")
     parser.add_argument("--symmetry", type=int, default=1, choices=[1, 2], help="Chế độ đối xứng lật màu dọc (mặc định: 1x do kiến trúc đã đối xứng đại số tuyệt đối)")
     parser.add_argument("--feature-dropout", type=float, default=0.0, help="Tỷ lệ dropout chỉ riêng trên bảng W_full ở Stage 1 (mặc định: 0.0 - tắt hoàn toàn)")
     parser.add_argument("--val-split", type=float, default=0.03, help="Tỷ lệ tập validation")
@@ -1458,26 +1571,35 @@ def main():
         sync_from_huggingface(args.hf_bucket, args.data)
 
     # 2. Nạp hoặc xây dựng cache nhị phân HKV3
-    us_data, them_data, eval_data, tau_data, rho_data, rs_data = load_or_build_hkv3_cache(
-        args.data, cache_path=args.cache if args.cache else None, use_cache=True
+    us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data, is_val_mask = load_or_build_hkv3_cache(
+        args.data, cache_path=args.cache if args.cache else None, use_cache=True, val_split=args.val_split
     )
 
     n_total = len(eval_data)
-    val_count = min(100000, max(1000, int(n_total * args.val_split)))
-    perm = np.random.permutation(n_total)
-    val_indices = perm[:val_count]
-    train_indices = perm[val_count:]
+    if is_val_mask is not None and np.any(is_val_mask == 1) and np.any(is_val_mask == 0):
+        val_indices_all = np.flatnonzero(is_val_mask == 1)
+        train_indices = np.flatnonzero(is_val_mask == 0)
+        if len(val_indices_all) > 100000:
+            rng_val = np.random.default_rng(42)
+            val_indices = rng_val.choice(val_indices_all, size=100000, replace=False)
+        else:
+            val_indices = val_indices_all
+        print("[Split] Sử dụng game/file-isolated Val split (0% leakage cùng ván).", flush=True)
+    else:
+        val_count = min(100000, max(1000, int(n_total * args.val_split)))
+        val_indices = np.arange(n_total - val_count, n_total, dtype=np.int64)
+        train_indices = np.arange(0, n_total - val_count, dtype=np.int64)
 
     print(f"[Split] Train: {len(train_indices):,} base ({len(train_indices) * args.symmetry:,} effective) | "
           f"Val: {len(val_indices):,} positions.", flush=True)
 
     train_loader = FastHKV3BatchLoader(
-        us_data, them_data, eval_data, tau_data, rho_data, rs_data,
+        us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
         train_indices, batch_size=args.batch_size, shuffle=True,
         symmetry=args.symmetry, device=device
     )
     val_loader = FastHKV3BatchLoader(
-        us_data, them_data, eval_data, tau_data, rho_data, rs_data,
+        us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
         val_indices, batch_size=args.batch_size, shuffle=False,
         symmetry=1, device=device
     )
@@ -1497,17 +1619,28 @@ def main():
     )
 
     model: nn.Module = base_model
-    criterion = HKV3MultiTaskLoss(wdl_weight=args.wdl_weight).to(dev0)
+    criterion = HKV3MultiTaskLoss(wdl_weight=args.wdl_weight, wdl_lambda=args.wdl_lambda).to(dev0)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    def active_emb_full_l2(us_b: torch.Tensor, them_b: torch.Tensor) -> torch.Tensor:
+        uniq0 = torch.unique(torch.cat([us_b.reshape(-1), them_b.reshape(-1)]))
+        uniq0 = uniq0[uniq0 < PADDING_FEATURE_IDX]
+        if uniq0.numel() == 0:
+            return torch.zeros((), device=dev0, dtype=torch.float32)
+        l2_l = base_model.left_branch.emb_full.weight[uniq0].float().square().mean()
+        uniq1 = uniq0.to(dev1) if dev1 != dev0 else uniq0
+        l2_r = base_model.right_branch.emb_full.weight[uniq1].float().square().mean().to(dev0)
+        return 0.5 * (l2_l + l2_r)
+
     # Phân nhóm tham số tối ưu:
-    # - W_full chịu weight_decay cao hơn (5e-5) để ép các ô Vua hiếm dựa vào W_piece & W_rel
+    # - emb_full / psqt_full dùng weight_decay=0.0 trong AdamW để tránh bào mòn các ô Vua hiếm vắng mặt trong batch;
+    #   thay bằng active_emb_full_l2() chỉ chuẩn hóa các đặc trưng thực sự xuất hiện trong batch.
     optimizer = optim.AdamW([
-        {"params": list(base_model.left_branch.emb_full.parameters()) + list(base_model.right_branch.emb_full.parameters()), "lr": args.lr * 0.8, "weight_decay": 5e-5},
+        {"params": list(base_model.left_branch.emb_full.parameters()) + list(base_model.right_branch.emb_full.parameters()), "lr": args.lr * 0.8, "weight_decay": 0.0},
         {"params": list(base_model.left_branch.emb_piece.parameters()) + list(base_model.right_branch.emb_piece.parameters()), "lr": args.lr, "weight_decay": 1e-5},
         {"params": list(base_model.left_branch.emb_rel.parameters()) + list(base_model.right_branch.emb_rel.parameters()), "lr": args.lr, "weight_decay": 1e-5},
         {"params": [base_model.left_branch.bias, base_model.right_branch.bias], "lr": args.lr, "weight_decay": 0.0},
-        {"params": base_model.psqt_full.parameters(), "lr": args.lr * 0.5, "weight_decay": 5e-5},
+        {"params": base_model.psqt_full.parameters(), "lr": args.lr * 0.5, "weight_decay": 0.0},
         {"params": base_model.psqt_piece.parameters(), "lr": args.lr, "weight_decay": 1e-5},
         {"params": base_model.psqt_rel.parameters(), "lr": args.lr, "weight_decay": 1e-5},
         {"params": base_model.fc2_self.parameters(), "lr": args.lr, "weight_decay": 1e-5},
@@ -1667,6 +1800,7 @@ def main():
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
                     loss, m = criterion(outputs_b, targets_b)
+                    loss = loss + 1e-4 * active_emb_full_l2(us_b, them_b)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -1745,11 +1879,11 @@ def main():
 
         # Phase 2A: Ưu tiên Eval gấp 4 lần nhưng vẫn giữ neo tau/rho/rs
         ft_opt_a = optim.AdamW([
-            {"params": list(base_model.left_branch.emb_full.parameters()) + list(base_model.right_branch.emb_full.parameters()), "lr": 1.0e-4, "weight_decay": 5e-5},
+            {"params": list(base_model.left_branch.emb_full.parameters()) + list(base_model.right_branch.emb_full.parameters()), "lr": 1.0e-4, "weight_decay": 0.0},
             {"params": list(base_model.left_branch.emb_piece.parameters()) + list(base_model.right_branch.emb_piece.parameters()), "lr": 1.5e-4, "weight_decay": 1e-5},
             {"params": list(base_model.left_branch.emb_rel.parameters()) + list(base_model.right_branch.emb_rel.parameters()), "lr": 1.5e-4, "weight_decay": 1e-5},
             {"params": [base_model.left_branch.bias, base_model.right_branch.bias], "lr": 1.0e-4, "weight_decay": 0.0},
-            {"params": base_model.psqt_full.parameters(), "lr": 1.0e-4, "weight_decay": 5e-5},
+            {"params": base_model.psqt_full.parameters(), "lr": 1.0e-4, "weight_decay": 0.0},
             {"params": base_model.psqt_piece.parameters(), "lr": 1.5e-4, "weight_decay": 1e-5},
             {"params": base_model.psqt_rel.parameters(), "lr": 1.5e-4, "weight_decay": 1e-5},
             {"params": base_model.fc2_self.parameters(), "lr": 1.5e-4, "weight_decay": 1e-5},
@@ -1766,13 +1900,17 @@ def main():
                 ft_opt_a.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
-                    loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
+                    loss_ev = criterion.compute_eval_loss(
+                        outputs_b["eval"], targets_b["eval"],
+                        target_wdl_game=targets_b.get("wdl"),
+                        eval_mask=targets_b.get("eval_mask"),
+                    )
                     loss_aux = (
                         F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
                         + F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
                         + F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
                     )
-                    loss = 4.0 * loss_ev + 0.15 * loss_aux
+                    loss = 4.0 * loss_ev + 0.15 * loss_aux + 1e-4 * active_emb_full_l2(us_b, them_b)
                 scaler.scale(loss).backward()
                 scaler.unscale_(ft_opt_a)
                 torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=0.5)
@@ -1829,7 +1967,11 @@ def main():
                 ft_opt_b.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     outputs_b = model(us_b, them_b)
-                    loss_ev = criterion.compute_eval_loss(outputs_b["eval"], targets_b["eval"])
+                    loss_ev = criterion.compute_eval_loss(
+                        outputs_b["eval"], targets_b["eval"],
+                        target_wdl_game=targets_b.get("wdl"),
+                        eval_mask=targets_b.get("eval_mask"),
+                    )
                 scaler.scale(loss_ev).backward()
                 scaler.unscale_(ft_opt_b)
                 scaler.step(ft_opt_b)
