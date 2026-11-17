@@ -122,6 +122,22 @@ int count_material(const Position& pos) {
     return w - b;
 }
 
+bool is_insufficient_material(const Position& pos) {
+    if (pos.count<PAWN>() || pos.count<ROOK>() || pos.count<QUEEN>())
+        return false;
+    int total_minors = pos.count<KNIGHT>() + pos.count<BISHOP>();
+    if (total_minors <= 1)
+        return true; // KvK, KNvK, KBvK
+    if (pos.count<KNIGHT>() == 0 && pos.count<BISHOP>(WHITE) == 1 && pos.count<BISHOP>(BLACK) == 1) {
+        constexpr Bitboard DARK_SQUARES = 0xAA55AA55AA55AA55ULL;
+        bool w_dark = (pos.pieces(WHITE, BISHOP) & DARK_SQUARES) != 0;
+        bool b_dark = (pos.pieces(BLACK, BISHOP) & DARK_SQUARES) != 0;
+        if (w_dark == b_dark)
+            return true; // KBvKB same-color bishops
+    }
+    return false;
+}
+
 std::string generate_dfrc_fen(std::mt19937_64& rng) {
     auto gen_rank = [&](std::mt19937_64& r) {
         char rank[8] = {0};
@@ -289,7 +305,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                 played_moves.clear();
             }
             MoveList<ALL> legal(pos);
-            if (legal.size() == 0 || pos.is_draw(0)) {
+            if (legal.size() == 0 || pos.is_draw(0) || is_insufficient_material(pos)) {
                 break;
             }
 
@@ -407,7 +423,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             } else {
                 white_outcome = 0.5;
             }
-        } else if (end_pos.is_draw(0)) {
+        } else if (end_pos.is_draw(0) || is_insufficient_material(end_pos)) {
             white_outcome = 0.5;
         } else if (has_last_eval) {
             if (last_eval_white >= 200) white_outcome = 1.0;
