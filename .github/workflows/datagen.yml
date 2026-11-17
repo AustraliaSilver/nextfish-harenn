@@ -42,19 +42,18 @@ jobs:
         run: |
           python3 manage_kaggle_runs.py
 
-      - name: Download Stockfish 19 (Universal Linux)
+      - name: Build Stockfish C++ HARENN Datagen + Download NNUE
         run: |
           sleep $(( (${{ matrix.worker_id }} % 10) * 2 ))
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o stockfish.tar.gz https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz
-          tar -xzvf stockfish.tar.gz
-          mv stockfish/stockfish-linux-x86-64-universal ./harenn_engine
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          SRCS=$(find Stockfish-latest/src -name '*.cpp' ! -path '*/universal/*')
+          g++ -O3 -flto=auto -march=native -DNDEBUG -DUSE_AVX2 -DUSE_BMI2 -DUSE_POPCNT -DUSE_PEXT -DNNUE_EMBEDDING_OFF -pthread -std=c++17 -IStockfish-latest/src $SRCS -o ./harenn_engine
           chmod +x harenn_engine
-          chmod +x parallel_generate.py
 
-      - name: Generate Data (time-budgeted)
+      - name: Generate Data (time-budgeted C++ native)
         run: |
           mkdir -p data
-          python3 parallel_generate.py --engine ./harenn_engine --output ./data --games 50000 --batch-size 100 --concurrency 2 --hash 32 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 8192
+          ./harenn_engine harenn_datagen --output ./data --games 50000 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ matrix.worker_id }} --nodes 8192
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"

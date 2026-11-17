@@ -34,6 +34,7 @@ struct DatagenConfig {
     int hash_mb = 64;
     int concurrency = 4;
     int multipv = 1;
+    bool soft_nodes = true;
     int time_budget_sec = 0;
     std::string output_dir = "data";
     std::string worker_id = "";
@@ -194,6 +195,9 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             m_deep_str = mv;
             cp_deep = sc;
             achieved_depth = info.depth;
+            if (cfg.soft_nodes && info.nodes >= cfg.nodes) {
+                engine.stop();
+            }
         } else if (info.multiPV == 2 && !mv.empty()) {
             sec_deep_str = mv;
             cp_second = sc;
@@ -222,6 +226,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
 
         set_opt("UCI_Chess960", is_standard ? "false" : "true");
 
+        std::string anchor_fen = start_fen;
         std::vector<std::string> played_moves;
         std::vector<RawPosRecord> game_positions;
         int last_eval_white = 0;
@@ -236,8 +241,12 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                 if (elapsed >= cfg.time_budget_sec) break;
             }
 
-            engine.set_position(start_fen, played_moves);
+            engine.set_position(anchor_fen, played_moves);
             const Position& pos = engine.position();
+            if (pos.rule50_count() == 0 && !played_moves.empty()) {
+                anchor_fen = engine.fen();
+                played_moves.clear();
+            }
             MoveList<ALL> legal(pos);
             if (legal.size() == 0 || pos.is_draw(0)) {
                 break;
@@ -263,7 +272,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             best_move_uci.clear();
 
             Search::LimitsType limits;
-            limits.nodes = cfg.nodes;
+            limits.nodes = cfg.soft_nodes ? (cfg.nodes * 4) : cfg.nodes;
             engine.go(limits);
             engine.wait_for_search_finished();
 
@@ -334,7 +343,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         }
 
         // Determine game outcome
-        engine.set_position(start_fen, played_moves);
+        engine.set_position(anchor_fen, played_moves);
         const Position& end_pos = engine.position();
         MoveList<ALL> end_legal(end_pos);
         double white_outcome = 0.5;
@@ -401,6 +410,8 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
         else if (tok == "--hash" && (is >> tok)) cfg.hash_mb = std::stoi(tok);
         else if ((tok == "--concurrency" || tok == "-j") && (is >> tok)) cfg.concurrency = std::stoi(tok);
         else if (tok == "--multipv") { if (is >> tok) cfg.multipv = std::clamp(std::stoi(tok), 1, 2); }
+        else if (tok == "--hard-nodes") cfg.soft_nodes = false;
+        else if (tok == "--soft-nodes") cfg.soft_nodes = true;
         else if (tok == "--time-budget" && (is >> tok)) cfg.time_budget_sec = std::stoi(tok);
         else if ((tok == "--output" || tok == "-o") && (is >> tok)) cfg.output_dir = tok;
         else if ((tok == "--worker-id" || tok == "-w") && (is >> tok)) cfg.worker_id = tok;
