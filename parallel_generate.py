@@ -66,18 +66,6 @@ class TrainingPosition:
 
     best_move_label: int
 
-    best_moves_d16: list
-
-    best_moves_d20: list
-
-    best_moves_d24: list
-
-    best_move_labels_d16: list
-
-    best_move_labels_d20: list
-
-    best_move_labels_d24: list
-
     game_result: int
 
     wdl: float
@@ -293,11 +281,6 @@ class ParallelGenerator:
             rs = 0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin
             rs = max(0.05, min(0.99, rs))
 
-            m_deep_uci = [m_deep.uci()] if m_deep else []
-            l_deep_lbl = [self.move_to_label(board, m_deep)] if m_deep else []
-            m_sec_uci = [sec_deep.uci()] if sec_deep else m_deep_uci
-            l_sec_lbl = [self.move_to_label(board, sec_deep)] if sec_deep else l_deep_lbl
-
             return {
                 "cp": cp,
                 "depth": achieved_depth,
@@ -308,12 +291,6 @@ class ParallelGenerator:
                 "tau": round(tau, 4),
                 "rho": round(min(rho, 1.0), 4),
                 "rs": round(rs, 4),
-                "m16": m_sec_uci,
-                "l16": l_sec_lbl,
-                "m20": m_deep_uci,
-                "l20": l_deep_lbl,
-                "m24": m_deep_uci,
-                "l24": l_deep_lbl,
             }
 
         except Exception:
@@ -402,12 +379,6 @@ class ParallelGenerator:
                     "best_move_label": chosen_best_lbl,
                     "sec_move": sec_best,
                     "sec_move_label": sec_best_lbl,
-                    "best_moves_d16": data["m16"],
-                    "best_moves_d20": data["m20"],
-                    "best_moves_d24": data["m24"],
-                    "best_move_labels_d16": data["l16"],
-                    "best_move_labels_d20": data["l20"],
-                    "best_move_labels_d24": data["l24"],
                     "game_result": 1,
                     "wdl": 0.5,
                     "material": self.count_material(board),
