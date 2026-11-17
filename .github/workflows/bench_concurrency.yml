@@ -1,4 +1,4 @@
-name: Bench Concurrency 1 vs 2 vs 4
+name: Bench Concurrency & Hard vs Soft Nodes
 
 on:
   workflow_dispatch:
@@ -12,20 +12,83 @@ jobs:
         with:
           ref: data
 
-      - name: CPU Info & Build
-        run: |
-          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
-          SRCS=$(find Stockfish-latest/src -name '*.cpp' ! -path '*/universal/*')
-          g++ -O3 -flto=auto -march=native -DNDEBUG -DUSE_AVX2 -DUSE_BMI2 -DUSE_POPCNT -DUSE_PEXT -DNNUE_EMBEDDING_OFF -pthread -std=c++17 -IStockfish-latest/src $SRCS -o ./harenn_engine
-          chmod +x harenn_engine
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Benchmark Concurrency 1 vs 2 vs 4 (30s each, 8192 softnodes, Hash 64MB)
+      - name: Install python-chess
+        run: pip install -q python-chess
+
+      - name: CPU Info & Build Universal (AVX-512 VNNI on EPYC)
         run: |
-          for C in 1 2 4; do
-            echo "========================================"
-            echo "=== CONCURRENCY = $C ==="
-            echo "========================================"
-            ./harenn_engine harenn_datagen --output ./tmp_c$C --games 0 --concurrency $C --hash 64 --time-budget 30 --nodes 8192
-            rm -rf ./tmp_c$C
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket|Flags" || nproc
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          make -C Stockfish-latest/src -j$(nproc) build ARCH=x86-64-universal
+          mv Stockfish-latest/src/stockfish ./harenn_engine
+          chmod +x harenn_engine
+          ./harenn_engine bench 64 1 10 2>&1 | tail -n 8
+
+      - name: Benchmark Hard vs Soft Nodes at Concurrency 2 and 4 (20s each)
+        run: |
+          for MODE in "hard-nodes" "soft-nodes"; do
+            for C in 2 4; do
+              echo "=== $MODE | CONCURRENCY=$C ==="
+              ./harenn_engine harenn_datagen --output ./tmp_${MODE}_c${C} --games 0 --concurrency $C --hash 64 --time-budget 20 --nodes 8192 --$MODE
+            done
           done
+
+      - name: Compare Label Quality (Hard 8192 vs Soft 8192 on 100 positions)
+        run: |
+          python3 - << 'EOF'
+          import glob, json, subprocess, statistics, chess, chess.engine
+          files = glob.glob("tmp_hard-nodes_c2/*.jsonl")
+          fens = []
+          for fn in files:
+              with open(fn) as f:
+                  for line in f:
+                      fens.append(json.loads(line))
+                      if len(fens) >= 100: break
+              if len(fens) >= 100: break
+
+          print(f"Loaded {len(fens)} positions from hard-nodes sample.")
+          # Compare avg depth in hard vs soft generated logs
+          soft_files = glob.glob("tmp_soft-nodes_c2/*.jsonl")
+          soft_recs = []
+          for fn in soft_files:
+              with open(fn) as f:
+                  for line in f:
+                      soft_recs.append(json.loads(line))
+          print(f"Hard avg depth: {statistics.mean(r['depth'] for r in fens):.2f} | Soft avg depth: {statistics.mean(r['depth'] for r in soft_recs):.2f}")
+
+          # Re-evaluate the exact same 100 FENs with softnodes 8192 (stop at end of iter >= 8192) vs hardnodes 8192
+          eng = chess.engine.SimpleEngine.popen_uci("./harenn_engine")
+          eng.configure({"Threads": 1, "Hash": 64})
+          diffs, move_match, d_hard, d_soft, nodes_soft = [], 0, [], [], []
+          for rec in fens:
+              b = chess.Board(rec["fen"], chess960=("~" in rec["fen"] or "A" in rec["fen"].split()[2] or "H" in rec["fen"].split()[2]))
+              # Hard 8192
+              r_h = eng.analyse(b, chess.engine.Limit(nodes=8192))
+              cp_h = r_h["score"].relative.score(mate_score=10000)
+              bm_h = r_h["pv"][0]
+              d_hard.append(r_h.get("depth", 0))
+              # Soft 8192: iterate with depth until nodes >= 8192
+              r_s = None
+              for d in range(1, 30):
+                  r_tmp = eng.analyse(b, chess.engine.Limit(depth=d))
+                  r_s = r_tmp
+                  if r_tmp.get("nodes", 0) >= 8192:
+                      break
+              cp_s = r_s["score"].relative.score(mate_score=10000)
+              bm_s = r_s["pv"][0]
+              d_soft.append(r_s.get("depth", 0))
+              nodes_soft.append(r_s.get("nodes", 0))
+              diffs.append(abs(cp_h - cp_s))
+              if bm_h == bm_s: move_match += 1
+          eng.quit()
+          print(f"=== LABEL COMPARISON (100 identical FENs) ===")
+          print(f"Hard 8192 avg depth: {statistics.mean(d_hard):.2f}")
+          print(f"Soft 8192 avg depth: {statistics.mean(d_soft):.2f} (avg actual nodes: {statistics.mean(nodes_soft):.0f})")
+          print(f"Best-move agreement: {move_match}/{len(fens)} ({100.0*move_match/len(fens):.1f}%)")
+          print(f"Eval MAE: {statistics.mean(diffs):.1f} cp | Median diff: {statistics.median(diffs):.1f} cp | Max diff: {max(diffs)} cp")
+          EOF
