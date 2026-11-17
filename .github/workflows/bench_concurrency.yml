@@ -1,0 +1,31 @@
+name: Bench Concurrency 1 vs 2 vs 4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: CPU Info & Build
+        run: |
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          SRCS=$(find Stockfish-latest/src -name '*.cpp' ! -path '*/universal/*')
+          g++ -O3 -flto=auto -march=native -DNDEBUG -DUSE_AVX2 -DUSE_BMI2 -DUSE_POPCNT -DUSE_PEXT -DNNUE_EMBEDDING_OFF -pthread -std=c++17 -IStockfish-latest/src $SRCS -o ./harenn_engine
+          chmod +x harenn_engine
+
+      - name: Benchmark Concurrency 1 vs 2 vs 4 (30s each, 8192 softnodes, Hash 64MB)
+        run: |
+          for C in 1 2 4; do
+            echo "========================================"
+            echo "=== CONCURRENCY = $C ==="
+            echo "========================================"
+            ./harenn_engine harenn_datagen --output ./tmp_c$C --games 0 --concurrency $C --hash 64 --time-budget 30 --nodes 8192
+            rm -rf ./tmp_c$C
+          done
