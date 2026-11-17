@@ -1,0 +1,111 @@
+name: Bench Worker (2-Roll x86 + ARM Fallback)
+
+on:
+  workflow_call:
+    inputs:
+      trial:
+        required: true
+        type: number
+
+jobs:
+  roll1:
+    runs-on: ubuntu-latest
+    outputs:
+      reroll: ${{ steps.chk.outputs.reroll }}
+    steps:
+      - name: Check CPU (Roll 1)
+        id: chk
+        run: |
+          echo "=== TRIAL ${{ inputs.trial }} | ROLL 1 (ubuntu-latest) ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
+          if grep -q avx512_vnni /proc/cpuinfo && ! lscpu | grep -qiE "8573C|7763"; then
+            echo "reroll=false" >> $GITHUB_OUTPUT
+            echo "FAST CPU -> running on Roll 1"
+          else
+            echo "reroll=true" >> $GITHUB_OUTPUT
+            echo "SLOW CPU -> triggering Roll 2"
+          fi
+
+      - name: Checkout code
+        if: steps.chk.outputs.reroll == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Download NNUE & Build PGO + mtune=native
+        if: steps.chk.outputs.reroll == 'false'
+        run: |
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
+          mv Stockfish-latest/src/stockfish ./engine_pgo
+          chmod +x ./engine_pgo
+
+      - name: Datagen Speed Test (20s)
+        if: steps.chk.outputs.reroll == 'false'
+        run: |
+          ./engine_pgo harenn_datagen --output ./tmp_r1 --games 0 --concurrency 4 --hash 64 --time-budget 20 --nodes 8192 --hard-nodes
+
+  roll2:
+    needs: roll1
+    if: needs.roll1.outputs.reroll == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      reroll: ${{ steps.chk.outputs.reroll }}
+    steps:
+      - name: Check CPU (Roll 2)
+        id: chk
+        run: |
+          echo "=== TRIAL ${{ inputs.trial }} | ROLL 2 (ubuntu-latest) ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
+          if grep -q avx512_vnni /proc/cpuinfo && ! lscpu | grep -qiE "8573C|7763"; then
+            echo "reroll=false" >> $GITHUB_OUTPUT
+            echo "FAST CPU -> running on Roll 2"
+          else
+            echo "reroll=true" >> $GITHUB_OUTPUT
+            echo "SLOW CPU -> falling back to ARM"
+          fi
+
+      - name: Checkout code
+        if: steps.chk.outputs.reroll == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Download NNUE & Build PGO + mtune=native
+        if: steps.chk.outputs.reroll == 'false'
+        run: |
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
+          mv Stockfish-latest/src/stockfish ./engine_pgo
+          chmod +x ./engine_pgo
+
+      - name: Datagen Speed Test (20s)
+        if: steps.chk.outputs.reroll == 'false'
+        run: |
+          ./engine_pgo harenn_datagen --output ./tmp_r2 --games 0 --concurrency 4 --hash 64 --time-budget 20 --nodes 8192 --hard-nodes
+
+  roll3_arm:
+    needs: [roll1, roll2]
+    if: needs.roll1.outputs.reroll == 'true' && needs.roll2.outputs.reroll == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: CPU Info (Roll 3 ARM Fallback)
+        run: |
+          echo "=== TRIAL ${{ inputs.trial }} | ROLL 3 (ubuntu-24.04-arm) ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Download NNUE & Build PGO + mtune=native
+        run: |
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
+          mv Stockfish-latest/src/stockfish ./engine_pgo
+          chmod +x ./engine_pgo
+
+      - name: Datagen Speed Test (20s)
+        run: |
+          ./engine_pgo harenn_datagen --output ./tmp_r3 --games 0 --concurrency 4 --hash 64 --time-budget 20 --nodes 8192 --hard-nodes

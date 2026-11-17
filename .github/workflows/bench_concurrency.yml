@@ -8,28 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
         trial: [1, 2, 3, 4, 5]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: data
-
-      - name: CPU Info & Download NNUE
-        run: |
-          echo "=== TRIAL ${{ matrix.trial }} | OS=${{ matrix.os }} ==="
-          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
-
-      - name: Build PGO + mtune=native & Bench
-        run: |
-          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
-          mv Stockfish-latest/src/stockfish ./engine_pgo
-          chmod +x ./engine_pgo
-          ./engine_pgo bench 64 1 10 2>&1 | tail -n 5
-
-      - name: Datagen Speed Test (C=4, Hash=64, 20s, hard-nodes 8192)
-        run: |
-          ./engine_pgo harenn_datagen --output ./tmp_t${{ matrix.trial }} --games 0 --concurrency 4 --hash 64 --time-budget 20 --nodes 8192 --hard-nodes
+    uses: ./.github/workflows/bench_worker.yml
+    with:
+      trial: ${{ matrix.trial }}
