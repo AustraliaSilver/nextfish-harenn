@@ -5,25 +5,47 @@ on:
 
 jobs:
   bench:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: data
 
-      - name: CPU Info & Build ARM64
+      - name: CPU Info & Download NNUE
         run: |
           lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket|Flags" || nproc
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
-          make -C Stockfish-latest/src -j$(nproc) build ARCH=native
-          mv Stockfish-latest/src/stockfish ./harenn_engine
-          chmod +x harenn_engine
-          ./harenn_engine bench 64 1 10 2>&1 | tail -n 8
 
-      - name: Benchmark ARM64 Hard Nodes at Concurrency 2 and 4 (20s each)
+      - name: Build Base vs PGO+mtune-native
         run: |
-          for C in 2 4; do
-            echo "=== ARM64 hard-nodes | CONCURRENCY=$C ==="
-            ./harenn_engine harenn_datagen --output ./tmp_arm_c${C} --games 0 --concurrency $C --hash 64 --time-budget 20 --nodes 8192 --hard-nodes
+          echo "=== BUILD 1: BASE (ARCH=native) ==="
+          make -C Stockfish-latest/src -j$(nproc) build ARCH=native
+          mv Stockfish-latest/src/stockfish ./engine_base
+          chmod +x ./engine_base
+          ./engine_base bench 64 1 10 2>&1 | tail -n 5
+
+          echo "=== BUILD 2: PGO + -mtune=native (profile-build ARCH=native) ==="
+          make -C Stockfish-latest/src clean
+          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
+          mv Stockfish-latest/src/stockfish ./engine_pgo
+          chmod +x ./engine_pgo
+          ./engine_pgo bench 64 1 10 2>&1 | tail -n 5
+
+      - name: Compare Base vs PGO pos/s (C=4, Hash=64, 15s)
+        run: |
+          echo "=== BASE pos/s (Hash=64, C=4) ==="
+          ./engine_base harenn_datagen --output ./tmp_base --games 0 --concurrency 4 --hash 64 --time-budget 15 --nodes 8192 --hard-nodes
+          echo "=== PGO pos/s (Hash=64, C=4) ==="
+          ./engine_pgo harenn_datagen --output ./tmp_pgo --games 0 --concurrency 4 --hash 64 --time-budget 15 --nodes 8192 --hard-nodes
+
+      - name: Sweep Hash 8 16 32 64 128 256 MB (PGO, C=4, 15s each)
+        run: |
+          for H in 8 16 32 64 128 256; do
+            echo "=== HASH=${H}MB | C=4 ==="
+            ./engine_pgo harenn_datagen --output ./tmp_h${H} --games 0 --concurrency 4 --hash $H --time-budget 15 --nodes 8192 --hard-nodes
           done
