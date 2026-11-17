@@ -18,7 +18,7 @@ jobs:
         run: |
           echo "=== TRIAL ${{ inputs.trial }} | ROLL 1 (ubuntu-latest) ==="
           lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
-          if grep -q avx512_vnni /proc/cpuinfo && ! lscpu | grep -qiE "8573C|7763"; then
+          if grep -q avx512_vnni /proc/cpuinfo && lscpu | grep -qiE "EPYC 9|6975P|Xeon.*6[0-9]{3}"; then
             echo "reroll=false" >> $GITHUB_OUTPUT
             echo "FAST CPU -> running on Roll 1"
           else
@@ -57,7 +57,7 @@ jobs:
         run: |
           echo "=== TRIAL ${{ inputs.trial }} | ROLL 2 (ubuntu-latest) ==="
           lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
-          if grep -q avx512_vnni /proc/cpuinfo && ! lscpu | grep -qiE "8573C|7763"; then
+          if grep -q avx512_vnni /proc/cpuinfo && lscpu | grep -qiE "EPYC 9|6975P|Xeon.*6[0-9]{3}"; then
             echo "reroll=false" >> $GITHUB_OUTPUT
             echo "FAST CPU -> running on Roll 2"
           else
