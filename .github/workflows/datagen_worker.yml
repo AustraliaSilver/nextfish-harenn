@@ -73,7 +73,7 @@ jobs:
         if: steps.chk.outputs.reroll == 'false'
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
@@ -207,7 +207,7 @@ jobs:
         if: steps.chk.outputs.reroll == 'false'
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
@@ -326,7 +326,7 @@ jobs:
       - name: Generate Data (time-budgeted C++ native)
         run: |
           mkdir -p data
-          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 16200 --worker-id ${{ inputs.worker_id }} --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 75
           echo "=== files in data/ ==="
           ls data/ | head -5
           echo "total files: $(ls data/ | wc -l)"
