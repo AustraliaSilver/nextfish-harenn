@@ -24,7 +24,7 @@ jobs:
         run: |
           lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket|Flags" || nproc
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
-          make -C Stockfish-latest/src -j$(nproc) build ARCH=x86-64-universal
+          make -C Stockfish-latest/src -j$(nproc) build ARCH=x86-64-avx512icl
           mv Stockfish-latest/src/stockfish ./harenn_engine
           chmod +x harenn_engine
           ./harenn_engine bench 64 1 10 2>&1 | tail -n 8
