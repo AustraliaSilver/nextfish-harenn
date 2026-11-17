@@ -66,8 +66,6 @@ class TrainingPosition:
 
     best_move_label: int
 
-    game_result: int
-
     wdl: float
 
     material: int
@@ -379,7 +377,6 @@ class ParallelGenerator:
                     "best_move_label": chosen_best_lbl,
                     "sec_move": sec_best,
                     "sec_move_label": sec_best_lbl,
-                    "game_result": 1,
                     "wdl": 0.5,
                     "material": self.count_material(board),
                     "piece_count": chess.popcount(board.occupied),
@@ -418,7 +415,6 @@ class ParallelGenerator:
             stm = p["stm"]
             stm_win = white_outcome if stm == 0 else (1.0 - white_outcome)
             p["wdl"] = round(stm_win, 2)
-            p["game_result"] = 2 if stm_win == 1.0 else (0 if stm_win == 0.0 else 1)
 
         outcome_str = "White win" if white_outcome == 1.0 else ("Black win" if white_outcome == 0.0 else "Draw")
         return game_positions, outcome_str
