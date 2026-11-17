@@ -8,7 +8,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, ubuntu-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        trial: [1, 2, 3, 4, 5]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -18,32 +19,17 @@ jobs:
 
       - name: CPU Info & Download NNUE
         run: |
-          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket|Flags" || nproc
+          echo "=== TRIAL ${{ matrix.trial }} | OS=${{ matrix.os }} ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core|Socket" || nproc
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
 
-      - name: Build PGO + mtune=native
+      - name: Build PGO + mtune=native & Bench
         run: |
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           mv Stockfish-latest/src/stockfish ./engine_pgo
           chmod +x ./engine_pgo
           ./engine_pgo bench 64 1 10 2>&1 | tail -n 5
 
-      - name: Multi-Run Average (4 runs x 15s) for Hash 16, 64, 128 MB
+      - name: Datagen Speed Test (C=4, Hash=64, 20s, hard-nodes 8192)
         run: |
-          python3 - << 'EOF'
-          import subprocess, re, statistics
-          for h in [16, 64, 128]:
-              rates = []
-              for i in range(1, 5):
-                  out = subprocess.check_output(
-                      ["./engine_pgo", "harenn_datagen", "--output", f"./tmp_h{h}_r{i}",
-                       "--games", "0", "--concurrency", "4", "--hash", str(h),
-                       "--time-budget", "15", "--nodes", "8192", "--hard-nodes"],
-                      text=True
-                  )
-                  m = re.search(r"\(([0-9.]+) pos/s\)", out.splitlines()[-1])
-                  rate = float(m.group(1)) if m else 0.0
-                  rates.append(rate)
-                  print(f"Hash={h}MB Run {i}: {rate:.1f} pos/s", flush=True)
-              print(f"==> SUMMARY Hash={h}MB: Mean = {statistics.mean(rates):.1f} pos/s | StdDev = {statistics.stdev(rates):.1f} | Runs = {rates}", flush=True)
-          EOF
+          ./engine_pgo harenn_datagen --output ./tmp_t${{ matrix.trial }} --games 0 --concurrency 4 --hash 64 --time-budget 20 --nodes 8192 --hard-nodes
