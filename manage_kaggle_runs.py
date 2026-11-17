@@ -24,35 +24,39 @@ print("====================================================================")
 print("  NEXTFISH HARENN KAGGLE DATAGEN WORKER {worker_num} (4 vCPUs | 30GB RAM)")
 print("====================================================================")
 
-# 1. Download Stockfish 19 Universal Linux
+# 1. Clone repo & build C++ HARENN Datagen (PGO + native)
 if not os.path.exists("./harenn_engine"):
-    print("[1/4] Downloading Stockfish 19 Universal Linux...")
-    cmd = "curl -L -o stockfish.tar.gz https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz && tar -xzvf stockfish.tar.gz && mv stockfish/stockfish-linux-x86-64-universal ./harenn_engine && chmod +x harenn_engine"
-    subprocess.check_call(cmd, shell=True)
+    print("[1/4] Cloning nextfish-harenn (branch data) & downloading NNUE + UHO book...")
+    subprocess.check_call("git clone --depth 1 -b data https://github.com/AustraliaSilver/nextfish-harenn.git repo", shell=True)
+    subprocess.check_call("curl -fL --retry 5 --retry-delay 3 -o repo/Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue", shell=True)
+    subprocess.check_call("cp repo/Stockfish-latest/src/nn-bddd9d57eb87.nnue ./nn-bddd9d57eb87.nnue", shell=True)
+    subprocess.check_call("curl -fL --retry 5 --retry-delay 3 -o uho.epd.zip https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip && unzip -p uho.epd.zip > uho.epd && rm -f uho.epd.zip", shell=True)
+    print("[2/4] Building Stockfish C++ HARENN Datagen (profile-build ARCH=native)...")
+    subprocess.check_call("make -C repo/Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS='-mtune=native'", shell=True)
+    subprocess.check_call("mv repo/Stockfish-latest/src/stockfish ./harenn_engine && chmod +x ./harenn_engine", shell=True)
 
-# 2. Download latest parallel_generate.py from branch data
-print("[2/4] Downloading latest parallel_generate.py...")
-cmd = "curl -L -o parallel_generate.py https://raw.githubusercontent.com/AustraliaSilver/nextfish-harenn/data/parallel_generate.py"
-subprocess.check_call(cmd, shell=True)
+# 3. Install huggingface_hub
+print("[3/4] Installing huggingface_hub...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "huggingface_hub"])
 
-# 3. Install dependencies
-print("[3/4] Installing python-chess & huggingface_hub...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "python-chess", "huggingface_hub"])
-
-# 4. Run data generation (11.5 hours budget, 32MB Hash/proc for optimal L3 cache locality, 16384 nodes, 4 vCPUs)
-print("[4/4] Starting Turbo Parallel Generator (1-Pass Streaming + Pre-filter + 32MB L3 Cache)...")
+# 4. Run C++ native data generation (11.5h budget, 64MB Hash, 16384 hard-nodes, MultiPV=2, 70% UHO + 30% DFRC, branch <=40cp)
+print("[4/4] Starting C++ Native HARENN Datagen (16384 hard-nodes, MultiPV=2, 70% UHO + 30% DFRC)...")
 os.makedirs("data", exist_ok=True)
 gen_cmd = [
-    sys.executable, "parallel_generate.py",
-    "--engine", "./harenn_engine",
+    "./harenn_engine", "harenn_datagen",
     "--output", "./data",
     "--games", "0",
-    "--batch-size", "100",
     "--concurrency", "4",
-    "--hash", "32",
+    "--hash", "64",
     "--time-budget", "41400",
     "--worker-id", "k{worker_num}",
-    "--nodes", "16384"
+    "--nodes", "16384",
+    "--hard-nodes",
+    "--multipv", "2",
+    "--book", "./uho.epd",
+    "--book-random-plies", "2",
+    "--branch-plies", "12",
+    "--branch-cp", "40"
 ]
 subprocess.run(gen_cmd)
 
