@@ -222,7 +222,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         std::string start_fen = is_standard
             ? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
             : generate_dfrc_fen(rng);
-        int random_plies = is_standard ? 3 : 8;
+        int random_plies = is_standard ? 3 : std::uniform_int_distribution<int>(4, 6)(rng);
 
         set_opt("UCI_Chess960", is_standard ? "false" : "true");
 
