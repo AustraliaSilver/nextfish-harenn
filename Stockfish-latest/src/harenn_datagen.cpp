@@ -290,6 +290,11 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         std::vector<RawPosRecord> game_positions;
         int last_eval_white = 0;
         bool has_last_eval = false;
+        bool abnormal_stop = false;
+        int win_adj_cnt = 0;
+        int win_adj_sign = 0;
+        int draw_adj_cnt = 0;
+        double adjudicated_outcome = -1.0;
 
         int move_num = 0;
         while (true) {
@@ -338,9 +343,15 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             engine.go(limits);
             engine.wait_for_search_finished();
 
-            if (best_move_uci.empty() || best_move_uci == "(none)") break;
+            if (best_move_uci.empty() || best_move_uci == "(none)") {
+                abnormal_stop = true;
+                break;
+            }
             Move best_m = UCIEngine::to_move(pos, best_move_uci);
-            if (best_m == Move::none()) break;
+            if (best_m == Move::none()) {
+                abnormal_stop = true;
+                break;
+            }
 
             if (!has_shallow) {
                 cp_shallow = cp_deep;
@@ -383,7 +394,8 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             double rs = std::clamp(0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin, 0.05, 0.99);
 
             bool quiet = !pos.checkers() && !pos.gives_check(best_m) && !pos.capture(best_m) &&
-                         best_m.type_of() != PROMOTION && eval_swing <= 150 && std::abs(cp_deep) < 1000;
+                         best_m.type_of() != PROMOTION && best_m.type_of() != CASTLING &&
+                         eval_swing <= 150 && std::abs(cp_deep) < 1000;
 
             RawPosRecord rec;
             rec.fen = engine.fen();
@@ -411,6 +423,29 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
             game_positions.push_back(std::move(rec));
             played_moves.push_back(move_to_play);
+
+            if (std::abs(last_eval_white) >= 500) {
+                int sign = (last_eval_white > 0) ? 1 : -1;
+                win_adj_cnt = (sign == win_adj_sign) ? (win_adj_cnt + 1) : 1;
+                win_adj_sign = sign;
+                draw_adj_cnt = 0;
+                if (win_adj_cnt >= 6) {
+                    adjudicated_outcome = (win_adj_sign > 0) ? 1.0 : 0.0;
+                    break;
+                }
+            } else if (move_num >= 80 && std::abs(last_eval_white) <= 15) {
+                win_adj_cnt = 0;
+                win_adj_sign = 0;
+                draw_adj_cnt++;
+                if (draw_adj_cnt >= 16) {
+                    adjudicated_outcome = 0.5;
+                    break;
+                }
+            } else {
+                win_adj_cnt = 0;
+                win_adj_sign = 0;
+                draw_adj_cnt = 0;
+            }
         }
 
         // Determine game outcome
@@ -418,7 +453,9 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         const Position& end_pos = engine.position();
         MoveList<ALL> end_legal(end_pos);
         double white_outcome = 0.5;
-        if (end_legal.size() == 0) {
+        if (adjudicated_outcome >= 0.0) {
+            white_outcome = adjudicated_outcome;
+        } else if (end_legal.size() == 0) {
             if (end_pos.checkers()) {
                 white_outcome = (end_pos.side_to_move() == WHITE) ? 0.0 : 1.0;
             } else {
@@ -426,7 +463,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
         } else if (end_pos.is_draw(0) || is_insufficient_material(end_pos)) {
             white_outcome = 0.5;
-        } else if (has_last_eval) {
+        } else if (!abnormal_stop && has_last_eval) {
             if (last_eval_white >= 200) white_outcome = 1.0;
             else if (last_eval_white <= -200) white_outcome = 0.0;
             else white_outcome = 0.5;
@@ -474,28 +511,90 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
 
 void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesystem::path>& bin_path) {
     DatagenConfig cfg;
+    auto parse_int = [&](const std::string& flag, int& out) -> bool {
+        std::string val;
+        if (!(is >> val)) {
+            std::cerr << "Error: missing value for " << flag << std::endl;
+            return false;
+        }
+        try {
+            size_t idx = 0;
+            int v = std::stoi(val, &idx);
+            if (idx != val.size()) throw std::invalid_argument("trailing chars");
+            out = v;
+            return true;
+        } catch (const std::exception&) {
+            std::cerr << "Error: invalid integer for " << flag << ": " << val << std::endl;
+            return false;
+        }
+    };
+    auto parse_u64 = [&](const std::string& flag, uint64_t& out) -> bool {
+        std::string val;
+        if (!(is >> val)) {
+            std::cerr << "Error: missing value for " << flag << std::endl;
+            return false;
+        }
+        try {
+            size_t idx = 0;
+            uint64_t v = std::stoull(val, &idx);
+            if (idx != val.size()) throw std::invalid_argument("trailing chars");
+            out = v;
+            return true;
+        } catch (const std::exception&) {
+            std::cerr << "Error: invalid uint64 for " << flag << ": " << val << std::endl;
+            return false;
+        }
+    };
+
     std::string tok;
     while (is >> tok) {
-        if ((tok == "--games" || tok == "-g") && (is >> tok)) cfg.games = std::stoi(tok);
-        else if ((tok == "--nodes" || tok == "-n") && (is >> tok)) cfg.nodes = std::stoull(tok);
-        else if (tok == "--hash" && (is >> tok)) cfg.hash_mb = std::stoi(tok);
-        else if ((tok == "--concurrency" || tok == "-j") && (is >> tok)) cfg.concurrency = std::stoi(tok);
-        else if (tok == "--multipv") { if (is >> tok) cfg.multipv = std::clamp(std::stoi(tok), 1, 2); }
+        if (tok == "--games" || tok == "-g") { if (!parse_int(tok, cfg.games)) return; }
+        else if (tok == "--nodes" || tok == "-n") { if (!parse_u64(tok, cfg.nodes)) return; }
+        else if (tok == "--hash") { if (!parse_int(tok, cfg.hash_mb)) return; }
+        else if (tok == "--concurrency" || tok == "-j") { if (!parse_int(tok, cfg.concurrency)) return; }
+        else if (tok == "--multipv") {
+            int mpv = cfg.multipv;
+            if (!parse_int(tok, mpv)) return;
+            cfg.multipv = std::clamp(mpv, 1, 2);
+        }
         else if (tok == "--hard-nodes") cfg.soft_nodes = false;
         else if (tok == "--soft-nodes") cfg.soft_nodes = true;
-        else if (tok == "--time-budget" && (is >> tok)) cfg.time_budget_sec = std::stoi(tok);
-        else if ((tok == "--output" || tok == "-o") && (is >> tok)) cfg.output_dir = tok;
-        else if ((tok == "--worker-id" || tok == "-w") && (is >> tok)) cfg.worker_id = tok;
-        else if (tok == "--book" && (is >> tok)) cfg.book_path = tok;
-        else if (tok == "--book-random-plies" && (is >> tok)) cfg.book_random_plies = std::max(0, std::stoi(tok));
-        else if (tok == "--branch-plies" && (is >> tok)) cfg.branch_plies = std::max(0, std::stoi(tok));
-        else if (tok == "--branch-cp" && (is >> tok)) cfg.branch_cp = std::max(0, std::stoi(tok));
+        else if (tok == "--time-budget") { if (!parse_int(tok, cfg.time_budget_sec)) return; }
+        else if (tok == "--output" || tok == "-o") {
+            if (!(is >> cfg.output_dir)) { std::cerr << "Error: missing value for " << tok << std::endl; return; }
+        }
+        else if (tok == "--worker-id" || tok == "-w") {
+            if (!(is >> cfg.worker_id)) { std::cerr << "Error: missing value for " << tok << std::endl; return; }
+        }
+        else if (tok == "--book") {
+            if (!(is >> cfg.book_path)) { std::cerr << "Error: missing value for " << tok << std::endl; return; }
+        }
+        else if (tok == "--book-random-plies") {
+            int v = 0; if (!parse_int(tok, v)) return;
+            cfg.book_random_plies = std::max(0, v);
+        }
+        else if (tok == "--branch-plies") {
+            int v = 0; if (!parse_int(tok, v)) return;
+            cfg.branch_plies = std::max(0, v);
+        }
+        else if (tok == "--branch-cp") {
+            int v = 0; if (!parse_int(tok, v)) return;
+            cfg.branch_cp = std::max(0, v);
+        }
+        else {
+            std::cerr << "Warning: unknown harenn_datagen option: " << tok << std::endl;
+        }
     }
+
+    int conc = std::max(1, cfg.concurrency);
+    int active_conc = (cfg.games > 0) ? std::min(conc, cfg.games) : conc;
+    int base_games = (cfg.games <= 0) ? 0 : (cfg.games / active_conc);
+    int rem_games = (cfg.games <= 0) ? 0 : (cfg.games % active_conc);
 
     std::vector<std::string> book_fens = load_book_fens(cfg.book_path);
     std::cout << "=== HARENN C++ Native Datagen (Stockfish Latest) | Games: " << cfg.games
               << " | Nodes: " << cfg.nodes << " | Hash: " << cfg.hash_mb << "MB | Threads: "
-              << cfg.concurrency << " | MultiPV: " << cfg.multipv
+              << active_conc << " | MultiPV: " << cfg.multipv
               << " | Book: " << book_fens.size() << " pos | RandPlies: " << cfg.book_random_plies
               << " | BranchPlies: " << cfg.branch_plies << " (cp<=" << cfg.branch_cp << ") ===" << std::endl;
 
@@ -503,17 +602,17 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
     auto start_tp = std::chrono::steady_clock::now();
     std::mutex log_mtx;
 
-    int per_worker = (cfg.games <= 0) ? 0 : std::max(1, cfg.games / std::max(1, cfg.concurrency));
     std::vector<std::unique_ptr<Engine>> engines;
-    engines.reserve(cfg.concurrency);
-    for (int i = 0; i < cfg.concurrency; ++i) {
+    engines.reserve(active_conc);
+    for (int i = 0; i < active_conc; ++i) {
         engines.push_back(std::make_unique<Engine>(bin_path));
     }
 
     std::vector<std::thread> threads;
-    threads.reserve(cfg.concurrency);
-    for (int i = 0; i < cfg.concurrency; ++i) {
-        threads.emplace_back(worker_fn, i, std::cref(cfg), per_worker, std::ref(*engines[i]),
+    threads.reserve(active_conc);
+    for (int i = 0; i < active_conc; ++i) {
+        int worker_games = (cfg.games <= 0) ? 0 : (base_games + (i < rem_games ? 1 : 0));
+        threads.emplace_back(worker_fn, i, std::cref(cfg), worker_games, std::ref(*engines[i]),
                              std::cref(book_fens), std::ref(total_positions), start_tp, std::ref(log_mtx));
     }
     for (auto& t : threads) t.join();
