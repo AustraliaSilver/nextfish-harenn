@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -579,16 +580,15 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
             std::cerr << "Error: missing value for " << flag << std::endl;
             return false;
         }
-        try {
-            size_t idx = 0;
-            int v = std::stoi(val, &idx);
-            if (idx != val.size()) throw std::invalid_argument("trailing chars");
-            out = v;
-            return true;
-        } catch (const std::exception&) {
+        int v = 0;
+        const char* end = val.data() + val.size();
+        auto res = std::from_chars(val.data(), end, v);
+        if (res.ec != std::errc{} || res.ptr != end) {
             std::cerr << "Error: invalid integer for " << flag << ": " << val << std::endl;
             return false;
         }
+        out = v;
+        return true;
     };
     auto parse_u64 = [&](const std::string& flag, uint64_t& out) -> bool {
         std::string val;
@@ -596,16 +596,15 @@ void run_harenn_datagen(std::istringstream& is, const std::optional<std::filesys
             std::cerr << "Error: missing value for " << flag << std::endl;
             return false;
         }
-        try {
-            size_t idx = 0;
-            uint64_t v = std::stoull(val, &idx);
-            if (idx != val.size()) throw std::invalid_argument("trailing chars");
-            out = v;
-            return true;
-        } catch (const std::exception&) {
+        uint64_t v = 0;
+        const char* end = val.data() + val.size();
+        auto res = std::from_chars(val.data(), end, v);
+        if (res.ec != std::errc{} || res.ptr != end) {
             std::cerr << "Error: invalid uint64 for " << flag << ": " << val << std::endl;
             return false;
         }
+        out = v;
+        return true;
     };
 
     std::string tok;
