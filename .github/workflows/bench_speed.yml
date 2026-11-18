@@ -32,14 +32,10 @@ jobs:
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           cp Stockfish-latest/src/stockfish ./sf_new
 
-      - name: Benchmark 1 game (1 thread) and 16 games (4 threads)
+      - name: Benchmark 120s each (all threads)
         run: |
-          mkdir -p out_old_1 out_new_1 out_old_16 out_new_16
-          echo "=== 1 GAME (1 THREAD) - OLD 441e9ab ==="
-          ./sf_old harenn_datagen --output ./out_old_1 --games 1 --concurrency 1 --hash 64 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
-          echo "=== 1 GAME (1 THREAD) - NEW e593716 ==="
-          ./sf_new harenn_datagen --output ./out_new_1 --games 1 --concurrency 1 --hash 64 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
-          echo "=== 16 GAMES (4 THREADS) - OLD 441e9ab ==="
-          ./sf_old harenn_datagen --output ./out_old_16 --games 16 --concurrency 4 --hash 64 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
-          echo "=== 16 GAMES (4 THREADS) - NEW e593716 ==="
-          ./sf_new harenn_datagen --output ./out_new_16 --games 16 --concurrency 4 --hash 64 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
+          mkdir -p out_old_120 out_new_120
+          echo "=== 120s (4 THREADS) - OLD 441e9ab ==="
+          ./sf_old harenn_datagen --output ./out_old_120 --games 0 --concurrency $(nproc) --hash 64 --time-budget 120 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
+          echo "=== 120s (4 THREADS) - NEW e593716 ==="
+          ./sf_new harenn_datagen --output ./out_new_120 --games 0 --concurrency $(nproc) --hash 64 --time-budget 120 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
