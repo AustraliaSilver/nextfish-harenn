@@ -307,10 +307,6 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         int last_eval_white = 0;
         std::vector<int> recent_evals_white;
         bool abnormal_stop = false;
-        int win_adj_cnt = 0;
-        int win_adj_sign = 0;
-        int draw_adj_cnt = 0;
-        double adjudicated_outcome = -1.0;
 
         int move_num = 0;
         while (true) {
@@ -483,29 +479,6 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
             game_positions.push_back(std::move(rec));
             played_moves.push_back(move_to_play);
-
-            if (std::abs(last_eval_white) >= 500) {
-                int sign = (last_eval_white > 0) ? 1 : -1;
-                win_adj_cnt = (sign == win_adj_sign) ? (win_adj_cnt + 1) : 1;
-                win_adj_sign = sign;
-                draw_adj_cnt = 0;
-                if (win_adj_cnt >= 6) {
-                    adjudicated_outcome = (win_adj_sign > 0) ? 1.0 : 0.0;
-                    break;
-                }
-            } else if (move_num >= 80 && std::abs(last_eval_white) <= 15) {
-                win_adj_cnt = 0;
-                win_adj_sign = 0;
-                draw_adj_cnt++;
-                if (draw_adj_cnt >= 16) {
-                    adjudicated_outcome = 0.5;
-                    break;
-                }
-            } else {
-                win_adj_cnt = 0;
-                win_adj_sign = 0;
-                draw_adj_cnt = 0;
-            }
         }
 
         // Determine game outcome
@@ -513,9 +486,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         const Position& end_pos = engine.position();
         MoveList<ALL> end_legal(end_pos);
         double white_outcome = 0.5;
-        if (adjudicated_outcome >= 0.0) {
-            white_outcome = adjudicated_outcome;
-        } else if (end_legal.size() == 0) {
+        if (end_legal.size() == 0) {
             if (end_pos.checkers()) {
                 white_outcome = (end_pos.side_to_move() == WHITE) ? 0.0 : 1.0;
             } else {
