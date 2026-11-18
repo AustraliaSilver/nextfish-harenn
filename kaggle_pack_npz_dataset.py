@@ -161,6 +161,126 @@ def fen_to_hkv3_sparse_pair(fen: str, stm_override: Optional[object] = None) -> 
     return b_arr, w_arr, 1
 
 
+_KNIGHT_DIRS = ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1))
+_KING_DIRS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+_ORTHO_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+_DIAG_DIRS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+
+
+def _is_sq_attacked(grid, sq: int, by_white: bool) -> bool:
+    r, f = sq >> 3, sq & 7
+    p_atk = "P" if by_white else "p"
+    n_atk = "N" if by_white else "n"
+    k_atk = "K" if by_white else "k"
+    rq_atk = ("R", "Q") if by_white else ("r", "q")
+    bq_atk = ("B", "Q") if by_white else ("b", "q")
+
+    # Pawn attacks: white pawn attacks from r-1, black pawn attacks from r+1
+    pr = r - 1 if by_white else r + 1
+    if 0 <= pr < 8:
+        base = pr << 3
+        if f > 0 and grid[base + f - 1] == p_atk:
+            return True
+        if f < 7 and grid[base + f + 1] == p_atk:
+            return True
+
+    for dr, df in _KNIGHT_DIRS:
+        nr, nf = r + dr, f + df
+        if 0 <= nr < 8 and 0 <= nf < 8 and grid[(nr << 3) + nf] == n_atk:
+            return True
+
+    for dr, df in _KING_DIRS:
+        nr, nf = r + dr, f + df
+        if 0 <= nr < 8 and 0 <= nf < 8 and grid[(nr << 3) + nf] == k_atk:
+            return True
+
+    for dr, df in _ORTHO_DIRS:
+        nr, nf = r + dr, f + df
+        while 0 <= nr < 8 and 0 <= nf < 8:
+            pc = grid[(nr << 3) + nf]
+            if pc is not None:
+                if pc in rq_atk:
+                    return True
+                break
+            nr += dr
+            nf += df
+
+    for dr, df in _DIAG_DIRS:
+        nr, nf = r + dr, f + df
+        while 0 <= nr < 8 and 0 <= nf < 8:
+            pc = grid[(nr << 3) + nf]
+            if pc is not None:
+                if pc in bq_atk:
+                    return True
+                break
+            nr += dr
+            nf += df
+
+    return False
+
+
+def _infer_is_quiet(board_fen: str, turn_char: str, best_move_uci: str, ev_cp_raw: float, rho: float) -> bool:
+    if abs(ev_cp_raw) >= 1000.0 or rho >= 0.75:
+        return False
+
+    grid = [None] * 64
+    wk = bk = -1
+    r, f = 7, 0
+    for ch in board_fen:
+        if ch == "/":
+            r -= 1
+            f = 0
+        elif "1" <= ch <= "8":
+            f += ord(ch) - 48
+        else:
+            sq = (r << 3) + f
+            grid[sq] = ch
+            if ch == "K":
+                wk = sq
+            elif ch == "k":
+                bk = sq
+            f += 1
+
+    if wk < 0 or bk < 0:
+        return False
+
+    us_white = (turn_char == "w")
+    our_king = wk if us_white else bk
+    opp_king = bk if us_white else wk
+
+    # 1. Currently in check
+    if _is_sq_attacked(grid, our_king, not us_white):
+        return False
+
+    # 2. Best move is capture, promotion, en-passant, or gives check
+    if best_move_uci and len(best_move_uci) >= 4:
+        if len(best_move_uci) >= 5:
+            return False  # promotion
+        f1 = ord(best_move_uci[0]) - 97
+        r1 = ord(best_move_uci[1]) - 49
+        f2 = ord(best_move_uci[2]) - 97
+        r2 = ord(best_move_uci[3]) - 49
+        if 0 <= f1 < 8 and 0 <= r1 < 8 and 0 <= f2 < 8 and 0 <= r2 < 8:
+            sq1 = (r1 << 3) + f1
+            sq2 = (r2 << 3) + f2
+            moving = grid[sq1]
+            target = grid[sq2]
+            if target is not None:
+                # DFRC castling encodes king capturing own rook -> check if same color rook
+                if not ((moving == "K" and target == "R") or (moving == "k" and target == "r")):
+                    return False
+            if moving in ("P", "p") and f1 != f2:
+                return False  # en passant capture
+
+            # Simulate move to test gives_check
+            grid[sq1] = None
+            grid[sq2] = moving
+            if _is_sq_attacked(grid, opp_king, us_white):
+                return False
+
+    return True
+
+
 def _parse_file_worker(file_path_str: str):
     path = Path(file_path_str)
     hashes, us_l, them_l = [], [], []
@@ -203,11 +323,21 @@ def _parse_file_worker(file_path_str: str):
         except (ValueError, TypeError):
             return
 
-        q_raw = pos.get("is_quiet", True)
-        if isinstance(q_raw, str):
-            is_quiet = q_raw.strip().lower() in ("true", "1", "yes")
+        tau = max(0.0, min(1.0, float(pos.get("tau", 0.5))))
+        rho = max(0.0, min(1.0, float(pos.get("rho", 0.3))))
+        rs = max(0.0, min(1.0, float(pos.get("rs", 0.5))))
+        bm_lbl = max(0, min(767, int(pos.get("best_move_label", 0))))
+        sm_lbl = max(0, min(767, int(pos.get("sec_move_label", 0))))
+
+        if "is_quiet" in pos and pos["is_quiet"] is not None:
+            q_raw = pos["is_quiet"]
+            if isinstance(q_raw, str):
+                is_quiet = q_raw.strip().lower() in ("true", "1", "yes")
+            else:
+                is_quiet = bool(q_raw)
         else:
-            is_quiet = bool(q_raw)
+            bm_uci = pos.get("best_move") or ""
+            is_quiet = _infer_is_quiet(parts[0], parts[1].lower(), bm_uci, ev_cp_raw, rho)
         eval_mask = 1 if (is_quiet and abs(ev_cp_raw) < 9000.0) else 0
 
         ev_pawns = max(-1000.0, min(1000.0, ev_cp_raw)) / 100.0
@@ -224,12 +354,6 @@ def _parse_file_worker(file_path_str: str):
                 wdl_val = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, ev_pawns / WDL_SCALE_PAWNS))))
         else:
             wdl_val = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, ev_pawns / WDL_SCALE_PAWNS))))
-
-        tau = max(0.0, min(1.0, float(pos.get("tau", 0.5))))
-        rho = max(0.0, min(1.0, float(pos.get("rho", 0.3))))
-        rs = max(0.0, min(1.0, float(pos.get("rs", 0.5))))
-        bm_lbl = max(0, min(767, int(pos.get("best_move_label", 0))))
-        sm_lbl = max(0, min(767, int(pos.get("sec_move_label", 0))))
 
         hashes.append(h)
         us_l.append(us_arr)
@@ -510,6 +634,8 @@ def main():
 
     staged_shards: List[Path] = []
     staged_sources: List[str] = []
+    staged_raw_pos = 0
+    staged_uniq_pos = 0
     part_num = int(manifest.get("next_part", 1))
 
     for i in range(0, len(pending), args.files_per_shard):
@@ -550,6 +676,8 @@ def main():
             print(f"[Shard] {shard_name}: {raw_n:,} raw -> {uniq_n:,} unique pos | {npz_mb:.1f} MB (nen {ratio:.2f}x) trong {time.time() - t1:.1f}s", flush=True)
             staged_shards.append(shard_path)
             staged_sources.extend(rel_p for rel_p, _ in chunk)
+            staged_raw_pos += raw_n
+            staged_uniq_pos += uniq_n
         else:
             print("[Shard Warning] Khong trich xuat duoc ban ghi hop le nao trong cum nay.", flush=True)
 
@@ -558,7 +686,7 @@ def main():
             if not args.dry_run:
                 ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, args.public)
                 manifest["processed_files"].extend(staged_sources)
-                manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards)})
+                manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
                 part_num += 1
                 manifest["next_part"] = part_num
                 save_and_push_manifest(k_api, index_ref, manifest, work_dir)
@@ -568,13 +696,15 @@ def main():
                     sp.unlink(missing_ok=True)
             staged_shards.clear()
             staged_sources.clear()
+            staged_raw_pos = 0
+            staged_uniq_pos = 0
 
     # Day not phan shards con lai neu co
     if staged_shards:
         if not args.dry_run:
             ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, args.public)
             manifest["processed_files"].extend(staged_sources)
-            manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards)})
+            manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
             part_num += 1
             manifest["next_part"] = part_num
             save_and_push_manifest(k_api, index_ref, manifest, work_dir)
