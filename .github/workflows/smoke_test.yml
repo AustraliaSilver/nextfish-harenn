@@ -1,0 +1,48 @@
+name: HARENN Smoke Test (60s)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download NNUE and UHO book
+        run: |
+          curl -fL --retry 5 --retry-delay 3 -o Stockfish-latest/src/nn-bddd9d57eb87.nnue https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue
+          cp Stockfish-latest/src/nn-bddd9d57eb87.nnue ./nn-bddd9d57eb87.nnue
+          curl -fL --retry 5 --retry-delay 3 -o uho.epd.zip https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip
+          unzip -p uho.epd.zip > uho.epd
+          rm -f uho.epd.zip
+
+      - name: Build Stockfish (profile-build ARCH=native)
+        run: |
+          make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
+          cp Stockfish-latest/src/stockfish ./harenn_engine
+
+      - name: Run 60s smoke test and inspect output
+        run: |
+          mkdir -p ./data_test
+          ./harenn_engine harenn_datagen --output ./data_test --games 0 --concurrency $(nproc) --hash 64 --time-budget 60 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
+          python3 - <<'EOF'
+          import glob, json
+          files = sorted(glob.glob("./data_test/*.jsonl"))
+          tot = q = 0
+          rhos, taus, rss = [], [], []
+          wdl = {}
+          for fp in files:
+              with open(fp) as f:
+                  for line in f:
+                      r = json.loads(line)
+                      tot += 1
+                      if r.get("is_quiet"): q += 1
+                      rhos.append(r["rho"]); taus.append(r["tau"]); rss.append(r["rs"])
+                      w = str(r.get("wdl")); wdl[w] = wdl.get(w, 0) + 1
+          def st(a):
+              s = sorted(a); n = len(s)
+              return {"mean": round(sum(s)/n,4), "p10": s[int(0.1*n)], "p50": s[int(0.5*n)], "p90": s[int(0.9*n)]}
+          print(json.dumps({"files": len(files), "positions": tot, "quiet_rate": round(q/max(1,tot),4), "rho": st(rhos), "tau": st(taus), "rs": st(rss), "wdl": wdl}, indent=2))
+          EOF
