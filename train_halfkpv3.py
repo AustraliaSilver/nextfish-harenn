@@ -338,7 +338,7 @@ def _parse_single_data_file_worker(task):
             return
 
         # Bao gồm quân (0), lượt đi (1) và quyền nhập thành (2) để phân biệt thế cờ
-        board_key = " ".join(parts[:3]) if len(parts) >= 3 else fen
+        board_key = " ".join(parts[:4]) if len(parts) >= 4 else fen
         # Dùng hàm băm mật mã 64-bit blake2b triệt tiêu 100% rủi ro đụng độ birthday collision trên 50M-100M vị trí
         h = struct.unpack("<q", hashlib.blake2b(board_key.encode("utf-8"), digest_size=8).digest())[0]
 

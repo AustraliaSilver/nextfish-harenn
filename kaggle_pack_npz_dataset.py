@@ -298,7 +298,7 @@ def _parse_file_worker(file_path_str: str):
         if len(parts) < 2:
             return
 
-        board_key = " ".join(parts[:3]) if len(parts) >= 3 else fen
+        board_key = " ".join(parts[:4]) if len(parts) >= 4 else fen
         h = struct.unpack("<q", hashlib.blake2b(board_key.encode("utf-8"), digest_size=8).digest())[0]
 
         stm = None
