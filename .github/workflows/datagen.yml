@@ -22,7 +22,7 @@ jobs:
   auto-retrigger:
     needs: data-generation
     runs-on: ubuntu-latest
-    if: success()
+    if: ${{ !cancelled() }}
     steps:
       - name: Cool down 2 minutes before next run
         run: |

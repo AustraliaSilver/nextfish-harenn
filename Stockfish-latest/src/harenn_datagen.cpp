@@ -206,12 +206,12 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
     std::filesystem::path out_path = std::filesystem::path(cfg.output_dir) / fname;
     std::ofstream out_f(out_path, std::ios::app);
 
-    engine.set_tt_size(static_cast<usize>(std::max(1, cfg.hash_mb)));
     auto set_opt = [&](const std::string& name, const std::string& val) {
         std::istringstream os("name " + name + " value " + val);
         engine.get_options().setoption(os);
     };
     set_opt("Threads", "1");
+    set_opt("Hash", std::to_string(std::max(1, cfg.hash_mb)));
     int cur_multipv = cfg.multipv;
     set_opt("MultiPV", std::to_string(cur_multipv));
 
@@ -404,7 +404,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
             trace_vals[trace_n++] = cp_deep;
 
-            double rho = 0.0;
+            double rho = 0.25;
             if (trace_n >= 2) {
                 double mean = 0.0;
                 for (int k = 0; k < trace_n; ++k) mean += trace_vals[k];
@@ -419,13 +419,14 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                 double std_dev = std::sqrt(var / trace_n);
                 double avg_step = step_sum / (trace_n - 1);
                 rho = std::clamp(0.5 * (std_dev / 120.0) + 0.5 * (avg_step / 120.0), 0.0, 1.0);
-            } else {
-                rho = std::min(eval_swing / 200.0, 1.0);
             }
 
-            double move_instability = 0.0;
-            if (m_shallow_str != m_deep_str) move_instability += 0.5;
-            if (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str != sec_deep_str) move_instability += 0.5;
+            double move_instability = 0.25;
+            if (has_shallow) {
+                move_instability = 0.0;
+                if (m_shallow_str != m_deep_str) move_instability += 0.5;
+                if (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str != sec_deep_str) move_instability += 0.5;
+            }
             double tau = std::clamp(0.60 * move_instability + 0.40 * tactical_density, 0.0, 1.0);
 
             if (std::abs(cp_deep) < 30) {
@@ -439,10 +440,14 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
                 tau = std::min(tau + 0.10, 1.0);
             }
 
-            bool best_same = (m_shallow_str == m_deep_str);
-            bool sec_same = (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str == sec_deep_str);
-            double s_agreement = (best_same && sec_same) ? 1.0 : (best_same ? 0.75 : (sec_same ? 0.50 : 0.25));
-            double s_stability = std::max(0.0, 1.0 - (eval_swing / 150.0));
+            double s_agreement = 0.50;
+            double s_stability = 0.50;
+            if (has_shallow) {
+                bool best_same = (m_shallow_str == m_deep_str);
+                bool sec_same = (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str == sec_deep_str);
+                s_agreement = (best_same && sec_same) ? 1.0 : (best_same ? 0.75 : (sec_same ? 0.50 : 0.25));
+                s_stability = std::max(0.0, 1.0 - (eval_swing / 150.0));
+            }
             int margin = std::max(0, cp_deep - cp_second);
             double s_margin = !sec_deep_str.empty() ? std::min(1.0, margin / 80.0) : 0.50;
             double rs = std::clamp(0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin, 0.05, 0.99);
