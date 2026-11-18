@@ -217,11 +217,19 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
     int cp_shallow = 0;
     bool has_shallow = false;
 
+    std::array<uint64_t, 3> trace_thresh = {
+        std::max<uint64_t>(512, cfg.nodes / 16),
+        std::max<uint64_t>(1024, cfg.nodes / 4),
+        std::max<uint64_t>(2048, cfg.nodes / 2)
+    };
+    std::array<int, 3> cp_trace = {0, 0, 0};
+    std::array<bool, 3> has_trace = {false, false, false};
+
     std::string m_deep_str, sec_deep_str;
     int cp_deep = 0, cp_second = 0, achieved_depth = 1;
     std::string best_move_uci;
 
-    uint64_t nodes_shallow = std::max<uint64_t>(512, cfg.nodes / 16);
+    uint64_t nodes_shallow = trace_thresh[0];
 
     engine.set_on_iter([](const auto&) {});
     engine.set_on_update_no_moves([](const auto&) {});
@@ -240,6 +248,12 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
         }
         if (info.multiPV == 1 && !mv.empty()) {
+            for (int k = 0; k < 3; ++k) {
+                if (!has_trace[k] && info.nodes >= trace_thresh[k]) {
+                    cp_trace[k] = sc;
+                    has_trace[k] = true;
+                }
+            }
             m_deep_str = mv;
             cp_deep = sc;
             achieved_depth = info.depth;
@@ -290,6 +304,7 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         std::vector<RawPosRecord> game_positions;
         int last_eval_white = 0;
         bool has_last_eval = false;
+        std::vector<int> recent_evals_white;
         bool abnormal_stop = false;
         int win_adj_cnt = 0;
         int win_adj_sign = 0;
@@ -323,12 +338,25 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             sec_shallow_str.clear();
             has_shallow = false;
             cp_shallow = 0;
+            cp_trace.fill(0);
+            has_trace.fill(false);
             m_deep_str.clear();
             sec_deep_str.clear();
             cp_deep = 0;
             cp_second = 0;
             achieved_depth = 1;
             best_move_uci.clear();
+
+            int tactical_cnt = 0;
+            for (const auto& m : legal) {
+                if (pos.capture(m) || pos.gives_check(m) || m.type_of() == PROMOTION) {
+                    tactical_cnt++;
+                }
+            }
+            double tactical_density = (legal.size() > 0)
+                ? std::clamp(static_cast<double>(tactical_cnt + (pos.checkers() ? 1 : 0)) /
+                             static_cast<double>(legal.size()), 0.0, 1.0)
+                : 0.0;
 
             bool in_branch_window = (cfg.branch_plies > 0 && move_num > random_plies &&
                                      move_num <= random_plies + cfg.branch_plies);
@@ -367,12 +395,42 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
 
             last_eval_white = (pos.side_to_move() == WHITE) ? cp_deep : -cp_deep;
             has_last_eval = true;
+            recent_evals_white.push_back(last_eval_white);
+            if (recent_evals_white.size() > 4) {
+                recent_evals_white.erase(recent_evals_white.begin());
+            }
 
             int eval_swing = std::abs(cp_shallow - cp_deep);
-            double rho = std::min(eval_swing / 200.0, 1.0);
-            double tau = 0.0;
-            if (m_shallow_str != m_deep_str) tau += 0.5;
-            if (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str != sec_deep_str) tau += 0.5;
+            int trace_vals[4];
+            int trace_n = 0;
+            for (int k = 0; k < 3; ++k) {
+                if (has_trace[k]) trace_vals[trace_n++] = cp_trace[k];
+            }
+            trace_vals[trace_n++] = cp_deep;
+
+            double rho = 0.0;
+            if (trace_n >= 2) {
+                double mean = 0.0;
+                for (int k = 0; k < trace_n; ++k) mean += trace_vals[k];
+                mean /= trace_n;
+                double var = 0.0;
+                double step_sum = 0.0;
+                for (int k = 0; k < trace_n; ++k) {
+                    double d = trace_vals[k] - mean;
+                    var += d * d;
+                    if (k > 0) step_sum += std::abs(trace_vals[k] - trace_vals[k - 1]);
+                }
+                double std_dev = std::sqrt(var / trace_n);
+                double avg_step = step_sum / (trace_n - 1);
+                rho = std::clamp(0.5 * (std_dev / 120.0) + 0.5 * (avg_step / 120.0), 0.0, 1.0);
+            } else {
+                rho = std::min(eval_swing / 200.0, 1.0);
+            }
+
+            double move_instability = 0.0;
+            if (m_shallow_str != m_deep_str) move_instability += 0.5;
+            if (!sec_shallow_str.empty() && !sec_deep_str.empty() && sec_shallow_str != sec_deep_str) move_instability += 0.5;
+            double tau = std::clamp(0.60 * move_instability + 0.40 * tactical_density, 0.0, 1.0);
 
             if (std::abs(cp_deep) < 30) {
                 rho = std::min(rho + 0.15, 1.0);
@@ -393,9 +451,10 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             double s_margin = !sec_deep_str.empty() ? std::min(1.0, margin / 80.0) : 0.50;
             double rs = std::clamp(0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin, 0.05, 0.99);
 
+            bool dest_attacked = (pos.attackers_to(best_m.to_sq()) & pos.pieces(~pos.side_to_move())) != 0;
             bool quiet = !pos.checkers() && !pos.gives_check(best_m) && !pos.capture(best_m) &&
                          best_m.type_of() != PROMOTION && best_m.type_of() != CASTLING &&
-                         eval_swing <= 150 && std::abs(cp_deep) < 1000;
+                         !dest_attacked && eval_swing <= 150 && std::abs(cp_deep) < 1000;
 
             RawPosRecord rec;
             rec.fen = engine.fen();
@@ -463,9 +522,12 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             }
         } else if (end_pos.is_draw(0) || is_insufficient_material(end_pos)) {
             white_outcome = 0.5;
-        } else if (!abnormal_stop && has_last_eval) {
-            if (last_eval_white >= 200) white_outcome = 1.0;
-            else if (last_eval_white <= -200) white_outcome = 0.0;
+        } else if (!abnormal_stop && !recent_evals_white.empty()) {
+            double eval_sum = 0.0;
+            for (int ev : recent_evals_white) eval_sum += ev;
+            double avg_eval_white = eval_sum / static_cast<double>(recent_evals_white.size());
+            if (avg_eval_white >= 200.0) white_outcome = 1.0;
+            else if (avg_eval_white <= -200.0) white_outcome = 0.0;
             else white_outcome = 0.5;
         }
 
