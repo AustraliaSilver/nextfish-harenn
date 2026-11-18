@@ -1,6 +1,7 @@
 #include "harenn_datagen.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -303,7 +304,6 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
         std::vector<std::string> played_moves;
         std::vector<RawPosRecord> game_positions;
         int last_eval_white = 0;
-        bool has_last_eval = false;
         std::vector<int> recent_evals_white;
         bool abnormal_stop = false;
         int win_adj_cnt = 0;
@@ -394,7 +394,6 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             if (cur_multipv == 1) cp_second = cp_deep;
 
             last_eval_white = (pos.side_to_move() == WHITE) ? cp_deep : -cp_deep;
-            has_last_eval = true;
             recent_evals_white.push_back(last_eval_white);
             if (recent_evals_white.size() > 4) {
                 recent_evals_white.erase(recent_evals_white.begin());
@@ -451,7 +450,8 @@ void worker_fn(int tid, const DatagenConfig& cfg, int max_games,
             double s_margin = !sec_deep_str.empty() ? std::min(1.0, margin / 80.0) : 0.50;
             double rs = std::clamp(0.45 * s_stability + 0.35 * s_agreement + 0.20 * s_margin, 0.05, 0.99);
 
-            bool dest_attacked = (pos.attackers_to(best_m.to_sq()) & pos.pieces(~pos.side_to_move())) != 0;
+            bool dest_attacked = (pos.attackers_to(best_m.to_sq(), pos.pieces() ^ best_m.from_sq()) &
+                                  pos.pieces(~pos.side_to_move())) != 0;
             bool quiet = !pos.checkers() && !pos.gives_check(best_m) && !pos.capture(best_m) &&
                          best_m.type_of() != PROMOTION && best_m.type_of() != CASTLING &&
                          !dest_attacked && eval_swing <= 150 && std::abs(cp_deep) < 1000;
