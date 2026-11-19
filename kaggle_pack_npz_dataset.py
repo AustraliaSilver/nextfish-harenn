@@ -27,9 +27,11 @@ import math
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -405,7 +407,75 @@ def _parse_file_worker(file_path_str: str):
     )
 
 
-def build_npz_shard(file_paths: List[str], out_npz_path: Path, dedup: bool = True) -> Tuple[int, int]:
+_FAST_PACK_BIN: Optional[str] = None
+
+
+def ensure_fast_pack(work_dir: Path) -> Optional[str]:
+    global _FAST_PACK_BIN
+    if _FAST_PACK_BIN is not None:
+        return _FAST_PACK_BIN or None
+    exe_name = "fast_pack.exe" if os.name == "nt" else "fast_pack"
+    bin_path = work_dir / exe_name
+    if bin_path.exists():
+        _FAST_PACK_BIN = str(bin_path)
+        return _FAST_PACK_BIN
+    cpp_path = Path(__file__).with_name("fast_pack.cpp")
+    if not cpp_path.exists():
+        cpp_dl = work_dir / "fast_pack.cpp"
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://raw.githubusercontent.com/AustraliaSilver/nextfish-harenn/data/fast_pack.cpp",
+                str(cpp_dl),
+            )
+            cpp_path = cpp_dl
+        except Exception as e:
+            print(f"[FastPack] Khong tai duoc fast_pack.cpp ({e}), dung Python fallback.", flush=True)
+            _FAST_PACK_BIN = ""
+            return None
+    try:
+        cmd = ["g++", "-O3", "-std=c++17", "-pthread", str(cpp_path), "-o", str(bin_path)]
+        if os.name == "nt":
+            cmd = ["g++", "-O3", "-std=c++17", str(cpp_path), "-o", str(bin_path)]
+        subprocess.run(cmd, check=True)
+        _FAST_PACK_BIN = str(bin_path)
+        print(f"[FastPack] Da bien dich C++ fast_pack thanh cong: {_FAST_PACK_BIN}", flush=True)
+        return _FAST_PACK_BIN
+    except Exception as e:
+        print(f"[FastPack] Bien dich that bai ({e}), dung Python fallback.", flush=True)
+        _FAST_PACK_BIN = ""
+        return None
+
+
+def _pack_npy_dir_to_npz(npy_dir: Path, out_npz_path: Path) -> None:
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(str(out_npz_path), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for p in sorted(npy_dir.glob("*.npy")):
+            zf.write(str(p), arcname=p.name)
+
+
+def build_npz_shard(file_paths: List[str], out_npz_path: Path, dedup: bool = True, work_dir: Optional[Path] = None) -> Tuple[int, int]:
+    fp_bin = ensure_fast_pack(work_dir) if work_dir is not None else None
+    if fp_bin and all(p.endswith(".jsonl") for p in file_paths):
+        npy_dir = (work_dir / "npy_tmp")
+        shutil.rmtree(npy_dir, ignore_errors=True)
+        npy_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            res = subprocess.run(
+                [fp_bin, str(npy_dir), "1" if dedup else "0", *file_paths],
+                capture_output=True, text=True, check=True,
+            )
+            parts = res.stdout.strip().split()
+            raw_n, uniq_n = int(parts[0]), int(parts[1])
+            if raw_n == 0 or uniq_n == 0:
+                return 0, 0
+            _pack_npy_dir_to_npz(npy_dir, out_npz_path)
+            return raw_n, uniq_n
+        except Exception as e:
+            print(f"[FastPack Warning] Loi C++ ({e}), chuyen sang Python fallback...", flush=True)
+        finally:
+            shutil.rmtree(npy_dir, ignore_errors=True)
+
     workers = max(1, min(8, cpu_count()))
     with Pool(workers) as pool:
         results = pool.map(_parse_file_worker, file_paths)
@@ -682,7 +752,7 @@ def main():
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         shard_name = f"hkv3_p{part_num:03d}_s{len(staged_shards) + 1:02d}_{ts}.npz"
         shard_path = shard_dir / shard_name
-        raw_n, uniq_n = build_npz_shard(local_paths, shard_path, dedup=not args.no_dedup)
+        raw_n, uniq_n = build_npz_shard(local_paths, shard_path, dedup=not args.no_dedup, work_dir=work_dir)
 
         # Xoa ngay file raw jsonl de giai phong o dia Kaggle
         for lp in local_paths:
