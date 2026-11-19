@@ -27,6 +27,7 @@ static constexpr double WDL_SCALE_PAWNS = 2.60;
 
 struct Record {
     uint64_t hash;
+    uint64_t hash2;
     uint16_t us[32];
     uint16_t them[32];
     float eval_pawns;
@@ -39,12 +40,18 @@ struct Record {
     uint16_t sm_lbl;
 };
 
-static inline uint64_t hash_bytes_64(const char* data, size_t len) {
-    // 64-bit FNV-1a + Murmur3 finalizer (fast, zero-alloc, ~0 collision at 30M)
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<uint8_t>(data[i]);
-        h *= 1099511628211ULL;
+static inline uint64_t hash_parts_64(const std::string_view parts[4], int n_parts, uint64_t seed, uint64_t mul) {
+    uint64_t h = seed;
+    int limit = (n_parts >= 4) ? 4 : n_parts;
+    for (int p = 0; p < limit; ++p) {
+        if (p > 0) {
+            h ^= static_cast<uint8_t>(' ');
+            h *= mul;
+        }
+        for (unsigned char c : parts[p]) {
+            h ^= c;
+            h *= mul;
+        }
     }
     h ^= h >> 33;
     h *= 0xff51afd7ed558ccdULL;
@@ -305,10 +312,8 @@ static bool parse_json_line(const char* line, size_t len, Record& out) {
     }
     if (n_parts < 2) return false;
 
-    std::string_view board_key = (n_parts >= 4)
-        ? fen.substr(0, static_cast<size_t>((parts[3].data() + parts[3].size()) - fen.data()))
-        : fen;
-    out.hash = hash_bytes_64(board_key.data(), board_key.size());
+    out.hash = hash_parts_64(parts, n_parts, 14695981039346656037ULL, 1099511628211ULL);
+    out.hash2 = hash_parts_64(parts, n_parts, 0x9e3779b97f4a7c15ULL, 0xbf58476d1ce4e5b9ULL);
 
     int stm = (stm_override >= 0) ? stm_override : ((parts[1] == "b") ? 1 : 0);
 
@@ -450,6 +455,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < raw_n; ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
             if (all[a].hash != all[b].hash) return all[a].hash < all[b].hash;
+            if (all[a].hash2 != all[b].hash2) return all[a].hash2 < all[b].hash2;
             return a < b;
         });
 
@@ -459,10 +465,11 @@ int main(int argc, char** argv) {
         while (i < raw_n) {
             size_t j = i + 1;
             uint64_t h = all[order[i]].hash;
+            uint64_t h2 = all[order[i]].hash2;
             double s_ev = all[order[i]].eval_pawns, s_wdl = all[order[i]].wdl;
             double s_msk = all[order[i]].eval_mask, s_tau = all[order[i]].tau;
             double s_rho = all[order[i]].rho, s_rs = all[order[i]].rs;
-            while (j < raw_n && all[order[j]].hash == h) {
+            while (j < raw_n && all[order[j]].hash == h && all[order[j]].hash2 == h2) {
                 const Record& rj = all[order[j]];
                 s_ev += rj.eval_pawns; s_wdl += rj.wdl;
                 s_msk += rj.eval_mask; s_tau += rj.tau;
@@ -503,6 +510,7 @@ int main(int argc, char** argv) {
         bm_buf[i] = r.bm_lbl;
         sm_buf[i] = r.sm_lbl;
     }
+    std::vector<Record>().swap(all);
 
     write_npy(out_dir / "us_indices.npy", "<u2", uniq_n, 32, us_buf.data(), 2);
     write_npy(out_dir / "them_indices.npy", "<u2", uniq_n, 32, them_buf.data(), 2);
