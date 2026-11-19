@@ -117,8 +117,9 @@ def manage_3_kaggle_workers():
     force = "--force" in sys.argv
     if force:
         print("  [Note] --force flag detected: Restarting 3 workers with latest code")
-    token = os.environ.get("KAGGLE_API_TOKEN") or "KGAT_b42d4a8ff82836dd870f04137475c469"
-    os.environ["KAGGLE_API_TOKEN"] = token
+    token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
+    if token:
+        os.environ["KAGGLE_API_TOKEN"] = token
 
     api = KaggleApi()
     api.authenticate()
