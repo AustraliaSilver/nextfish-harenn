@@ -727,9 +727,11 @@ def main():
             p_idx += 1
         batches.append((chunk, chunk_bytes))
 
-    # Don sach thu muc raw cu neu con sot
+    # Don sach thu muc raw/shard cu neu con sot
     shutil.rmtree(raw_dir, ignore_errors=True)
+    shutil.rmtree(shard_dir, ignore_errors=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
     ensure_fast_pack(work_dir)
 
     def _download_batch(b_idx: int) -> Tuple[Path, List[str], float]:
@@ -775,34 +777,34 @@ def main():
             shutil.rmtree(b_dir, ignore_errors=True)
             cur_fut = next_fut
 
-        if uniq_n > 0 and shard_path.exists():
-            npz_mb = shard_path.stat().st_size / (1024 * 1024)
-            ratio = chunk_mb / max(0.01, npz_mb)
-            print(f"[Shard] {shard_name}: {raw_n:,} raw -> {uniq_n:,} unique pos | {npz_mb:.1f} MB (nen {ratio:.2f}x) trong {time.time() - t1:.1f}s", flush=True)
-            staged_shards.append(shard_path)
-            staged_sources.extend(rel_p for rel_p, _ in chunk)
-            staged_raw_pos += raw_n
-            staged_uniq_pos += uniq_n
-        else:
-            print("[Shard Warning] Khong trich xuat duoc ban ghi hop le nao trong cum nay.", flush=True)
-
-        # Neu da gom du so shard -> dang ngay len Kaggle Dataset
-        if len(staged_shards) >= args.shards_per_dataset:
-            if not args.dry_run:
-                ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, not args.private)
-                manifest["processed_files"].extend(staged_sources)
-                manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
-                part_num += 1
-                manifest["next_part"] = part_num
-                save_and_push_manifest(k_api, index_ref, manifest, work_dir)
+            if uniq_n > 0 and shard_path.exists():
+                npz_mb = shard_path.stat().st_size / (1024 * 1024)
+                ratio = chunk_mb / max(0.01, npz_mb)
+                print(f"[Shard] {shard_name}: {raw_n:,} raw -> {uniq_n:,} unique pos | {npz_mb:.1f} MB (nen {ratio:.2f}x) trong {time.time() - t1:.1f}s", flush=True)
+                staged_shards.append(shard_path)
+                staged_sources.extend(rel_p for rel_p, _ in chunk)
+                staged_raw_pos += raw_n
+                staged_uniq_pos += uniq_n
             else:
-                print(f"[Dry-Run] Bo qua upload {len(staged_shards)} shards len Kaggle.", flush=True)
-                for sp in staged_shards:
-                    sp.unlink(missing_ok=True)
-            staged_shards.clear()
-            staged_sources.clear()
-            staged_raw_pos = 0
-            staged_uniq_pos = 0
+                print("[Shard Warning] Khong trich xuat duoc ban ghi hop le nao trong cum nay.", flush=True)
+
+            # Neu da gom du so shard -> dang ngay len Kaggle Dataset
+            if len(staged_shards) >= args.shards_per_dataset:
+                if not args.dry_run:
+                    ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, not args.private)
+                    manifest["processed_files"].extend(staged_sources)
+                    manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
+                    part_num += 1
+                    manifest["next_part"] = part_num
+                    save_and_push_manifest(k_api, index_ref, manifest, work_dir)
+                else:
+                    print(f"[Dry-Run] Bo qua upload {len(staged_shards)} shards len Kaggle.", flush=True)
+                    for sp in staged_shards:
+                        sp.unlink(missing_ok=True)
+                staged_shards.clear()
+                staged_sources.clear()
+                staged_raw_pos = 0
+                staged_uniq_pos = 0
 
     # Day not phan shards con lai neu co
     if staged_shards:
