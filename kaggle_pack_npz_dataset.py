@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -651,7 +652,7 @@ def main():
     parser.add_argument("--dataset-prefix", type=str, default="harenn-hkv3-npz", help="Ten goc Kaggle Dataset (tao dang <prefix>-p001, p002...)")
     parser.add_argument("--index-dataset", type=str, default="harenn-hkv3-npz-index", help="Slug dataset nho luu packed_manifest.json")
     parser.add_argument("--files-per-shard", type=int, default=17, help="So file .jsonl toi da gom thanh 1 shard .npz (mac dinh: 17)")
-    parser.add_argument("--max-batch-gb", type=float, default=8.0, help="Gioi han dung luong raw JSONL tai moi luot (GB, mac dinh 8.0 de tranh tran o dia Kaggle)")
+    parser.add_argument("--max-batch-gb", type=float, default=5.5, help="Gioi han dung luong raw JSONL tai moi luot (GB, mac dinh 5.5 de an toan khi prefetch song song)")
     parser.add_argument("--shards-per-dataset", type=int, default=4, help="So shard .npz gom du roi tu dong dang len 1 Kaggle Dataset (mac dinh: 4)")
     parser.add_argument("--max-files", type=int, default=0, help="Gioi han so file xu ly moi phien (0 = khong gioi han)")
     parser.add_argument("--time-budget", type=int, default=39600, help="Gioi han thoi gian chay (giay, mac dinh 11h cho Kaggle)")
@@ -669,6 +670,7 @@ def main():
     raw_dir.mkdir(parents=True, exist_ok=True)
     shard_dir.mkdir(parents=True, exist_ok=True)
 
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     hf_token = get_secret("HF_TOKEN")
     from huggingface_hub import HfApi
     hf_api = HfApi(token=hf_token if hf_token else None)
@@ -710,13 +712,9 @@ def main():
     part_num = int(manifest.get("next_part", 1))
 
     max_batch_bytes = int(max(1.0, args.max_batch_gb) * 1024 * 1024 * 1024)
+    batches: List[Tuple[List[Tuple[str, int]], int]] = []
     p_idx = 0
-    batch_num = 0
     while p_idx < len(pending):
-        if args.time_budget > 0 and (time.time() - t_start) >= args.time_budget:
-            print("[Time Budget] Sap het thoi gian phien -> dung tai file moi va day not phan da nen.", flush=True)
-            break
-
         chunk = []
         chunk_bytes = 0
         while p_idx < len(pending) and len(chunk) < args.files_per_shard:
@@ -726,40 +724,55 @@ def main():
             chunk.append((rel_p, sz))
             chunk_bytes += sz
             p_idx += 1
+        batches.append((chunk, chunk_bytes))
 
-        batch_num += 1
-        # Don file cu con sot (neu co) truoc khi tai luot moi
-        for stale in raw_dir.glob("*"):
-            try:
-                stale.unlink(missing_ok=True)
-            except Exception:
-                pass
+    # Don sach thu muc raw cu neu con sot
+    shutil.rmtree(raw_dir, ignore_errors=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ensure_fast_pack(work_dir)
 
+    def _download_batch(b_idx: int) -> Tuple[Path, List[str], float]:
+        chunk, chunk_bytes = batches[b_idx]
+        b_dir = raw_dir / f"b{b_idx}"
+        shutil.rmtree(b_dir, ignore_errors=True)
+        b_dir.mkdir(parents=True, exist_ok=True)
         dl_pairs = []
         local_paths = []
-        chunk_mb = chunk_bytes / (1024 * 1024)
         for rel_p, _ in chunk:
-            lp = raw_dir / Path(rel_p).name
+            lp = b_dir / Path(rel_p).name
             dl_pairs.append((rel_p, str(lp)))
             local_paths.append(str(lp))
-
-        t0 = time.time()
-        print(f"\n[Batch {batch_num}] Dang tai {len(chunk)} file ({chunk_mb:.1f} MB)...", flush=True)
+        t_dl = time.time()
+        chunk_mb = chunk_bytes / (1024 * 1024)
+        print(f"\n[Batch {b_idx + 1}/{len(batches)}] Dang tai {len(chunk)} file ({chunk_mb:.1f} MB)...", flush=True)
         hf_api.download_bucket_files(args.hf_bucket, dl_pairs)
-        print(f"[Batch] Tai xong trong {time.time() - t0:.1f}s. Dang chuyen doi sang NPZ nen...", flush=True)
+        return b_dir, local_paths, time.time() - t_dl
 
-        t1 = time.time()
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        shard_name = f"hkv3_p{part_num:03d}_s{len(staged_shards) + 1:02d}_{ts}.npz"
-        shard_path = shard_dir / shard_name
-        raw_n, uniq_n = build_npz_shard(local_paths, shard_path, dedup=not args.no_dedup, work_dir=work_dir)
+    with ThreadPoolExecutor(max_workers=1) as dl_pool:
+        cur_fut = dl_pool.submit(_download_batch, 0)
+        for b_idx, (chunk, chunk_bytes) in enumerate(batches):
+            if args.time_budget > 0 and (time.time() - t_start) >= args.time_budget:
+                print("[Time Budget] Sap het thoi gian phien -> dung tai file moi va day not phan da nen.", flush=True)
+                cur_fut.cancel()
+                break
 
-        # Xoa ngay file raw jsonl de giai phong o dia Kaggle
-        for lp in local_paths:
-            try:
-                Path(lp).unlink(missing_ok=True)
-            except Exception:
-                pass
+            b_dir, local_paths, dl_sec = cur_fut.result()
+            chunk_mb = chunk_bytes / (1024 * 1024)
+            print(f"[Batch {b_idx + 1}] Tai xong trong {dl_sec:.1f}s. Dang chuyen doi sang NPZ nen...", flush=True)
+
+            next_fut = None
+            if (b_idx + 1) < len(batches) and (args.time_budget <= 0 or (time.time() - t_start) < args.time_budget):
+                next_fut = dl_pool.submit(_download_batch, b_idx + 1)
+
+            t1 = time.time()
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            shard_name = f"hkv3_p{part_num:03d}_s{len(staged_shards) + 1:02d}_{ts}.npz"
+            shard_path = shard_dir / shard_name
+            raw_n, uniq_n = build_npz_shard(local_paths, shard_path, dedup=not args.no_dedup, work_dir=work_dir)
+
+            # Xoa ngay thu muc raw jsonl cua batch nay de giai phong o dia Kaggle
+            shutil.rmtree(b_dir, ignore_errors=True)
+            cur_fut = next_fut
 
         if uniq_n > 0 and shard_path.exists():
             npz_mb = shard_path.stat().st_size / (1024 * 1024)
