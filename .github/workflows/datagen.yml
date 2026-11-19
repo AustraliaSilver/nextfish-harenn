@@ -19,8 +19,34 @@ jobs:
       run_id: ${{ github.run_id }}
     secrets: inherit
 
-  auto-retrigger:
+  publish-kaggle:
     needs: data-generation
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Setup Python & dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -q huggingface_hub kaggle numpy six
+
+      - name: Publish shift NPZ shards to Kaggle Datasets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          python3 github_publish_shift_to_kaggle.py --run-id ${{ github.run_id }}
+
+  auto-retrigger:
+    needs: [data-generation, publish-kaggle]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:

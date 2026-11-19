@@ -1,4 +1,4 @@
-name: HARENN Smoke Test (60s)
+name: HARENN Smoke Test (Full E2E Pipeline)
 
 on:
   workflow_dispatch:
@@ -9,6 +9,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: data
+
+      - name: Setup Python & dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -q huggingface_hub kaggle numpy six
 
       - name: Download NNUE and UHO book
         run: |
@@ -23,26 +34,12 @@ jobs:
           make -C Stockfish-latest/src -j$(nproc) profile-build ARCH=native EXTRACXXFLAGS="-mtune=native"
           cp Stockfish-latest/src/stockfish ./harenn_engine
 
-      - name: Run 60s smoke test and inspect output
+      - name: Run 20s datagen + worker upload (HF Bucket JSONL + HF Dataset NPZ) + Kaggle manifest check
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          mkdir -p ./data_test
-          ./harenn_engine harenn_datagen --output ./data_test --games 0 --concurrency $(nproc) --hash 64 --time-budget 60 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
-          python3 - <<'EOF'
-          import glob, json
-          files = sorted(glob.glob("./data_test/*.jsonl"))
-          tot = q = 0
-          rhos, taus, rss = [], [], []
-          wdl = {}
-          for fp in files:
-              with open(fp) as f:
-                  for line in f:
-                      r = json.loads(line)
-                      tot += 1
-                      if r.get("is_quiet"): q += 1
-                      rhos.append(r["rho"]); taus.append(r["tau"]); rss.append(r["rs"])
-                      w = str(r.get("wdl")); wdl[w] = wdl.get(w, 0) + 1
-          def st(a):
-              s = sorted(a); n = len(s)
-              return {"mean": round(sum(s)/n,4), "p10": s[int(0.1*n)], "p50": s[int(0.5*n)], "p90": s[int(0.9*n)]}
-          print(json.dumps({"files": len(files), "positions": tot, "quiet_rate": round(q/max(1,tot),4), "rho": st(rhos), "tau": st(taus), "rs": st(rss), "wdl": wdl}, indent=2))
-          EOF
+          mkdir -p ./data
+          ./harenn_engine harenn_datagen --output ./data --games 0 --concurrency $(nproc) --hash 64 --time-budget 20 --worker-id 99 --nodes 8192 --hard-nodes --multipv 2 --book ./uho.epd --book-random-plies 2 --branch-plies 12 --branch-cp 40
+          python3 github_worker_upload.py --worker-id 99 --run-id smoke_${{ github.run_id }}
+          python3 github_publish_shift_to_kaggle.py --run-id smoke_${{ github.run_id }} --dry-run --cleanup-hf-test
