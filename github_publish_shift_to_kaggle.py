@@ -35,7 +35,8 @@ def main():
     parser.add_argument("--dataset-prefix", default="harenn-hkv3-npz", type=str)
     parser.add_argument("--index-dataset", default="harenn-hkv3-npz-index", type=str)
     parser.add_argument("--max-part-gb", default=5.5, type=float)
-    parser.add_argument("--public", action="store_true")
+    parser.add_argument("--public", action="store_true", help="(Tuong thich nguoc) Mac dinh da la public")
+    parser.add_argument("--private", action="store_true", help="Tao Kaggle Dataset dang private (mac dinh public)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--cleanup-hf-test", action="store_true", help="Xoa du lieu test cua run-id tren HF (chi dung cho smoke test)")
     parser.add_argument("--ignore-running-packer", action="store_true", help="Bo qua kiem tra kernel packer dang chay")
@@ -132,7 +133,7 @@ def main():
                     shutil.move(sp, flat_p)
                 shard_paths.append(flat_p)
 
-            ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, shard_paths, args.public)
+            ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, shard_paths, not args.private)
             src_files = [m["jsonl"] for m in grp]
             raw_sum = sum(int(m["raw_positions"]) for m in grp)
             uniq_sum = sum(int(m["unique_positions"]) for m in grp)

@@ -603,7 +603,7 @@ def save_and_push_manifest(k_api, index_dataset_ref: str, manifest: Dict, work_d
         k_api.dataset_status(index_dataset_ref)
         k_api.dataset_create_version(str(idx_dir), version_notes=f"Update manifest: {len(manifest['processed_files'])} files", dir_mode="zip", quiet=False)
     except Exception:
-        k_api.dataset_create_new(str(idx_dir), public=False, dir_mode="zip", quiet=False)
+        k_api.dataset_create_new(str(idx_dir), public=True, dir_mode="zip", quiet=False)
     shutil.rmtree(idx_dir, ignore_errors=True)
 
 
@@ -657,7 +657,8 @@ def main():
     parser.add_argument("--max-files", type=int, default=0, help="Gioi han so file xu ly moi phien (0 = khong gioi han)")
     parser.add_argument("--time-budget", type=int, default=39600, help="Gioi han thoi gian chay (giay, mac dinh 11h cho Kaggle)")
     parser.add_argument("--work-dir", type=str, default="/kaggle/working/packer_tmp" if os.path.exists("/kaggle/working") else "./packer_tmp", help="Thu muc tam")
-    parser.add_argument("--public", action="store_true", help="Tao Kaggle Dataset dang public (mac dinh private)")
+    parser.add_argument("--public", action="store_true", help="(Tuong thich nguoc) Mac dinh da la public")
+    parser.add_argument("--private", action="store_true", help="Tao Kaggle Dataset dang private (mac dinh la public de khong dinh private quota)")
     parser.add_argument("--no-dedup", action="store_true", help="Tat khử trùng trong moi shard")
     parser.add_argument("--dry-run", action="store_true", help="Chi liet ke & nen thu, khong day len Kaggle")
     args = parser.parse_args()
@@ -788,7 +789,7 @@ def main():
         # Neu da gom du so shard -> dang ngay len Kaggle Dataset
         if len(staged_shards) >= args.shards_per_dataset:
             if not args.dry_run:
-                ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, args.public)
+                ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, not args.private)
                 manifest["processed_files"].extend(staged_sources)
                 manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
                 part_num += 1
@@ -806,7 +807,7 @@ def main():
     # Day not phan shards con lai neu co
     if staged_shards:
         if not args.dry_run:
-            ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, args.public)
+            ds_ref = publish_shards_to_kaggle(k_api, owner, args.dataset_prefix, part_num, staged_shards, not args.private)
             manifest["processed_files"].extend(staged_sources)
             manifest["parts"].append({"part": part_num, "dataset": ds_ref, "files": len(staged_sources), "shards": len(staged_shards), "raw_positions": staged_raw_pos, "unique_positions": staged_uniq_pos})
             part_num += 1
