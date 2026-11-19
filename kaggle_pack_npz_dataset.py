@@ -580,7 +580,8 @@ def main():
     parser.add_argument("--kaggle-owner", type=str, default="", help="Kaggle username (mac dinh lay tu env/secret)")
     parser.add_argument("--dataset-prefix", type=str, default="harenn-hkv3-npz", help="Ten goc Kaggle Dataset (tao dang <prefix>-p001, p002...)")
     parser.add_argument("--index-dataset", type=str, default="harenn-hkv3-npz-index", help="Slug dataset nho luu packed_manifest.json")
-    parser.add_argument("--files-per-shard", type=int, default=17, help="So file .jsonl gom thanh 1 shard .npz (mac dinh: 17)")
+    parser.add_argument("--files-per-shard", type=int, default=17, help="So file .jsonl toi da gom thanh 1 shard .npz (mac dinh: 17)")
+    parser.add_argument("--max-batch-gb", type=float, default=8.0, help="Gioi han dung luong raw JSONL tai moi luot (GB, mac dinh 8.0 de tranh tran o dia Kaggle)")
     parser.add_argument("--shards-per-dataset", type=int, default=4, help="So shard .npz gom du roi tu dong dang len 1 Kaggle Dataset (mac dinh: 4)")
     parser.add_argument("--max-files", type=int, default=0, help="Gioi han so file xu ly moi phien (0 = khong gioi han)")
     parser.add_argument("--time-budget", type=int, default=39600, help="Gioi han thoi gian chay (giay, mac dinh 11h cho Kaggle)")
@@ -638,22 +639,42 @@ def main():
     staged_uniq_pos = 0
     part_num = int(manifest.get("next_part", 1))
 
-    for i in range(0, len(pending), args.files_per_shard):
+    max_batch_bytes = int(max(1.0, args.max_batch_gb) * 1024 * 1024 * 1024)
+    p_idx = 0
+    batch_num = 0
+    while p_idx < len(pending):
         if args.time_budget > 0 and (time.time() - t_start) >= args.time_budget:
             print("[Time Budget] Sap het thoi gian phien -> dung tai file moi va day not phan da nen.", flush=True)
             break
 
-        chunk = pending[i : i + args.files_per_shard]
+        chunk = []
+        chunk_bytes = 0
+        while p_idx < len(pending) and len(chunk) < args.files_per_shard:
+            rel_p, sz = pending[p_idx]
+            if chunk and (chunk_bytes + sz) > max_batch_bytes:
+                break
+            chunk.append((rel_p, sz))
+            chunk_bytes += sz
+            p_idx += 1
+
+        batch_num += 1
+        # Don file cu con sot (neu co) truoc khi tai luot moi
+        for stale in raw_dir.glob("*"):
+            try:
+                stale.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         dl_pairs = []
         local_paths = []
-        chunk_mb = sum(sz for _, sz in chunk) / (1024 * 1024)
+        chunk_mb = chunk_bytes / (1024 * 1024)
         for rel_p, _ in chunk:
             lp = raw_dir / Path(rel_p).name
             dl_pairs.append((rel_p, str(lp)))
             local_paths.append(str(lp))
 
         t0 = time.time()
-        print(f"\n[Batch {i // args.files_per_shard + 1}] Dang tai {len(chunk)} file ({chunk_mb:.1f} MB)...", flush=True)
+        print(f"\n[Batch {batch_num}] Dang tai {len(chunk)} file ({chunk_mb:.1f} MB)...", flush=True)
         hf_api.download_bucket_files(args.hf_bucket, dl_pairs)
         print(f"[Batch] Tai xong trong {time.time() - t0:.1f}s. Dang chuyen doi sang NPZ nen...", flush=True)
 
