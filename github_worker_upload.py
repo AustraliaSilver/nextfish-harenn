@@ -55,12 +55,13 @@ def hf_commit_with_retry(api, **kwargs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge worker JSONL, upload to HF Bucket, pack NPZ, upload to HF Dataset")
+    parser = argparse.ArgumentParser(description="Merge worker JSONL, upload to HF Bucket, pack NPZ, upload to HF NPZ Bucket/Dataset")
     parser.add_argument("--worker-id", required=True, type=str)
     parser.add_argument("--run-id", required=True, type=str)
     parser.add_argument("--data-dir", default="data", type=str)
     parser.add_argument("--hf-bucket", default="australia1/myrandombucket", type=str)
-    parser.add_argument("--hf-dataset", default="australia1/harenn-hkv3-npz", type=str)
+    parser.add_argument("--hf-npz-bucket", default="australia1/harenn-hkv3-npz-bucket", type=str)
+    parser.add_argument("--hf-dataset", default="", type=str)
     parser.add_argument("--compresslevel", default=3, type=int)
     args = parser.parse_args()
 
@@ -177,25 +178,38 @@ def main():
         encoding="utf-8",
     )
 
-    api.create_repo(repo_id=args.hf_dataset, repo_type="dataset", exist_ok=True)
     t2 = time.time()
-    hf_commit_with_retry(
-        api,
-        repo_id=args.hf_dataset,
-        repo_type="dataset",
-        operations=[
-            CommitOperationAdd(
-                path_in_repo=f"shards/r{args.run_id}/{npz_filename}",
-                path_or_fileobj=str(npz_path),
-            ),
-            CommitOperationAdd(
-                path_in_repo=f"staging/r{args.run_id}/{meta_filename}",
-                path_or_fileobj=str(meta_path),
-            ),
-        ],
-        commit_message=f"Add NPZ shard + metadata w{wid_pad} for run {args.run_id}",
-    )
-    print(f"Uploaded NPZ + metadata to HF dataset '{args.hf_dataset}' in {time.time() - t2:.2f}s!", flush=True)
+    shard_repo_path = f"shards/r{args.run_id}/{npz_filename}"
+    meta_repo_path = f"staging/r{args.run_id}/{meta_filename}"
+    if args.hf_npz_bucket:
+        api.create_bucket(args.hf_npz_bucket, private=True, exist_ok=True)
+        api.batch_bucket_files(
+            args.hf_npz_bucket,
+            add=[
+                (str(npz_path), shard_repo_path),
+                (str(meta_path), meta_repo_path),
+            ],
+        )
+        print(f"Uploaded NPZ + metadata to private HF bucket '{args.hf_npz_bucket}' in {time.time() - t2:.2f}s!", flush=True)
+    else:
+        api.create_repo(repo_id=args.hf_dataset, repo_type="dataset", exist_ok=True)
+        hf_commit_with_retry(
+            api,
+            repo_id=args.hf_dataset,
+            repo_type="dataset",
+            operations=[
+                CommitOperationAdd(
+                    path_in_repo=shard_repo_path,
+                    path_or_fileobj=str(npz_path),
+                ),
+                CommitOperationAdd(
+                    path_in_repo=meta_repo_path,
+                    path_or_fileobj=str(meta_path),
+                ),
+            ],
+            commit_message=f"Add NPZ shard + metadata w{wid_pad} for run {args.run_id}",
+        )
+        print(f"Uploaded NPZ + metadata to HF dataset '{args.hf_dataset}' in {time.time() - t2:.2f}s!", flush=True)
 
 
 if __name__ == "__main__":
