@@ -686,15 +686,21 @@ class FastHKV3BatchLoader:
         self.shuffle = shuffle
         self.device = device
         self.pin_memory = (self.device.type == "cuda")
+        self._pin_bufs: Dict[str, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return (self.total_samples + self.batch_size - 1) // self.batch_size
 
-    def _to_gpu(self, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        t = torch.from_numpy(np.ascontiguousarray(arr))
+    def _to_gpu(self, key: str, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         if self.pin_memory:
-            t = t.pin_memory()
-        t_gpu = t.to(self.device, non_blocking=True)
+            buf = self._pin_bufs.get(key)
+            if buf is None or buf.shape != arr.shape:
+                buf = torch.empty(arr.shape, dtype=torch.from_numpy(arr[:0]).dtype, pin_memory=True)
+                self._pin_bufs[key] = buf
+            buf.numpy()[...] = arr
+            t_gpu = buf.to(self.device, non_blocking=True)
+        else:
+            t_gpu = torch.from_numpy(np.ascontiguousarray(arr)).to(self.device)
         if target_dtype is not None and t_gpu.dtype != target_dtype:
             t_gpu = t_gpu.to(target_dtype)
         return t_gpu
@@ -728,16 +734,16 @@ class FastHKV3BatchLoader:
                 wdl_np = self.wdl_data[actual_ids]
 
             # Truyền uint16 (2 bytes) qua PCIe bằng Pinned Memory DMA, sau đó mới .to(torch.int64) trên GPU VRAM:
-            us_t = self._to_gpu(us_np, target_dtype=torch.int64)
-            them_t = self._to_gpu(them_np, target_dtype=torch.int64)
+            us_t = self._to_gpu("us", us_np, target_dtype=torch.int64)
+            them_t = self._to_gpu("them", them_np, target_dtype=torch.int64)
 
             targets = {
-                "eval": self._to_gpu(ev_np),
-                "wdl": self._to_gpu(wdl_np),
-                "eval_mask": self._to_gpu(self.eval_mask_data[actual_ids]),
-                "tau": self._to_gpu(self.tau_data[actual_ids]),
-                "rho": self._to_gpu(self.rho_data[actual_ids]),
-                "rs": self._to_gpu(self.rs_data[actual_ids]),
+                "eval": self._to_gpu("eval", ev_np),
+                "wdl": self._to_gpu("wdl", wdl_np),
+                "eval_mask": self._to_gpu("eval_mask", self.eval_mask_data[actual_ids]),
+                "tau": self._to_gpu("tau", self.tau_data[actual_ids]),
+                "rho": self._to_gpu("rho", self.rho_data[actual_ids]),
+                "rs": self._to_gpu("rs", self.rs_data[actual_ids]),
             }
             yield us_t, them_t, targets
 
@@ -1202,6 +1208,237 @@ def fc2_screlu_ste(z: torch.Tensor, qat: bool) -> torch.Tensor:
     return z_act.square().to(z.dtype)
 
 
+_HKV3_CUDA_EXT = None
+_HKV3_CUDA_EXT_TRIED = False
+
+
+def _get_hkv3_cuda_ext():
+    """Biên dịch Fused CUDA Sparse L1 Kernel (nếu có nvcc) để tăng tốc 3-6x thay cụm EmbeddingBag."""
+    global _HKV3_CUDA_EXT, _HKV3_CUDA_EXT_TRIED
+    if _HKV3_CUDA_EXT_TRIED:
+        return _HKV3_CUDA_EXT
+    _HKV3_CUDA_EXT_TRIED = True
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME, load_inline
+        if not CUDA_HOME and shutil.which("nvcc") is None:
+            return None
+        cuda_src = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void hkv3_l1_fwd_kernel(
+    const int64_t* __restrict__ idx,
+    const int64_t* __restrict__ idx_full,
+    const int64_t* __restrict__ piece_map,
+    const int64_t* __restrict__ rel_map,
+    const float* __restrict__ W_full,
+    const float* __restrict__ W_piece,
+    const float* __restrict__ W_rel,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    uint8_t* __restrict__ clamp_mask,
+    int64_t B, int K, int H, int64_t pad_f, bool qat, float qa_scale
+) {
+    __shared__ int32_t s_f[64];
+    __shared__ int32_t s_p[64];
+    __shared__ int32_t s_r[64];
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid < K) {
+        int64_t f_orig = idx[(int64_t)b * K + tid];
+        int64_t f_full = idx_full[(int64_t)b * K + tid];
+        s_f[tid] = (f_full >= 0 && f_full < pad_f) ? (int32_t)f_full : -1;
+        if (f_orig >= 0 && f_orig < pad_f) {
+            s_p[tid] = (int32_t)piece_map[f_orig];
+            s_r[tid] = (int32_t)rel_map[f_orig];
+        } else {
+            s_p[tid] = -1;
+            s_r[tid] = -1;
+        }
+    }
+    __syncthreads();
+
+    int d = blockIdx.y * blockDim.x + tid;
+    if (d >= H) return;
+
+    float acc = bias[d];
+    #pragma unroll 4
+    for (int k = 0; k < K; ++k) {
+        int32_t f = s_f[k];
+        int32_t p = s_p[k];
+        int32_t r = s_r[k];
+        if (f >= 0) acc += W_full[(int64_t)f * H + d];
+        if (p >= 0) acc += W_piece[(int64_t)p * H + d];
+        if (r >= 0) acc += W_rel[(int64_t)r * H + d];
+    }
+    uint8_t m = (acc > 0.0f && acc < 1.0f) ? 1 : 0;
+    float c = acc < 0.0f ? 0.0f : (acc > 1.0f ? 1.0f : acc);
+    if (qat) {
+        c = rintf(c * qa_scale) / qa_scale;
+    }
+    out[(int64_t)b * H + d] = c;
+    clamp_mask[(int64_t)b * H + d] = m;
+}
+
+__global__ void hkv3_l1_bwd_kernel(
+    const float* __restrict__ grad_out,
+    const uint8_t* __restrict__ clamp_mask,
+    const int64_t* __restrict__ idx,
+    const int64_t* __restrict__ idx_full,
+    const int64_t* __restrict__ piece_map,
+    const int64_t* __restrict__ rel_map,
+    float* __restrict__ grad_W_full,
+    float* __restrict__ grad_W_piece,
+    float* __restrict__ grad_W_rel,
+    int64_t B, int K, int H, int64_t pad_f
+) {
+    __shared__ int32_t s_f[64];
+    __shared__ int32_t s_p[64];
+    __shared__ int32_t s_r[64];
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid < K) {
+        int64_t f_orig = idx[(int64_t)b * K + tid];
+        int64_t f_full = idx_full[(int64_t)b * K + tid];
+        s_f[tid] = (f_full >= 0 && f_full < pad_f) ? (int32_t)f_full : -1;
+        if (f_orig >= 0 && f_orig < pad_f) {
+            s_p[tid] = (int32_t)piece_map[f_orig];
+            s_r[tid] = (int32_t)rel_map[f_orig];
+        } else {
+            s_p[tid] = -1;
+            s_r[tid] = -1;
+        }
+    }
+    __syncthreads();
+
+    int d = blockIdx.y * blockDim.x + tid;
+    if (d >= H) return;
+    if (!clamp_mask[(int64_t)b * H + d]) return;
+    float g = grad_out[(int64_t)b * H + d];
+    if (g == 0.0f) return;
+
+    #pragma unroll 4
+    for (int k = 0; k < K; ++k) {
+        int32_t f = s_f[k];
+        int32_t p = s_p[k];
+        int32_t r = s_r[k];
+        if (f >= 0) atomicAdd(&grad_W_full[(int64_t)f * H + d], g);
+        if (p >= 0) atomicAdd(&grad_W_piece[(int64_t)p * H + d], g);
+        if (r >= 0) atomicAdd(&grad_W_rel[(int64_t)r * H + d], g);
+    }
+}
+
+std::vector<torch::Tensor> hkv3_l1_forward(
+    torch::Tensor idx, torch::Tensor idx_full,
+    torch::Tensor piece_map, torch::Tensor rel_map,
+    torch::Tensor W_full, torch::Tensor W_piece, torch::Tensor W_rel, torch::Tensor bias,
+    int64_t pad_f, bool qat, double qa_scale
+) {
+    c10::cuda::CUDAGuard guard(idx.device());
+    int64_t B = idx.size(0);
+    int K = (int)idx.size(1);
+    int H = (int)W_full.size(1);
+    auto out = torch::empty({B, H}, W_full.options());
+    auto mask = torch::empty({B, H}, torch::TensorOptions().dtype(torch::kUInt8).device(idx.device()));
+    if (B == 0) return {out, mask};
+    dim3 block(256);
+    dim3 grid((unsigned int)B, (unsigned int)((H + 255) / 256));
+    hkv3_l1_fwd_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        idx.data_ptr<int64_t>(), idx_full.data_ptr<int64_t>(),
+        piece_map.data_ptr<int64_t>(), rel_map.data_ptr<int64_t>(),
+        W_full.data_ptr<float>(), W_piece.data_ptr<float>(), W_rel.data_ptr<float>(), bias.data_ptr<float>(),
+        out.data_ptr<float>(), mask.data_ptr<uint8_t>(),
+        B, K, H, pad_f, qat, (float)qa_scale
+    );
+    return {out, mask};
+}
+
+void hkv3_l1_backward(
+    torch::Tensor grad_out, torch::Tensor clamp_mask,
+    torch::Tensor idx, torch::Tensor idx_full,
+    torch::Tensor piece_map, torch::Tensor rel_map,
+    torch::Tensor grad_W_full, torch::Tensor grad_W_piece, torch::Tensor grad_W_rel,
+    int64_t pad_f
+) {
+    c10::cuda::CUDAGuard guard(idx.device());
+    int64_t B = idx.size(0);
+    int K = (int)idx.size(1);
+    int H = (int)grad_W_full.size(1);
+    if (B == 0) return;
+    dim3 block(256);
+    dim3 grid((unsigned int)B, (unsigned int)((H + 255) / 256));
+    hkv3_l1_bwd_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        grad_out.data_ptr<float>(), clamp_mask.data_ptr<uint8_t>(),
+        idx.data_ptr<int64_t>(), idx_full.data_ptr<int64_t>(),
+        piece_map.data_ptr<int64_t>(), rel_map.data_ptr<int64_t>(),
+        grad_W_full.data_ptr<float>(), grad_W_piece.data_ptr<float>(), grad_W_rel.data_ptr<float>(),
+        B, K, H, pad_f
+    );
+}
+"""
+        cpp_src = """
+std::vector<torch::Tensor> hkv3_l1_forward(
+    torch::Tensor idx, torch::Tensor idx_full,
+    torch::Tensor piece_map, torch::Tensor rel_map,
+    torch::Tensor W_full, torch::Tensor W_piece, torch::Tensor W_rel, torch::Tensor bias,
+    int64_t pad_f, bool qat, double qa_scale
+);
+void hkv3_l1_backward(
+    torch::Tensor grad_out, torch::Tensor clamp_mask,
+    torch::Tensor idx, torch::Tensor idx_full,
+    torch::Tensor piece_map, torch::Tensor rel_map,
+    torch::Tensor grad_W_full, torch::Tensor grad_W_piece, torch::Tensor grad_W_rel,
+    int64_t pad_f
+);
+"""
+        ext = load_inline(
+            name="hkv3_fused_l1_ext",
+            cpp_sources=cpp_src,
+            cuda_sources=cuda_src,
+            functions=["hkv3_l1_forward", "hkv3_l1_backward"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+        _HKV3_CUDA_EXT = ext
+        print("[CUDA Kernel] Đã biên dịch thành công Fused Sparse L1 Kernel (hkv3_fused_l1_ext)!", flush=True)
+        return ext
+    except Exception as e:
+        print(f"[CUDA Kernel] Dùng PyTorch EmbeddingBag fallback ({e})", flush=True)
+        return None
+
+
+class _FusedHKV3L1Op(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, ext, idx, idx_full, piece_map, rel_map, W_full, W_piece, W_rel, bias, qat):
+        out, clamp_mask = ext.hkv3_l1_forward(
+            idx.contiguous(), idx_full.contiguous(), piece_map, rel_map,
+            W_full, W_piece, W_rel, bias, PADDING_FEATURE_IDX, bool(qat), float(QA_SCALE)
+        )
+        ctx.ext = ext
+        ctx.save_for_backward(clamp_mask, idx, idx_full, piece_map, rel_map, W_full, W_piece, W_rel)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        clamp_mask, idx, idx_full, piece_map, rel_map, W_full, W_piece, W_rel = ctx.saved_tensors
+        g_out = grad_out.contiguous().float()
+        g_W_full = torch.zeros_like(W_full)
+        g_W_piece = torch.zeros_like(W_piece)
+        g_W_rel = torch.zeros_like(W_rel)
+        ctx.ext.hkv3_l1_backward(
+            g_out, clamp_mask, idx.contiguous(), idx_full.contiguous(),
+            piece_map, rel_map, g_W_full, g_W_piece, g_W_rel, PADDING_FEATURE_IDX
+        )
+        g_bias = (g_out * clamp_mask.to(torch.float32)).sum(dim=0)
+        return None, None, None, None, None, g_W_full, g_W_piece, g_W_rel, g_bias, None
+
+
 class HalfKPv3BranchL1(nn.Module):
     """
     Một nửa nhánh tích lũy Tầng 1 (1024 chiều: Left hoặc Right của Pairwise Bilinear Gating).
@@ -1249,11 +1486,6 @@ class HalfKPv3BranchL1(nn.Module):
         self.emb_rel.weight[PADDING_REL_IDX].zero_()
 
     def forward(self, us_idx: torch.Tensor, them_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        us_p = self.piece_map_pad[us_idx]
-        us_r = self.rel_map_pad[us_idx]
-        them_p = self.piece_map_pad[them_idx]
-        them_r = self.rel_map_pad[them_idx]
-
         # Chỉ dropout trên bảng dư emb_full để ép mạng học quy luật tổng quát qua emb_piece & emb_rel
         # mà không làm mất quân cờ hay làm lệch vật chất giữa us và them!
         if self.training and self.full_dropout > 0.0:
@@ -1265,6 +1497,22 @@ class HalfKPv3BranchL1(nn.Module):
         else:
             us_idx_full = us_idx
             them_idx_full = them_idx
+
+        ext = _get_hkv3_cuda_ext() if (us_idx.is_cuda and us_idx.shape[1] <= 64 and self.emb_full.weight.dtype == torch.float32) else None
+        if ext is not None:
+            both_idx = torch.cat([us_idx, them_idx], dim=0)
+            both_full = torch.cat([us_idx_full, them_idx_full], dim=0) if (us_idx_full is not us_idx or them_idx_full is not them_idx) else both_idx
+            both_c = _FusedHKV3L1Op.apply(
+                ext, both_idx, both_full, self.piece_map_pad, self.rel_map_pad,
+                self.emb_full.weight, self.emb_piece.weight, self.emb_rel.weight, self.bias, self.qat
+            )
+            b = us_idx.shape[0]
+            return both_c[:b], both_c[b:]
+
+        us_p = self.piece_map_pad[us_idx]
+        us_r = self.rel_map_pad[us_idx]
+        them_p = self.piece_map_pad[them_idx]
+        them_r = self.rel_map_pad[them_idx]
 
         acc_us = self.emb_full(us_idx_full) + self.emb_piece(us_p) + self.emb_rel(us_r) + self.bias
         acc_them = self.emb_full(them_idx_full) + self.emb_piece(them_p) + self.emb_rel(them_r) + self.bias
@@ -2124,7 +2372,7 @@ def main():
     # Phân nhóm tham số tối ưu:
     # - emb_full / psqt_full dùng weight_decay=0.0 trong AdamW để tránh bào mòn các ô Vua hiếm vắng mặt trong batch;
     #   thay bằng active_emb_full_l2() chỉ chuẩn hóa các đặc trưng thực sự xuất hiện trong batch.
-    optimizer = optim.AdamW([
+    opt_groups = [
         {"params": list(base_model.left_branch.emb_full.parameters()) + list(base_model.right_branch.emb_full.parameters()), "lr": args.lr * 0.8, "weight_decay": 0.0},
         {"params": list(base_model.left_branch.emb_piece.parameters()) + list(base_model.right_branch.emb_piece.parameters()), "lr": args.lr, "weight_decay": 1e-5},
         {"params": list(base_model.left_branch.emb_rel.parameters()) + list(base_model.right_branch.emb_rel.parameters()), "lr": args.lr, "weight_decay": 1e-5},
@@ -2136,7 +2384,11 @@ def main():
         {"params": base_model.fc2_opp.parameters(), "lr": args.lr, "weight_decay": 1e-5},
         {"params": base_model.eval_head.parameters(), "lr": args.lr * 1.2, "weight_decay": 1e-6},
         {"params": base_model.tac_head.parameters(), "lr": args.lr * 1.2, "weight_decay": 1e-6},
-    ])
+    ]
+    try:
+        optimizer = optim.AdamW(opt_groups, fused=(dev0.type == "cuda"))
+    except Exception:
+        optimizer = optim.AdamW(opt_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=2e-5)
 
     start_epoch = 1
@@ -2303,7 +2555,8 @@ def main():
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         outputs_b = model(us_b, them_b)
                         loss, m = criterion(outputs_b, targets_b)
-                        loss = loss + 1e-4 * active_emb_full_l2(us_b, them_b)
+                        if (steps & 7) == 0:
+                            loss = loss + 8e-4 * active_emb_full_l2(us_b, them_b)
 
                     if not math.isfinite(m["total"]):
                         nan_cnt += 1
