@@ -51,10 +51,13 @@ import math
 import os
 import random
 import re
+import shutil
 import struct
 import sys
 import time
+import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -737,6 +740,265 @@ class FastHKV3BatchLoader:
                 "rs": self._to_gpu(self.rs_data[actual_ids]),
             }
             yield us_t, them_t, targets
+
+
+def _peek_npz_rows(npz_path: Path) -> int:
+    """Đọc nhanh số hàng N từ header .npy trong .npz mà không giải nén toàn bộ mảng."""
+    with zipfile.ZipFile(str(npz_path), "r") as zf:
+        target = "labels_eval.npy" if "labels_eval.npy" in zf.namelist() else zf.namelist()[0]
+        with zf.open(target, "r") as fp:
+            ver = np.lib.format.read_magic(fp)
+            if ver == (1, 0):
+                shape, _, _ = np.lib.format.read_array_header_1_0(fp)
+            elif ver == (2, 0):
+                shape, _, _ = np.lib.format.read_array_header_2_0(fp)
+            else:
+                shape, _, _ = np.lib.format._read_array_header(fp, ver)
+            return int(shape[0])
+
+
+def _load_single_npz_arrays(cpath: Path, max_rows: int = 0) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    """Đọc 1 file .npz HKV3 chuẩn, tự chuẩn hóa 64-king nếu gặp file đời cũ."""
+    with np.load(str(cpath), allow_pickle=False) as data:
+        n = len(data["labels_eval"])
+        sl = slice(0, min(n, max_rows)) if max_rows > 0 else slice(None)
+        us_indices = np.asarray(data["us_indices"][sl], dtype=np.uint16)
+        them_indices = np.asarray(data["them_indices"][sl], dtype=np.uint16)
+        labels_eval = np.asarray(data["labels_eval"][sl], dtype=np.float32)
+        if "labels_wdl" in data:
+            labels_wdl = np.asarray(data["labels_wdl"][sl], dtype=np.float32)
+        else:
+            labels_wdl = (1.0 / (1.0 + np.exp(-np.clip(labels_eval / WDL_SCALE_PAWNS, -20.0, 20.0)))).astype(np.float32)
+        if "labels_eval_mask" in data:
+            labels_eval_mask = np.asarray(data["labels_eval_mask"][sl])
+        else:
+            labels_eval_mask = np.ones(len(labels_eval), dtype=np.uint8)
+        labels_tau = np.asarray(data["labels_tau"][sl], dtype=np.float32)
+        labels_rho = np.asarray(data["labels_rho"][sl], dtype=np.float32)
+        labels_rs = np.asarray(data["labels_rs"][sl], dtype=np.float32)
+
+    if len(labels_eval) > 0:
+        max_feat = max(int(us_indices.max()), int(them_indices.max()))
+        if max_feat > HKV3_NUM_FEATURES:
+            lut = np.full(65536, PADDING_FEATURE_IDX, dtype=np.uint16)
+            for f in range(64 * HKV3_PLANES_PER_BUCKET):
+                ksq = f // HKV3_PLANES_PER_BUCKET
+                rem = f % HKV3_PLANES_PER_BUCKET
+                ch = rem // 64
+                sq = rem % 64
+                mirror = 7 if (ksq & 7) >= 4 else 0
+                knorm = ksq ^ mirror
+                kb = ((knorm >> 3) * 4 + (knorm & 3)) * HKV3_PLANES_PER_BUCKET
+                lut[f] = kb + ch * 64 + (sq ^ mirror)
+            us_indices = lut[us_indices]
+            them_indices = lut[them_indices]
+
+    return us_indices, them_indices, labels_eval, labels_wdl, labels_eval_mask, labels_tau, labels_rho, labels_rs
+
+
+def _load_npz_chunk_prealloc(paths: List[Path]):
+    """Nạp danh sách nhiều file .npz bằng cấp phát sẵn 1 lần, tránh tăng gấp đôi RAM như np.concatenate."""
+    counts = [_peek_npz_rows(p) for p in paths]
+    total = sum(counts)
+    us_out = np.empty((total, MAX_ACTIVE_FEATURES), dtype=np.uint16)
+    them_out = np.empty((total, MAX_ACTIVE_FEATURES), dtype=np.uint16)
+    ev_out = np.empty(total, dtype=np.float32)
+    wdl_out = np.empty(total, dtype=np.float32)
+    msk_out = np.empty(total, dtype=np.uint8)
+    tau_out = np.empty(total, dtype=np.float32)
+    rho_out = np.empty(total, dtype=np.float32)
+    rs_out = np.empty(total, dtype=np.float32)
+
+    off = 0
+    for p, cnt in zip(paths, counts):
+        if cnt == 0:
+            continue
+        u, t, ev, wdl, msk, tau, rho, rs = _load_single_npz_arrays(p)
+        end = off + len(ev)
+        us_out[off:end] = u
+        them_out[off:end] = t
+        ev_out[off:end] = ev
+        wdl_out[off:end] = wdl
+        msk_out[off:end] = msk
+        tau_out[off:end] = tau
+        rho_out[off:end] = rho
+        rs_out[off:end] = rs
+        off = end
+        del u, t, ev, wdl, msk, tau, rho, rs
+
+    if off < total:
+        us_out = us_out[:off]
+        them_out = them_out[:off]
+        ev_out = ev_out[:off]
+        wdl_out = wdl_out[:off]
+        msk_out = msk_out[:off]
+        tau_out = tau_out[:off]
+        rho_out = rho_out[:off]
+        rs_out = rs_out[:off]
+    return us_out, them_out, ev_out, wdl_out, msk_out, tau_out, rho_out, rs_out
+
+
+class MultiNPZStreamer:
+    """
+    Quản lý nạp luân phiên (streaming) cho hàng chục/trăm file .npz (~3+ tỷ thế cờ) vừa khít RAM 30 GB:
+      - Chế độ Local Directory (--cache-dir hoặc --data chứa .npz): quét đệ quy *.npz, giữ file cuối làm Val cố định,
+        gom các file còn lại thành từng super-chunk <= chunk_max_pos (~80M thế cờ ≈ 12 GB RAM).
+      - Chế độ Kaggle Manifest (--kaggle-index): tự đọc packed_manifest.json, giữ part cuối làm Val,
+        tải ngầm (prefetch) từng part Public về train rồi xóa ngay khỏi ổ tạm.
+    """
+
+    def __init__(
+        self,
+        local_npz_files: Optional[List[Path]] = None,
+        kaggle_index_ref: str = "",
+        batch_size: int = 16384,
+        symmetry: int = 1,
+        chunk_max_pos: int = 80_000_000,
+        start_part: int = 0,
+        end_part: int = 0,
+        device: torch.device = torch.device("cuda"),
+        stream_tmp_dir: Optional[Path] = None,
+    ):
+        self.batch_size = batch_size
+        self.symmetry = symmetry
+        self.chunk_max_pos = max(1_000_000, int(chunk_max_pos))
+        self.device = device
+        self.kaggle_index_ref = kaggle_index_ref
+        self.stream_tmp_dir = stream_tmp_dir or Path("/tmp/hkv3_stream_npz")
+        self.k_api = None
+        self.part_entries: List[Dict] = []
+        self.local_chunks: List[List[Path]] = []
+
+        if kaggle_index_ref:
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            self.k_api = KaggleApi()
+            self.k_api.authenticate()
+            idx_dir = self.stream_tmp_dir / "_index"
+            shutil.rmtree(idx_dir, ignore_errors=True)
+            idx_dir.mkdir(parents=True, exist_ok=True)
+            self.k_api.dataset_download_files(kaggle_index_ref, path=str(idx_dir), unzip=True, quiet=True)
+            manifest = json.loads((idx_dir / "packed_manifest.json").read_text(encoding="utf-8"))
+            all_parts = manifest.get("parts", [])
+            if start_part > 0:
+                all_parts = [p for p in all_parts if int(p["part"]) >= start_part]
+            if end_part > 0:
+                all_parts = [p for p in all_parts if int(p["part"]) <= end_part]
+            if len(all_parts) < 2:
+                raise RuntimeError(f"Manifest chỉ có {len(all_parts)} part, cần >= 2 part (hoặc giảm --start-part).")
+
+            val_part = all_parts[-1]
+            self.part_entries = all_parts[:-1]
+            val_dir = self.stream_tmp_dir / f"val_p{int(val_part['part']):03d}"
+            shutil.rmtree(val_dir, ignore_errors=True)
+            val_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Stream Val] Đang tải part cố định cho Validation: {val_part['dataset']}...", flush=True)
+            self.k_api.dataset_download_files(val_part["dataset"], path=str(val_dir), unzip=True, quiet=True)
+            val_files = sorted(val_dir.glob("*.npz"))
+            if not val_files:
+                raise RuntimeError(f"Không thấy .npz nào trong {val_part['dataset']}")
+            self.val_arrays = _load_single_npz_arrays(val_files[-1], max_rows=100_000)
+            shutil.rmtree(val_dir, ignore_errors=True)
+            print(
+                f"[Multi-NPZ Kaggle] {len(self.part_entries)} train parts | Val cố định: {len(self.val_arrays[2]):,} thế cờ từ {val_part['dataset']}",
+                flush=True,
+            )
+        else:
+            files = sorted(local_npz_files or [])
+            if len(files) < 2:
+                raise RuntimeError("Cần >= 2 file .npz cho MultiNPZStreamer.")
+            val_file = files[-1]
+            train_files = files[:-1]
+            self.val_arrays = _load_single_npz_arrays(val_file, max_rows=100_000)
+
+            cur_grp: List[Path] = []
+            cur_pos = 0
+            for f in train_files:
+                n = _peek_npz_rows(f)
+                if cur_grp and (cur_pos + n > self.chunk_max_pos):
+                    self.local_chunks.append(cur_grp)
+                    cur_grp = []
+                    cur_pos = 0
+                cur_grp.append(f)
+                cur_pos += n
+            if cur_grp:
+                self.local_chunks.append(cur_grp)
+            total_train = sum(_peek_npz_rows(f) for f in train_files)
+            print(
+                f"[Multi-NPZ Local] {len(train_files)} file ({total_train:,} pos) -> {len(self.local_chunks)} super-chunks | "
+                f"Val cố định: {len(self.val_arrays[2]):,} pos từ {val_file.name}",
+                flush=True,
+            )
+
+    def get_val_loader(self) -> Tuple[FastHKV3BatchLoader, np.ndarray, np.ndarray]:
+        u, t, ev, wdl, msk, tau, rho, rs = self.val_arrays
+        idx = np.arange(len(ev), dtype=np.int64)
+        loader = FastHKV3BatchLoader(u, t, ev, wdl, msk, tau, rho, rs, idx, batch_size=self.batch_size, shuffle=False, symmetry=1, device=self.device)
+        return loader, u, t
+
+    def num_chunks(self) -> int:
+        return len(self.part_entries) if self.kaggle_index_ref else len(self.local_chunks)
+
+    def _download_kaggle_part(self, part_entry: Dict) -> Path:
+        pnum = int(part_entry["part"])
+        pdir = self.stream_tmp_dir / f"train_p{pnum:03d}"
+        shutil.rmtree(pdir, ignore_errors=True)
+        pdir.mkdir(parents=True, exist_ok=True)
+        self.k_api.dataset_download_files(part_entry["dataset"], path=str(pdir), unzip=True, quiet=True)
+        return pdir
+
+    def iter_chunks(self, epoch_seed: int, start_chunk: int = 0):
+        rng = random.Random(epoch_seed)
+        if self.kaggle_index_ref:
+            order = list(self.part_entries)
+            rng.shuffle(order)
+            n_chunks = len(order)
+            if start_chunk >= n_chunks:
+                return
+            with ThreadPoolExecutor(max_workers=1) as dl_pool:
+                cur_fut = dl_pool.submit(self._download_kaggle_part, order[start_chunk])
+                for c_idx in range(start_chunk, n_chunks):
+                    pdir = cur_fut.result()
+                    next_fut = dl_pool.submit(self._download_kaggle_part, order[c_idx + 1]) if (c_idx + 1) < n_chunks else None
+                    npz_list = sorted(pdir.glob("*.npz"))
+                    if not npz_list:
+                        shutil.rmtree(pdir, ignore_errors=True)
+                        cur_fut = next_fut
+                        continue
+                    t_ld = time.time()
+                    arrs = _load_npz_chunk_prealloc(npz_list)
+                    shutil.rmtree(pdir, ignore_errors=True)
+                    u, t, ev, wdl, msk, tau, rho, rs = arrs
+                    del arrs
+                    print(
+                        f"  [Stream Part {order[c_idx]['part']:03d} | Chunk {c_idx + 1}/{n_chunks}] "
+                        f"Nạp {len(ev):,} pos trong {time.time() - t_ld:.1f}s",
+                        flush=True,
+                    )
+                    idx = np.arange(len(ev), dtype=np.int64)
+                    loader = FastHKV3BatchLoader(u, t, ev, wdl, msk, tau, rho, rs, idx, batch_size=self.batch_size, shuffle=True, symmetry=self.symmetry, device=self.device)
+                    yield c_idx, n_chunks, loader
+                    del loader, idx, u, t, ev, wdl, msk, tau, rho, rs
+                    gc.collect()
+                    cur_fut = next_fut
+        else:
+            order = list(self.local_chunks)
+            rng.shuffle(order)
+            n_chunks = len(order)
+            for c_idx in range(start_chunk, n_chunks):
+                t_ld = time.time()
+                u, t, ev, wdl, msk, tau, rho, rs = _load_npz_chunk_prealloc(order[c_idx])
+                print(
+                    f"  [Local Chunk {c_idx + 1}/{n_chunks}] "
+                    f"Nạp {len(ev):,} pos ({len(order[c_idx])} shards) trong {time.time() - t_ld:.1f}s",
+                    flush=True,
+                )
+                idx = np.arange(len(ev), dtype=np.int64)
+                loader = FastHKV3BatchLoader(u, t, ev, wdl, msk, tau, rho, rs, idx, batch_size=self.batch_size, shuffle=True, symmetry=self.symmetry, device=self.device)
+                yield c_idx, n_chunks, loader
+                del loader, idx, u, t, ev, wdl, msk, tau, rho, rs
+                gc.collect()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1515,8 +1777,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="HalfKPv3 (HKV3) + HARENN Training Pipeline (Kaggle T4x2 Ready)"
     )
-    parser.add_argument("--data", type=str, default="Neuron Network/data", help="Thư mục chứa các file .jsonl/.json")
-    parser.add_argument("--cache", type=str, default="", help="Đường dẫn file cache .npz (tùy chọn)")
+    parser.add_argument("--data", type=str, default="Neuron Network/data", help="Thư mục chứa các file .jsonl/.json hoặc .npz")
+    parser.add_argument("--cache", type=str, default="", help="Đường dẫn file cache .npz đơn lẻ (tùy chọn)")
+    parser.add_argument("--cache-dir", type=str, default="", help="Thư mục chứa nhiều file .npz để train streaming (tìm đệ quy, vd: /kaggle/input)")
+    parser.add_argument("--kaggle-index", type=str, default="", help="Kaggle Index Dataset (vd: hunganh12333/harenn-hkv3-npz-index) để tự tải luân phiên từng part Public")
+    parser.add_argument("--chunk-max-pos", type=int, default=80_000_000, help="Số thế cờ tối đa nạp RAM mỗi super-chunk trong chế độ --cache-dir (mặc định: 80M ≈ 12 GB RAM)")
+    parser.add_argument("--start-part", type=int, default=0, help="Lọc bắt đầu từ part >= N khi dùng --kaggle-index (0 = tất cả)")
+    parser.add_argument("--end-part", type=int, default=0, help="Lọc kết thúc ở part <= N khi dùng --kaggle-index (0 = tất cả)")
+    parser.add_argument("--time-budget", type=int, default=0, help="Giới hạn thời gian train (giây, 0 = không giới hạn; trên Kaggle nên đặt 39600)")
     parser.add_argument("--sync-hf", action="store_true", help="Tự động tải toàn bộ .jsonl từ Hugging Face Bucket trước khi train")
     parser.add_argument("--hf-bucket", type=str, default="australia1/myrandombucket", help="ID của Hugging Face Bucket")
     parser.add_argument("--epochs", type=int, default=16, help="Số epoch huấn luyện đa nhiệm Giai đoạn 1")
@@ -1566,43 +1834,95 @@ def main():
     print(f"  File xuất nhị phân:      {args.output}")
     print("=" * 76, flush=True)
 
+    t_train_start = time.time()
+
     # 1. Đồng bộ dữ liệu từ Hugging Face Bucket nếu có cờ --sync-hf
     if args.sync_hf:
         sync_from_huggingface(args.hf_bucket, args.data)
 
-    # 2. Nạp hoặc xây dựng cache nhị phân HKV3
-    us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data, is_val_mask = load_or_build_hkv3_cache(
-        args.data, cache_path=args.cache if args.cache else None, use_cache=True, val_split=args.val_split
-    )
+    # 2. Khởi tạo bộ nạp dữ liệu: Streaming Multi-NPZ hoặc Single-NPZ truyền thống
+    device_tmp = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    streamer: Optional[MultiNPZStreamer] = None
+    single_train_loader: Optional[FastHKV3BatchLoader] = None
 
-    n_total = len(eval_data)
-    if is_val_mask is not None and np.any(is_val_mask == 1) and np.any(is_val_mask == 0):
-        val_indices_all = np.flatnonzero(is_val_mask == 1)
-        train_indices = np.flatnonzero(is_val_mask == 0)
-        if len(val_indices_all) > 100000:
-            rng_val = np.random.default_rng(42)
-            val_indices = rng_val.choice(val_indices_all, size=100000, replace=False)
-        else:
-            val_indices = val_indices_all
-        print("[Split] Sử dụng game/file-isolated Val split (0% leakage cùng ván).", flush=True)
+    local_npz_files: List[Path] = []
+    if args.cache_dir:
+        cdir = Path(args.cache_dir)
+        if not cdir.exists():
+            raise FileNotFoundError(f"Không tìm thấy thư mục --cache-dir: {cdir}")
+        local_npz_files = sorted(
+            p for p in cdir.rglob("*.npz") if not p.name.startswith("_hkv3_sparse_cache")
+        )
+    elif not args.cache and not args.kaggle_index and Path(args.data).is_dir():
+        found_npz = sorted(
+            p for p in Path(args.data).rglob("*.npz") if not p.name.startswith("_hkv3_sparse_cache")
+        )
+        if len(found_npz) >= 2:
+            local_npz_files = found_npz
+
+    if args.kaggle_index:
+        streamer = MultiNPZStreamer(
+            kaggle_index_ref=args.kaggle_index,
+            batch_size=args.batch_size,
+            symmetry=args.symmetry,
+            chunk_max_pos=args.chunk_max_pos,
+            start_part=args.start_part,
+            end_part=args.end_part,
+            device=device_tmp,
+        )
+        val_loader, val_us_sample, val_them_sample = streamer.get_val_loader()
+    elif len(local_npz_files) >= 2:
+        streamer = MultiNPZStreamer(
+            local_npz_files=local_npz_files,
+            batch_size=args.batch_size,
+            symmetry=args.symmetry,
+            chunk_max_pos=args.chunk_max_pos,
+            device=device_tmp,
+        )
+        val_loader, val_us_sample, val_them_sample = streamer.get_val_loader()
     else:
-        val_count = min(100000, max(1000, int(n_total * args.val_split)))
-        val_indices = np.arange(n_total - val_count, n_total, dtype=np.int64)
-        train_indices = np.arange(0, n_total - val_count, dtype=np.int64)
+        cache_arg = args.cache if args.cache else (str(local_npz_files[0]) if len(local_npz_files) == 1 else None)
+        us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data, is_val_mask = load_or_build_hkv3_cache(
+            args.data, cache_path=cache_arg, use_cache=True, val_split=args.val_split
+        )
 
-    print(f"[Split] Train: {len(train_indices):,} base ({len(train_indices) * args.symmetry:,} effective) | "
-          f"Val: {len(val_indices):,} positions.", flush=True)
+        n_total = len(eval_data)
+        if is_val_mask is not None and np.any(is_val_mask == 1) and np.any(is_val_mask == 0):
+            val_indices_all = np.flatnonzero(is_val_mask == 1)
+            train_indices = np.flatnonzero(is_val_mask == 0)
+            if len(val_indices_all) > 100000:
+                rng_val = np.random.default_rng(42)
+                val_indices = rng_val.choice(val_indices_all, size=100000, replace=False)
+            else:
+                val_indices = val_indices_all
+            print("[Split] Sử dụng game/file-isolated Val split (0% leakage cùng ván).", flush=True)
+        else:
+            val_count = min(100000, max(1000, int(n_total * args.val_split)))
+            val_indices = np.arange(n_total - val_count, n_total, dtype=np.int64)
+            train_indices = np.arange(0, n_total - val_count, dtype=np.int64)
 
-    train_loader = FastHKV3BatchLoader(
-        us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
-        train_indices, batch_size=args.batch_size, shuffle=True,
-        symmetry=args.symmetry, device=device
-    )
-    val_loader = FastHKV3BatchLoader(
-        us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
-        val_indices, batch_size=args.batch_size, shuffle=False,
-        symmetry=1, device=device
-    )
+        print(f"[Split] Train: {len(train_indices):,} base ({len(train_indices) * args.symmetry:,} effective) | "
+              f"Val: {len(val_indices):,} positions.", flush=True)
+
+        single_train_loader = FastHKV3BatchLoader(
+            us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
+            train_indices, batch_size=args.batch_size, shuffle=True,
+            symmetry=args.symmetry, device=device
+        )
+        val_loader = FastHKV3BatchLoader(
+            us_data, them_data, eval_data, wdl_data, eval_mask_data, tau_data, rho_data, rs_data,
+            val_indices, batch_size=args.batch_size, shuffle=False,
+            symmetry=1, device=device
+        )
+        sample_n = min(64, len(val_indices))
+        val_us_sample = us_data[val_indices[:sample_n]].copy()
+        val_them_sample = them_data[val_indices[:sample_n]].copy()
+
+    def iter_train_loaders(epoch_seed: int, start_chunk: int = 0):
+        if streamer is not None:
+            yield from streamer.iter_chunks(epoch_seed=epoch_seed, start_chunk=start_chunk)
+        else:
+            yield 0, 1, single_train_loader
 
     # 3. Khởi tạo mạng HalfKPv3 với Tensor-Parallel tự nhiên trên 2 GPU (ví dụ Kaggle T4x2)
     dev0 = torch.device("cuda:0") if num_gpus >= 1 else torch.device("cpu")
@@ -1651,6 +1971,7 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=2e-5)
 
     start_epoch = 1
+    resume_chunk_idx = 0
     best_val_loss = float("inf")
     best_val_mae = float("inf")
     best_pt_path = Path(args.output).with_suffix(".best.pt")
@@ -1658,9 +1979,14 @@ def main():
     # 4. Nạp checkpoint / mô hình cũ nếu có tham số --resume
     if args.resume:
         ckpt_dict, loaded_epoch = load_hkv3_weights_or_checkpoint(base_model, args.resume, dev0, dev1)
+        in_prog_ep = ckpt_dict.get("in_progress_epoch")
         if args.resume_epoch is not None:
             start_epoch = args.resume_epoch
             print(f"[Resume] Ghi đè epoch bắt đầu: {start_epoch}", flush=True)
+        elif in_prog_ep is not None and int(in_prog_ep) > 0:
+            start_epoch = int(in_prog_ep)
+            resume_chunk_idx = int(ckpt_dict.get("next_chunk_idx", 0))
+            print(f"[Resume] Tiếp tục giữa Epoch {start_epoch} tại Chunk {resume_chunk_idx + 1}!", flush=True)
         elif loaded_epoch > 0:
             start_epoch = loaded_epoch + 1
             print(f"[Resume] Tự động tiếp tục từ epoch: {start_epoch}", flush=True)
@@ -1743,22 +2069,23 @@ def main():
             t0 = time.time()
             tac_loss_sum = 0.0
             steps = 0
-            for us_b, them_b, targets_b in train_loader:
-                tac_opt.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs_b = model(us_b, them_b)
-                    loss_tau = F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
-                    loss_rho = F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
-                    loss_rs = F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
-                    loss = loss_tau + loss_rho + loss_rs
+            for _, _, train_loader in iter_train_loaders(epoch_seed=1000 + ep):
+                for us_b, them_b, targets_b in train_loader:
+                    tac_opt.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        outputs_b = model(us_b, them_b)
+                        loss_tau = F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
+                        loss_rho = F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
+                        loss_rs = F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
+                        loss = loss_tau + loss_rho + loss_rs
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(tac_opt)
-                torch.nn.utils.clip_grad_norm_(base_model.tac_head.parameters(), max_norm=1.0)
-                scaler.step(tac_opt)
-                scaler.update()
-                tac_loss_sum += loss.item()
-                steps += 1
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(tac_opt)
+                    torch.nn.utils.clip_grad_norm_(base_model.tac_head.parameters(), max_norm=1.0)
+                    scaler.step(tac_opt)
+                    scaler.update()
+                    tac_loss_sum += loss.item()
+                    steps += 1
 
             tac_sched.step()
             dt = time.time() - t0
@@ -1789,29 +2116,70 @@ def main():
         )
     else:
         print(f"\n[Stage 1] Bắt đầu huấn luyện Đa nhiệm HalfKPv3 (Epoch {start_epoch:02d} -> {args.epochs:02d})...", flush=True)
+        time_budget_hit = False
+        latest_path = Path(args.output).with_suffix(".latest.pt")
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             t0 = time.time()
             train_totals = {"total": 0.0, "eval": 0.0, "tau": 0.0, "rho": 0.0, "rs": 0.0, "mae_cp": 0.0}
             steps = 0
+            c_start = resume_chunk_idx if epoch == start_epoch else 0
+            resume_chunk_idx = 0
+            epoch_finished = True
 
-            for us_b, them_b, targets_b in train_loader:
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs_b = model(us_b, them_b)
-                    loss, m = criterion(outputs_b, targets_b)
-                    loss = loss + 1e-4 * active_emb_full_l2(us_b, them_b)
+            for c_idx, n_chunks, train_loader in iter_train_loaders(epoch_seed=42 + epoch, start_chunk=c_start):
+                for us_b, them_b, targets_b in train_loader:
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        outputs_b = model(us_b, them_b)
+                        loss, m = criterion(outputs_b, targets_b)
+                        loss = loss + 1e-4 * active_emb_full_l2(us_b, them_b)
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                base_model.clamp_quantizable_weights()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    base_model.clamp_quantizable_weights()
 
-                for k in train_totals:
-                    train_totals[k] += m[k]
-                steps += 1
+                    for k in train_totals:
+                        train_totals[k] += m[k]
+                    steps += 1
+
+                if streamer is not None and (c_idx + 1) < n_chunks:
+                    val_mid = evaluate_validation()
+                    is_mid_best = val_mid["total"] < best_val_loss
+                    if is_mid_best:
+                        best_val_loss = val_mid["total"]
+                        best_val_mae = val_mid["mae_cp"]
+                    mid_ckpt = {
+                        "epoch": epoch - 1,
+                        "in_progress_epoch": epoch,
+                        "next_chunk_idx": c_idx + 1,
+                        "model_state_dict": base_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "best_val_loss": best_val_loss,
+                        "best_val_mae": best_val_mae,
+                    }
+                    torch.save(mid_ckpt, latest_path)
+                    if is_mid_best:
+                        torch.save(mid_ckpt, best_pt_path)
+                        export_hkv3_binary(base_model, args.output)
+                    print(
+                        f"  [Ckpt Ep {epoch:02d} Chunk {c_idx + 1}/{n_chunks}] "
+                        f"Val Loss: {val_mid['total']:.4f} | MAE: {val_mid['mae_cp']:.1f}cp",
+                        flush=True,
+                    )
+                    if args.time_budget > 0 and (time.time() - t_train_start) >= args.time_budget:
+                        print(f"[Time Budget] Đạt giới hạn {args.time_budget}s sau Chunk {c_idx + 1}/{n_chunks}. Lưu checkpoint để resume phiên sau!", flush=True)
+                        epoch_finished = False
+                        time_budget_hit = True
+                        break
+
+            if not epoch_finished:
+                break
 
             scheduler.step()
             dt = time.time() - t0
@@ -1837,6 +2205,8 @@ def main():
 
             ckpt_data = {
                 "epoch": epoch,
+                "in_progress_epoch": None,
+                "next_chunk_idx": 0,
                 "model_state_dict": base_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
@@ -1845,13 +2215,21 @@ def main():
                 "best_val_mae": best_val_mae,
             }
             ckpt_path = Path(args.output).with_suffix(f".epoch{epoch}.pt")
-            latest_path = Path(args.output).with_suffix(".latest.pt")
             torch.save(ckpt_data, ckpt_path)
             torch.save(ckpt_data, latest_path)
 
             if is_new_best:
                 torch.save(ckpt_data, best_pt_path)
                 export_hkv3_binary(base_model, args.output)
+
+            if args.time_budget > 0 and (time.time() - t_train_start) >= args.time_budget:
+                print(f"[Time Budget] Đạt giới hạn {args.time_budget}s cuối Epoch {epoch}. Dừng sạch để resume phiên sau!", flush=True)
+                time_budget_hit = True
+                break
+
+        if time_budget_hit:
+            print(f"\n[Paused] Phiên tạm dừng theo --time-budget. Chạy lại kèm `--resume {latest_path}` để train tiếp!", flush=True)
+            return
 
     # ─── GIAI ĐOẠN 2: TINH CHỈNH CHUYÊN SÂU ĐẦU ĐỌC EVAL (2A: JOINT REFINEMENT + 2B: LOCKED HEAD) ───
     if args.finetune_eval_epochs > 0:
@@ -1896,27 +2274,28 @@ def main():
         for ep in range(1, phase_a + 1):
             model.train()
             t0 = time.time()
-            for us_b, them_b, targets_b in train_loader:
-                ft_opt_a.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs_b = model(us_b, them_b)
-                    loss_ev = criterion.compute_eval_loss(
-                        outputs_b["eval"], targets_b["eval"],
-                        target_wdl_game=targets_b.get("wdl"),
-                        eval_mask=targets_b.get("eval_mask"),
-                    )
-                    loss_aux = (
-                        F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
-                        + F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
-                        + F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
-                    )
-                    loss = 4.0 * loss_ev + 0.15 * loss_aux + 1e-4 * active_emb_full_l2(us_b, them_b)
-                scaler.scale(loss).backward()
-                scaler.unscale_(ft_opt_a)
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=0.5)
-                scaler.step(ft_opt_a)
-                scaler.update()
-                base_model.clamp_quantizable_weights()
+            for _, _, train_loader in iter_train_loaders(epoch_seed=2000 + ep):
+                for us_b, them_b, targets_b in train_loader:
+                    ft_opt_a.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        outputs_b = model(us_b, them_b)
+                        loss_ev = criterion.compute_eval_loss(
+                            outputs_b["eval"], targets_b["eval"],
+                            target_wdl_game=targets_b.get("wdl"),
+                            eval_mask=targets_b.get("eval_mask"),
+                        )
+                        loss_aux = (
+                            F.binary_cross_entropy_with_logits(outputs_b["tau"], targets_b["tau"])
+                            + F.binary_cross_entropy_with_logits(outputs_b["rho"], targets_b["rho"])
+                            + F.binary_cross_entropy_with_logits(outputs_b["rs"], targets_b["rs"])
+                        )
+                        loss = 4.0 * loss_ev + 0.15 * loss_aux + 1e-4 * active_emb_full_l2(us_b, them_b)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(ft_opt_a)
+                    torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=0.5)
+                    scaler.step(ft_opt_a)
+                    scaler.update()
+                    base_model.clamp_quantizable_weights()
 
             ft_sched_a.step()
             dt = time.time() - t0
@@ -1963,20 +2342,21 @@ def main():
         for ep in range(1, phase_b + 1):
             model.train()
             t0 = time.time()
-            for us_b, them_b, targets_b in train_loader:
-                ft_opt_b.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs_b = model(us_b, them_b)
-                    loss_ev = criterion.compute_eval_loss(
-                        outputs_b["eval"], targets_b["eval"],
-                        target_wdl_game=targets_b.get("wdl"),
-                        eval_mask=targets_b.get("eval_mask"),
-                    )
-                scaler.scale(loss_ev).backward()
-                scaler.unscale_(ft_opt_b)
-                scaler.step(ft_opt_b)
-                scaler.update()
-                base_model.clamp_quantizable_weights()
+            for _, _, train_loader in iter_train_loaders(epoch_seed=3000 + ep):
+                for us_b, them_b, targets_b in train_loader:
+                    ft_opt_b.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        outputs_b = model(us_b, them_b)
+                        loss_ev = criterion.compute_eval_loss(
+                            outputs_b["eval"], targets_b["eval"],
+                            target_wdl_game=targets_b.get("wdl"),
+                            eval_mask=targets_b.get("eval_mask"),
+                        )
+                    scaler.scale(loss_ev).backward()
+                    scaler.unscale_(ft_opt_b)
+                    scaler.step(ft_opt_b)
+                    scaler.update()
+                    base_model.clamp_quantizable_weights()
 
             ft_sched_b.step()
             dt = time.time() - t0
@@ -2015,11 +2395,11 @@ def main():
         print(f"\n[Verification] Nạp lại Best Model (MAE: {best_val_mae:.2f} cp) từ {args.output} để kiểm chứng...", flush=True)
         _, _ = load_hkv3_weights_or_checkpoint(base_model, args.output, dev0, dev1)
     quant_tensors = export_hkv3_binary(base_model, args.output)
-    sample_n = min(64, len(val_indices))
+    sample_n = min(64, len(val_us_sample))
     verify_integer_avx2_parity_and_accuracy(
         quant_tensors,
-        us_data[val_indices[:sample_n]],
-        them_data[val_indices[:sample_n]],
+        val_us_sample[:sample_n],
+        val_them_sample[:sample_n],
         model=base_model,
     )
     print(f"\n[Done] Huấn luyện hoàn tất! Best Validation MAE: {best_val_mae:.2f} cp -> {args.output}", flush=True)
