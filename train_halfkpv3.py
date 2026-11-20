@@ -872,13 +872,26 @@ class MultiNPZStreamer:
         self.local_chunks: List[List[Path]] = []
 
         if kaggle_index_ref:
-            from kaggle.api.kaggle_api_extended import KaggleApi
-            self.k_api = KaggleApi()
-            self.k_api.authenticate()
+            # Thử lấy Kaggle API auth nếu có; nếu không có vẫn tải trực tiếp Public dataset qua HTTPS!
+            self.k_api = None
+            try:
+                if not os.environ.get("KAGGLE_API_TOKEN"):
+                    try:
+                        from kaggle_secrets import UserSecretsClient
+                        t = UserSecretsClient().get_secret("KAGGLE_API_TOKEN") or ""
+                        if t:
+                            os.environ["KAGGLE_API_TOKEN"] = t
+                    except Exception:
+                        pass
+                from kaggle.api.kaggle_api_extended import KaggleApi
+                k = KaggleApi()
+                k.authenticate()
+                self.k_api = k
+            except Exception:
+                self.k_api = None
+
             idx_dir = self.stream_tmp_dir / "_index"
-            shutil.rmtree(idx_dir, ignore_errors=True)
-            idx_dir.mkdir(parents=True, exist_ok=True)
-            self.k_api.dataset_download_files(kaggle_index_ref, path=str(idx_dir), unzip=True, quiet=True)
+            self._download_public_or_api(kaggle_index_ref, idx_dir)
             manifest = json.loads((idx_dir / "packed_manifest.json").read_text(encoding="utf-8"))
             all_parts = manifest.get("parts", [])
             if start_part > 0:
@@ -891,10 +904,8 @@ class MultiNPZStreamer:
             val_part = all_parts[-1]
             self.part_entries = all_parts[:-1]
             val_dir = self.stream_tmp_dir / f"val_p{int(val_part['part']):03d}"
-            shutil.rmtree(val_dir, ignore_errors=True)
-            val_dir.mkdir(parents=True, exist_ok=True)
             print(f"[Stream Val] Đang tải part cố định cho Validation: {val_part['dataset']}...", flush=True)
-            self.k_api.dataset_download_files(val_part["dataset"], path=str(val_dir), unzip=True, quiet=True)
+            self._download_public_or_api(val_part["dataset"], val_dir)
             val_files = sorted(val_dir.glob("*.npz"))
             if not val_files:
                 raise RuntimeError(f"Không thấy .npz nào trong {val_part['dataset']}")
@@ -940,13 +951,44 @@ class MultiNPZStreamer:
     def num_chunks(self) -> int:
         return len(self.part_entries) if self.kaggle_index_ref else len(self.local_chunks)
 
+    def _download_public_or_api(self, ds_ref: str, out_dir: Path) -> Path:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if self.k_api is not None:
+            try:
+                self.k_api.dataset_download_files(ds_ref, path=str(out_dir), unzip=True, quiet=True)
+                return out_dir
+            except Exception as e:
+                print(f"[Stream Warn] Kaggle API download loi ({e}), fallback HTTPS public...", flush=True)
+
+        import urllib.request
+        url = f"https://www.kaggle.com/api/v1/datasets/download/{ds_ref}"
+        zip_path = out_dir / "_dl.zip"
+        for attempt in range(1, 5):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=300) as resp, open(zip_path, "wb") as f:
+                    while True:
+                        buf = resp.read(4 * 1024 * 1024)
+                        if not buf:
+                            break
+                        f.write(buf)
+                with zipfile.ZipFile(str(zip_path), "r") as zf:
+                    zf.extractall(str(out_dir))
+                zip_path.unlink(missing_ok=True)
+                return out_dir
+            except Exception as e:
+                zip_path.unlink(missing_ok=True)
+                if attempt == 4:
+                    raise
+                print(f"[Stream Retry {attempt}/4] Loi tai {ds_ref}: {e}", flush=True)
+                time.sleep(5 * attempt)
+        return out_dir
+
     def _download_kaggle_part(self, part_entry: Dict) -> Path:
         pnum = int(part_entry["part"])
         pdir = self.stream_tmp_dir / f"train_p{pnum:03d}"
-        shutil.rmtree(pdir, ignore_errors=True)
-        pdir.mkdir(parents=True, exist_ok=True)
-        self.k_api.dataset_download_files(part_entry["dataset"], path=str(pdir), unzip=True, quiet=True)
-        return pdir
+        return self._download_public_or_api(part_entry["dataset"], pdir)
 
     def iter_chunks(self, epoch_seed: int, start_chunk: int = 0):
         rng = random.Random(epoch_seed)
