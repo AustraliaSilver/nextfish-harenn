@@ -901,16 +901,27 @@ class MultiNPZStreamer:
             if len(all_parts) < 2:
                 raise RuntimeError(f"Manifest chỉ có {len(all_parts)} part, cần >= 2 part (hoặc giảm --start-part).")
 
-            val_part = all_parts[-1]
-            self.part_entries = all_parts[:-1]
-            val_dir = self.stream_tmp_dir / f"val_p{int(val_part['part']):03d}"
-            print(f"[Stream Val] Đang tải part cố định cho Validation: {val_part['dataset']}...", flush=True)
-            self._download_public_or_api(val_part["dataset"], val_dir)
-            val_files = sorted(val_dir.glob("*.npz"))
-            if not val_files:
-                raise RuntimeError(f"Không thấy .npz nào trong {val_part['dataset']}")
-            self.val_arrays = _load_single_npz_arrays(val_files[-1], max_rows=100_000)
-            shutil.rmtree(val_dir, ignore_errors=True)
+            val_part = None
+            val_files: List[Path] = []
+            for cand in reversed(all_parts):
+                val_dir = self.stream_tmp_dir / f"val_p{int(cand['part']):03d}"
+                print(f"[Stream Val] Đang tải part cố định cho Validation: {cand['dataset']}...", flush=True)
+                try:
+                    self._download_public_or_api(cand["dataset"], val_dir)
+                    vfs = sorted(val_dir.glob("*.npz"))
+                    if vfs:
+                        val_part = cand
+                        val_files = vfs
+                        self.val_arrays = _load_single_npz_arrays(val_files[-1], max_rows=100_000)
+                        shutil.rmtree(val_dir, ignore_errors=True)
+                        break
+                except Exception as e:
+                    print(f"[Stream Val Warn] Chưa tải được {cand['dataset']} ({e}), thử part trước đó...", flush=True)
+                shutil.rmtree(val_dir, ignore_errors=True)
+
+            if val_part is None:
+                raise RuntimeError("Không tải được bất kỳ part nào cho Validation từ manifest!")
+            self.part_entries = [p for p in all_parts if int(p["part"]) != int(val_part["part"])]
             print(
                 f"[Multi-NPZ Kaggle] {len(self.part_entries)} train parts | Val cố định: {len(self.val_arrays[2]):,} thế cờ từ {val_part['dataset']}",
                 flush=True,
@@ -1001,8 +1012,15 @@ class MultiNPZStreamer:
             with ThreadPoolExecutor(max_workers=1) as dl_pool:
                 cur_fut = dl_pool.submit(self._download_kaggle_part, order[start_chunk])
                 for c_idx in range(start_chunk, n_chunks):
-                    pdir = cur_fut.result()
+                    try:
+                        pdir = cur_fut.result()
+                    except Exception as e:
+                        print(f"  [Stream Skip Part {order[c_idx]['part']:03d}] Bỏ qua do lỗi tải ({e})", flush=True)
+                        pdir = None
                     next_fut = dl_pool.submit(self._download_kaggle_part, order[c_idx + 1]) if (c_idx + 1) < n_chunks else None
+                    if pdir is None:
+                        cur_fut = next_fut
+                        continue
                     npz_list = sorted(pdir.glob("*.npz"))
                     if not npz_list:
                         shutil.rmtree(pdir, ignore_errors=True)
