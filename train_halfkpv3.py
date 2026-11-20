@@ -691,6 +691,19 @@ class FastHKV3BatchLoader:
     def __len__(self) -> int:
         return (self.total_samples + self.batch_size - 1) // self.batch_size
 
+    def release(self):
+        """Giải phóng ngay các mảng NumPy & pinned buffer của chunk trước khi nạp chunk mới."""
+        self.us_data = None
+        self.them_data = None
+        self.eval_data = None
+        self.wdl_data = None
+        self.eval_mask_data = None
+        self.tau_data = None
+        self.rho_data = None
+        self.rs_data = None
+        self.base_indices = None
+        self._pin_bufs.clear()
+
     def _to_gpu(self, key: str, arr: np.ndarray, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         if self.pin_memory:
             buf = self._pin_bufs.get(key)
@@ -2394,6 +2407,7 @@ def main():
     start_epoch = 1
     resume_chunk_idx = 0
     best_val_loss = float("inf")
+    best_val_eval = float("inf")
     best_val_mae = float("inf")
     best_pt_path = Path(args.output).with_suffix(".best.pt")
 
@@ -2579,9 +2593,10 @@ def main():
 
                 if streamer is not None and (c_idx + 1) < n_chunks:
                     val_mid = evaluate_validation()
-                    is_mid_best = val_mid["total"] < best_val_loss
+                    best_val_loss = min(best_val_loss, val_mid["total"])
+                    is_mid_best = val_mid["eval"] < best_val_eval
                     if is_mid_best:
-                        best_val_loss = val_mid["total"]
+                        best_val_eval = val_mid["eval"]
                         best_val_mae = val_mid["mae_cp"]
                     mid_ckpt = {
                         "epoch": epoch - 1,
@@ -2625,7 +2640,11 @@ def main():
                         print(f"[Time Budget] Đạt giới hạn {args.time_budget}s sau Chunk {c_idx + 1}/{n_chunks}. Lưu checkpoint để resume phiên sau!", flush=True)
                         epoch_finished = False
                         time_budget_hit = True
+                        train_loader.release()
+                        gc.collect()
                         break
+                train_loader.release()
+                gc.collect()
 
             if not epoch_finished:
                 break
@@ -2649,10 +2668,11 @@ def main():
                 flush=True,
             )
 
-            # Cập nhật best_val_loss / best_val_mae TRƯỚC khi đóng gói ckpt_data để lưu đúng kỷ lục mới nhất
-            is_new_best = val_m["total"] < best_val_loss
+            # Cập nhật best_val_eval / best_val_mae TRƯỚC khi đóng gói ckpt_data để không bỏ lỡ best chess model vì nhiễu aux loss
+            best_val_loss = min(best_val_loss, val_m["total"])
+            is_new_best = val_m["eval"] < best_val_eval
             if is_new_best:
-                best_val_loss = val_m["total"]
+                best_val_eval = val_m["eval"]
                 best_val_mae = val_m["mae_cp"]
 
             ckpt_data = {
@@ -2768,6 +2788,8 @@ def main():
                     scaler.step(ft_opt_a)
                     scaler.update()
                     base_model.clamp_quantizable_weights()
+                train_loader.release()
+                gc.collect()
 
             ft_sched_a.step()
             dt = time.time() - t0
@@ -2829,6 +2851,8 @@ def main():
                     scaler.step(ft_opt_b)
                     scaler.update()
                     base_model.clamp_quantizable_weights()
+                train_loader.release()
+                gc.collect()
 
             ft_sched_b.step()
             dt = time.time() - t0
