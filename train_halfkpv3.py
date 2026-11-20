@@ -1011,16 +1011,21 @@ class MultiNPZStreamer:
                 return
             with ThreadPoolExecutor(max_workers=1) as dl_pool:
                 cur_fut = dl_pool.submit(self._download_kaggle_part, order[start_chunk])
+                consec_skips = 0
                 for c_idx in range(start_chunk, n_chunks):
                     try:
                         pdir = cur_fut.result()
                     except Exception as e:
+                        consec_skips += 1
                         print(f"  [Stream Skip Part {order[c_idx]['part']:03d}] Bỏ qua do lỗi tải ({e})", flush=True)
+                        if consec_skips >= 5:
+                            raise RuntimeError(f"Đã bỏ qua {consec_skips} part liên tiếp khi tải dữ liệu!") from e
                         pdir = None
                     next_fut = dl_pool.submit(self._download_kaggle_part, order[c_idx + 1]) if (c_idx + 1) < n_chunks else None
                     if pdir is None:
                         cur_fut = next_fut
                         continue
+                    consec_skips = 0
                     npz_list = sorted(pdir.glob("*.npz"))
                     if not npz_list:
                         shutil.rmtree(pdir, ignore_errors=True)
@@ -1059,6 +1064,101 @@ class MultiNPZStreamer:
                 yield c_idx, n_chunks, loader
                 del loader, idx, u, t, ev, wdl, msk, tau, rho, rs
                 gc.collect()
+
+
+class HFTelemetry:
+    """Đẩy live status.json, train.log và backup .harenn lên Hugging Face (nếu có HF_TOKEN)."""
+
+    def __init__(self, repo_id: str, live_log_file: str = ""):
+        self.repo_id = repo_id.strip()
+        self.live_log_file = Path(live_log_file) if live_log_file else None
+        self.api = None
+        self._pool = None
+        self._fut = None
+        self._stage_dir = Path("/tmp/hf_telemetry_stage")
+        if not self.repo_id:
+            return
+        token = os.environ.get("HF_TOKEN", "").strip()
+        if not token:
+            try:
+                from kaggle_secrets import UserSecretsClient
+                token = (UserSecretsClient().get_secret("HF_TOKEN") or "").strip()
+            except Exception:
+                token = ""
+        if not token:
+            print("[HF Live Log] Không tìm thấy HF_TOKEN -> chỉ ghi log local.", flush=True)
+            return
+        try:
+            from huggingface_hub import HfApi
+            self.api = HfApi(token=token)
+            self.api.create_repo(repo_id=self.repo_id, repo_type="dataset", private=True, exist_ok=True)
+            self._pool = ThreadPoolExecutor(max_workers=1)
+            print(f"[HF Live Log] Đã bật đẩy log trực tiếp lên HF dataset: {self.repo_id}", flush=True)
+        except Exception as e:
+            print(f"[HF Live Log Warn] Không khởi tạo được HF repo ({e}) -> chỉ ghi local.", flush=True)
+            self.api = None
+
+    def push(self, status: Dict, extra_files: Optional[List[Path]] = None, wait: bool = False):
+        if self.api is None or self._pool is None:
+            return
+        if self._fut is not None and not self._fut.done():
+            if not wait:
+                return
+            try:
+                self._fut.result()
+            except Exception:
+                pass
+
+        shutil.rmtree(self._stage_dir, ignore_errors=True)
+        self._stage_dir.mkdir(parents=True, exist_ok=True)
+        st_path = self._stage_dir / "status.json"
+        st_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        to_upload: List[Tuple[str, str]] = [(str(st_path), "status.json")]
+
+        if self.live_log_file and self.live_log_file.exists():
+            log_cp = self._stage_dir / "train_live.log"
+            try:
+                shutil.copy2(self.live_log_file, log_cp)
+                to_upload.append((str(log_cp), "train_live.log"))
+            except Exception:
+                pass
+        for ef in (extra_files or []):
+            if ef and Path(ef).exists():
+                dst = self._stage_dir / Path(ef).name
+                try:
+                    shutil.copy2(ef, dst)
+                    to_upload.append((str(dst), Path(ef).name))
+                except Exception:
+                    pass
+
+        def _do_commit():
+            try:
+                from huggingface_hub import CommitOperationAdd
+                ops = [CommitOperationAdd(path_in_repo=rname, path_or_fileobj=lpath) for lpath, rname in to_upload]
+                self.api.create_commit(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    operations=ops,
+                    commit_message=f"Update live train log ({status.get('stage', 'init')})",
+                )
+            except Exception as e:
+                print(f"[HF Live Log Warn] Lỗi đẩy HF: {e}", flush=True)
+
+        self._fut = self._pool.submit(_do_commit)
+        if wait:
+            try:
+                self._fut.result()
+            except Exception:
+                pass
+
+    def close(self):
+        if self._fut is not None:
+            try:
+                self._fut.result()
+            except Exception:
+                pass
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1845,6 +1945,8 @@ def main():
     parser.add_argument("--start-part", type=int, default=0, help="Lọc bắt đầu từ part >= N khi dùng --kaggle-index (0 = tất cả)")
     parser.add_argument("--end-part", type=int, default=0, help="Lọc kết thúc ở part <= N khi dùng --kaggle-index (0 = tất cả)")
     parser.add_argument("--time-budget", type=int, default=0, help="Giới hạn thời gian train (giây, 0 = không giới hạn; trên Kaggle nên đặt 39600)")
+    parser.add_argument("--hf-log-repo", type=str, default="", help="HF Dataset repo đẩy live status/log & backup .harenn (vd: australia1/harenn-hkv3-logs)")
+    parser.add_argument("--live-log-file", type=str, default="", help="Đường dẫn file log để đồng bộ lên --hf-log-repo")
     parser.add_argument("--sync-hf", action="store_true", help="Tự động tải toàn bộ .jsonl từ Hugging Face Bucket trước khi train")
     parser.add_argument("--hf-bucket", type=str, default="australia1/myrandombucket", help="ID của Hugging Face Bucket")
     parser.add_argument("--epochs", type=int, default=16, help="Số epoch huấn luyện đa nhiệm Giai đoạn 1")
@@ -1895,6 +1997,8 @@ def main():
     print("=" * 76, flush=True)
 
     t_train_start = time.time()
+    telemetry = HFTelemetry(args.hf_log_repo, args.live_log_file)
+    telemetry.push({"stage": "startup", "elapsed_s": 0.0})
 
     # 1. Đồng bộ dữ liệu từ Hugging Face Bucket nếu có cờ --sync-hf
     if args.sync_hf:
@@ -1931,6 +2035,11 @@ def main():
             device=device_tmp,
         )
         val_loader, val_us_sample, val_them_sample = streamer.get_val_loader()
+        telemetry.push({
+            "stage": "data_ready",
+            "elapsed_s": round(time.time() - t_train_start, 1),
+            "num_chunks": streamer.num_chunks(),
+        })
     elif len(local_npz_files) >= 2:
         streamer = MultiNPZStreamer(
             local_npz_files=local_npz_files,
@@ -2186,6 +2295,7 @@ def main():
             c_start = resume_chunk_idx if epoch == start_epoch else 0
             resume_chunk_idx = 0
             epoch_finished = True
+            nan_cnt = 0
 
             for c_idx, n_chunks, train_loader in iter_train_loaders(epoch_seed=42 + epoch, start_chunk=c_start):
                 for us_b, them_b, targets_b in train_loader:
@@ -2194,6 +2304,14 @@ def main():
                         outputs_b = model(us_b, them_b)
                         loss, m = criterion(outputs_b, targets_b)
                         loss = loss + 1e-4 * active_emb_full_l2(us_b, them_b)
+
+                    if not math.isfinite(m["total"]):
+                        nan_cnt += 1
+                        if nan_cnt >= 5:
+                            telemetry.push({"stage": "error", "error": "NaN/Inf loss", "epoch": epoch, "chunk": c_idx + 1, "steps": steps}, wait=True)
+                            raise RuntimeError(f"Phát hiện loss NaN/Inf {nan_cnt} lần liên tiếp tại Epoch {epoch}, Chunk {c_idx + 1}!")
+                        continue
+                    nan_cnt = 0
 
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -2232,6 +2350,24 @@ def main():
                         f"Val Loss: {val_mid['total']:.4f} | MAE: {val_mid['mae_cp']:.1f}cp",
                         flush=True,
                     )
+                    telemetry.push(
+                        {
+                            "stage": "stage1_chunk",
+                            "epoch": epoch,
+                            "chunk": c_idx + 1,
+                            "total_chunks": n_chunks,
+                            "steps": steps,
+                            "elapsed_s": round(time.time() - t_train_start, 1),
+                            "val_loss": round(val_mid["total"], 5),
+                            "val_eval_loss": round(val_mid["eval"], 5),
+                            "val_mae_cp": round(val_mid["mae_cp"], 2),
+                            "val_wdl_err": round(val_mid["wdl_err"], 6),
+                            "tau": round(val_mid["tau"], 5),
+                            "rho": round(val_mid["rho"], 5),
+                            "rs": round(val_mid["rs"], 5),
+                        },
+                        extra_files=[Path(args.output)] if is_mid_best else None,
+                    )
                     if args.time_budget > 0 and (time.time() - t_train_start) >= args.time_budget:
                         print(f"[Time Budget] Đạt giới hạn {args.time_budget}s sau Chunk {c_idx + 1}/{n_chunks}. Lưu checkpoint để resume phiên sau!", flush=True)
                         epoch_finished = False
@@ -2240,6 +2376,9 @@ def main():
 
             if not epoch_finished:
                 break
+            if steps == 0:
+                telemetry.push({"stage": "error", "error": "Zero training steps in epoch", "epoch": epoch}, wait=True)
+                raise RuntimeError(f"Epoch {epoch} kết thúc với 0 steps train!")
 
             scheduler.step()
             dt = time.time() - t0
@@ -2282,6 +2421,24 @@ def main():
                 torch.save(ckpt_data, best_pt_path)
                 export_hkv3_binary(base_model, args.output)
 
+            telemetry.push(
+                {
+                    "stage": "stage1_epoch_end",
+                    "epoch": epoch,
+                    "steps": steps,
+                    "elapsed_s": round(time.time() - t_train_start, 1),
+                    "train_loss": round(train_totals["total"], 5),
+                    "val_loss": round(val_m["total"], 5),
+                    "val_mae_cp": round(val_m["mae_cp"], 2),
+                    "val_wdl_err": round(val_m["wdl_err"], 6),
+                    "tau": round(val_m["tau"], 5),
+                    "rho": round(val_m["rho"], 5),
+                    "rs": round(val_m["rs"], 5),
+                    "lr": cur_lr,
+                },
+                extra_files=[Path(args.output)] if is_new_best else None,
+            )
+
             if args.time_budget > 0 and (time.time() - t_train_start) >= args.time_budget:
                 print(f"[Time Budget] Đạt giới hạn {args.time_budget}s cuối Epoch {epoch}. Dừng sạch để resume phiên sau!", flush=True)
                 time_budget_hit = True
@@ -2289,6 +2446,8 @@ def main():
 
         if time_budget_hit:
             print(f"\n[Paused] Phiên tạm dừng theo --time-budget. Chạy lại kèm `--resume {latest_path}` để train tiếp!", flush=True)
+            telemetry.push({"stage": "paused_time_budget", "elapsed_s": round(time.time() - t_train_start, 1)}, extra_files=[latest_path, Path(args.output)], wait=True)
+            telemetry.close()
             return
 
     # ─── GIAI ĐOẠN 2: TINH CHỈNH CHUYÊN SÂU ĐẦU ĐỌC EVAL (2A: JOINT REFINEMENT + 2B: LOCKED HEAD) ───
@@ -2463,6 +2622,8 @@ def main():
         model=base_model,
     )
     print(f"\n[Done] Huấn luyện hoàn tất! Best Validation MAE: {best_val_mae:.2f} cp -> {args.output}", flush=True)
+    telemetry.push({"stage": "done", "best_val_mae_cp": round(best_val_mae, 2), "elapsed_s": round(time.time() - t_train_start, 1)}, extra_files=[Path(args.output)], wait=True)
+    telemetry.close()
 
 
 if __name__ == "__main__":
